@@ -19,7 +19,7 @@ import { koluShellDir } from "./koluRoot.ts";
  * Exported so callers can pass it as the default whitelist value.
  */
 export const NIX_ENV_WHITELIST =
-  "HOME,USER,PATH,TERM,LANG,LC_ALL,LOGNAME,DISPLAY,COLORTERM,TERM_PROGRAM";
+  "HOME,USER,PATH,TERM,LANG,LC_ALL,LOGNAME,DISPLAY,COLORTERM,TERM_PROGRAM,SSH_AUTH_SOCK,JUSPAY_API_KEY";
 
 /** Whitelist set once at startup; undefined means passthrough mode (production). */
 let envWhitelist: Set<string> | undefined;
@@ -213,6 +213,8 @@ export function osc7Init(opts: {
     writeFileSync(
       join(zdotdir, ".zshrc"),
       [
+        `[ -f /etc/zshenv ] && source /etc/zshenv`,
+        `[ -f "${home}/.zshenv" ] && source "${home}/.zshenv"`,
         `[ -f /etc/zprofile ] && source /etc/zprofile`,
         `[ -f "${home}/.zprofile" ] && source "${home}/.zprofile"`,
         `[ -f "${home}/.zshrc" ] && ZDOTDIR="${home}" source "${home}/.zshrc"`,
