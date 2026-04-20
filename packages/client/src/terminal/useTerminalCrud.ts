@@ -123,11 +123,15 @@ export function useTerminalCrud(deps: {
       toast.error(`Failed to create terminal: ${err.message}`);
       throw err;
     });
-    const theme =
-      themeName ??
-      (peerBgs
-        ? pickTheme(availableThemes, { spread: true, peerBgs })
-        : undefined);
+    // Priority: session restore > user default > shuffleTheme > undefined
+    let theme: string | undefined;
+    if (themeName) {
+      theme = themeName;
+    } else if (preferences().defaultThemeName) {
+      theme = preferences().defaultThemeName;
+    } else if (peerBgs) {
+      theme = pickTheme(availableThemes, { spread: true, peerBgs });
+    }
     store.setActiveId(info.id);
     deps.subscribeExit(info.id);
     if (theme) setThemeName(info.id, theme);

@@ -38,4 +38,5 @@ export const DEFAULT_PREFERENCES: Preferences = {
     tab: { kind: "inspector" },
     pinned: true,
   },
+  defaultThemeName: undefined,
 };

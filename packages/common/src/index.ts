@@ -337,6 +337,10 @@ export const PreferencesSchema = z.object({
    *  font-rendering shift on focus swap at the cost of WebGL throughput. */
   terminalRenderer: z.enum(["auto", "dom"]),
   rightPanel: RightPanelPrefsSchema,
+  /** Default theme name for new terminals. Updated whenever the user
+   *  explicitly sets a terminal theme, so new terminals inherit their
+   *  preferred look without relying on shuffleTheme. */
+  defaultThemeName: z.string().optional(),
 });
 
 // --- Activity feed (server-derived, append + MRU evict) ---

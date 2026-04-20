@@ -17,9 +17,11 @@ import {
 import type { TerminalId } from "kolu-common";
 import { client } from "./rpc/rpc";
 import { useTerminalStore } from "./terminal/useTerminalStore";
+import { usePreferences } from "./settings/usePreferences";
 
 function init() {
   const store = useTerminalStore();
+  const { preferences, updatePreferences } = usePreferences();
   const getThemeName = (id: TerminalId) => store.getMetadata(id)?.themeName;
 
   const committedThemeName = createMemo(() => {
@@ -54,6 +56,10 @@ function init() {
     const id = store.activeId();
     if (id === null) return;
     setThemeName(id, themeName);
+    // Remember this as the user's preferred default for new terminals
+    if (preferences().defaultThemeName !== themeName) {
+      updatePreferences({ defaultThemeName: themeName });
+    }
   }
 
   /** Shuffle the active terminal to a random theme. Random — not argmax —
