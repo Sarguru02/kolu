@@ -1,11 +1,20 @@
 # Prefix for commands that need a Nix devshell; empty if already inside one.
 
-nix_shell := if env('IN_NIX_SHELL', '') != '' { '' } else { 'nix develop path:' + justfile_directory() + ' -c' }
+# Use git+file:// (default) instead of path: — path: disables the eval cache
+# and re-copies/re-evaluates on every invocation (~4200ms vs ~130ms hot).
+# Caveat: new .nix files must be `git add`ed before nix develop sees them.
+nix_shell := if env('IN_NIX_SHELL', '') != '' { '' } else { 'nix develop ' + justfile_directory() + ' --accept-flake-config -c' }
+# E2e shell includes Playwright browsers (not in default shell for perf).
+# Check PLAYWRIGHT_BROWSERS_PATH, not IN_NIX_SHELL — the default shell sets
+# IN_NIX_SHELL but doesn't provide browsers, so `just ci::e2e` (which runs
+# inside the default shell) must still enter .#e2e to get them.
+nix_shell_e2e := if env('PLAYWRIGHT_BROWSERS_PATH', '') != '' { '' } else { 'nix develop ' + justfile_directory() + '#e2e --accept-flake-config -c' }
 
 cucumber_parallel := env('CUCUMBER_PARALLEL', '4')
 
 mod ai 'agents/ai.just'
 mod ci 'ci/mod.just'
+mod website 'website/mod.just'
 
 # List available recipes
 default:
@@ -37,11 +46,11 @@ check: install
 
 # Run server with auto-reload
 server:
-    cd server && {{ nix_shell }} pnpm dev
+    cd packages/server && {{ nix_shell }} pnpm dev
 
 # Run client with Vite dev server (HMR)
 client:
-    cd client && {{ nix_shell }} pnpm dev
+    cd packages/client && {{ nix_shell }} pnpm dev
 
 # Run unit tests (vitest) across server and client packages
 test-unit: install
@@ -51,10 +60,10 @@ test-unit: install
 test: install
     #!/usr/bin/env bash
     set -euo pipefail
-    KOLU_SERVER="${KOLU_SERVER:-$(nix build --print-out-paths)/bin/kolu}"
-    cd tests
-    {{ nix_shell }} pnpm install
-    KOLU_SERVER="$KOLU_SERVER" CUCUMBER_PARALLEL={{ cucumber_parallel }} {{ nix_shell }} pnpm test
+    KOLU_SERVER="${KOLU_SERVER:-$(nix build .#koluBin --print-out-paths)/bin/kolu}"
+    cd packages/tests
+    {{ nix_shell_e2e }} pnpm install
+    KOLU_SERVER="$KOLU_SERVER" CUCUMBER_PARALLEL={{ cucumber_parallel }} {{ nix_shell_e2e }} pnpm test
 
 # Fast self-contained e2e tests (no nix build, no separate dev server).
 # Builds client via pnpm, spawns server from source on random ports.
@@ -65,7 +74,7 @@ test: install
 test-quick *args: install
     #!/usr/bin/env bash
     set -euo pipefail
-    {{ nix_shell }} pnpm --filter kolu-client build
+    {{ nix_shell_e2e }} pnpm --filter kolu-client build
     # hooks.ts spawn()s KOLU_SERVER as an executable with ["--port", N].
     # Without nix build there's no `kolu` binary, so we create a temp wrapper
     # that does what the nix-built binary does: set KOLU_CLIENT_DIST and exec tsx.
@@ -73,13 +82,13 @@ test-quick *args: install
     trap 'rm -f "$wrapper"' EXIT
     cat > "$wrapper" <<SCRIPT
     #!/bin/sh
-    KOLU_CLIENT_DIST="$PWD/client/dist" exec tsx "$PWD/server/src/index.ts" --allow-nix-shell-with-env-whitelist default "\$@"
+    KOLU_CLIENT_DIST="$PWD/packages/client/dist" exec tsx "$PWD/packages/server/src/index.ts" --allow-nix-shell-with-env-whitelist default "\$@"
     SCRIPT
     chmod +x "$wrapper"
-    cd tests
-    {{ nix_shell }} pnpm install
+    cd packages/tests
+    {{ nix_shell_e2e }} pnpm install
     KOLU_SERVER="$wrapper" CUCUMBER_PARALLEL={{ cucumber_parallel }} \
-        {{ nix_shell }} node --import tsx \
+        {{ nix_shell_e2e }} node --import tsx \
         ./node_modules/@cucumber/cucumber/bin/cucumber-js \
         --profile ui {{ args }}
 
@@ -88,12 +97,12 @@ clean:
     git clean -fdX
 
 # Format all files in-place
-fmt:
-    {{ nix_shell }} sh -c 'prettier --write --cache --ignore-unknown . && nixpkgs-fmt *.nix nix/**/*.nix'
+fmt: install
+    {{ nix_shell }} sh -c 'pnpm exec prettier --write --cache --ignore-unknown . && nixpkgs-fmt *.nix nix/**/*.nix website/*.nix'
 
 # Check formatting without modifying files (used by CI)
-fmt-check:
-    {{ nix_shell }} sh -c 'prettier --check --cache --ignore-unknown . && nixpkgs-fmt --check *.nix nix/**/*.nix'
+fmt-check: install
+    {{ nix_shell }} sh -c 'pnpm exec prettier --check --cache --ignore-unknown . && nixpkgs-fmt --check *.nix nix/**/*.nix website/*.nix'
 
 # Nix build (server + client)
 build:

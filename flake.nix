@@ -5,7 +5,7 @@
 #
 #   - Each flake input adds ~1.5s of fetcher-cache verification on cold
 #     eval cache. Even a single nixpkgs input costs ~7s.
-#   - With zero inputs, `nix develop` cold is ~2.6s, warm is ~0.3s.
+#   - With zero inputs, `nix develop` cold is ~1.0s, warm is ~0.1s.
 #
 # DO NOT add flake inputs (nixpkgs, flake-parts, git-hooks, etc.).
 # Instead, use fetchTarball or callPackage in nix/ files.
@@ -29,9 +29,36 @@
     {
       homeManagerModules.default = import ./nix/home/module.nix;
       packages = eachSystem (pkgs:
-        let all = import ./default.nix { inherit pkgs commitHash; };
-        in removeAttrs all [ "koluEnv" ]);
+        let
+          kolu = import ./default.nix { inherit pkgs commitHash; };
+          # Synthesized website source tree: website/ with the canonical
+          # favicon copied in where the working tree has a symlink to
+          # ../../packages/client/favicon.svg. One SVG on disk; the Nix
+          # sandbox still sees a self-contained website/ with real bytes.
+          websiteSrc = pkgs.runCommand "kolu-website-src" { } ''
+            cp -r ${./website} $out
+            chmod -R u+w $out
+            rm -f $out/public/favicon.svg
+            cp ${./packages/client/favicon.svg} $out/public/favicon.svg
+          '';
+          website = import ./website { inherit pkgs; src = websiteSrc; };
+        in
+        removeAttrs kolu [ "koluEnv" ] // {
+          website = website.default;
+          website-pnpm-deps = website.pnpmDeps;
+        });
       devShells = eachSystem (pkgs:
-        { default = import ./shell.nix { inherit pkgs; }; });
+        let default = import ./shell.nix { inherit pkgs; };
+        in {
+          inherit default;
+          # Extended shell with Playwright browsers for e2e testing.
+          # Usage: nix develop .#e2e
+          e2e = default.overrideAttrs (prev: {
+            name = "kolu-shell-e2e";
+            env = (prev.env or { }) // {
+              PLAYWRIGHT_BROWSERS_PATH = pkgs.playwright-driver.browsers;
+            };
+          });
+        });
     };
 }

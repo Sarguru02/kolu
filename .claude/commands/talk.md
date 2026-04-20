@@ -1,5 +1,5 @@
 ---
-argument-hint: <topic or question>
+argument-hint: '[--no-laconic] <topic or question>'
 description: Enter talk mode — conversation only, no file changes
 ---
 
@@ -23,7 +23,7 @@ Talk mode is a research-first workflow, not an off-the-cuff conversation. Before
 
 ### First-turn gate
 
-Your first substantive response must not contain recommendations, fixes, "suspects," or claims about third-party library behavior unless you have **already read the relevant source in this session**. If you haven't yet, your first response is the research itself (a plan + the reads), not an answer. Partial research followed by a confident recommendation is worse than no answer — it anchors the user on a guess.
+Your first substantive response must not contain recommendations, fixes, "suspects," or claims about third-party library behavior unless you have **already read the relevant source in this session**. If you haven't yet, your first response is the research itself — normally a single `Agent(subagent_type=Explore)` call. Direct `Read`s in the main turn are allowed only for narrow, single-file lookups you can name up front. Partial research followed by a confident recommendation is worse than no answer — it anchors the user on a guess.
 
 ### When to use the Explore subagent
 
@@ -38,7 +38,7 @@ For narrow, single-file lookups, `Grep`/`Read` directly is fine. The line is: if
 
 **When the source isn't on disk.** If the relevant library isn't in `node_modules/`, `vendor/`, or similar, and isn't already checked out somewhere you can read, `git clone` it to a scratch dir (e.g. `/tmp/<name>`) at the version the project actually uses, then read it there. Don't fall back to memory of the API — memory is how you end up recommending flags that don't exist in the installed version.
 
-**Subagent output is a lead, not ground truth.** Explore subagents hallucinate file:line references and invent plausible-sounding behavior. Before citing any specific claim a subagent made about a file:line, function signature, or control flow, open the file yourself and verify. If you haven't verified it, either verify now or mark the claim as "per subagent, unverified" so the user can weigh it — don't launder subagent guesses into confident statements.
+**Subagent output is a lead, not ground truth.** Explore subagents hallucinate file:line references and invent plausible-sounding behavior. If you haven't verified a claim yourself, mark it "per subagent, unverified" so the user can weigh it — don't launder subagent guesses into confident statements.
 
 ### Citation requirement
 
@@ -65,5 +65,29 @@ If you're about to emit "probably", "almost certainly", "I suspect", "my #1 susp
 
 - Be direct, opinionated, and concise.
 - If the user asks you to implement something, remind them to use `/do` when ready and discuss the approach instead — but **only after** you've done the research that would make the discussion grounded.
+
+## Auto-Hickey + Auto-Lowy
+
+Any time the conversation produces a concrete code plan, diff proposal, or design sketch that could be implemented, **invoke the `hickey` and `lowy` sub-agents on that proposal before presenting your final recommendation** — do not wait for the user to ask. Fold findings into the recommendation (e.g. flag complecting, note where simplicity could be preserved, flag boundaries that track functionality instead of volatility) rather than dumping raw sub-agent output on top.
+
+<use_parallel_tool_calls>
+For maximum efficiency, invoke `Agent(subagent_type="hickey")` and `Agent(subagent_type="lowy")` **in parallel** rather than sequentially. You MUST use parallel tool calls: emit both Agent tool_use blocks in a single response. Do NOT use the `Skill` tool here — `Skill` calls serialize on the main loop, so two Skill invocations in one response still run sequentially.
+</use_parallel_tool_calls>
+
+Skip the Hickey/Lowy pass only when the turn is pure Q&A with no proposed change (e.g. "how does X work?"). When in doubt, run it.
+
+## Laconic mode (default)
+
+Laconic mode is **on by default**. If `ARGUMENTS` begins with `--no-laconic` (strip the flag before treating the rest as the topic), disable it and use normal verbose output instead.
+
+When laconic mode is active:
+
+- One or two sentences when it will do. A single word when *that* will do.
+- No preamble, no recap of the question, no "great question", no closing offers to help further.
+- Drop bullet lists unless the answer is genuinely a list. No headings.
+- Keep file:line citations — brevity does not override the research/citation rules above. Research silently; show only the conclusion plus its citations.
+- Code blocks only when code is the answer.
+
+Laconic mode trims the *output*, not the *investigation*. Do the same reading you would otherwise; just say less about it.
 
 ARGUMENTS: $ARGUMENTS

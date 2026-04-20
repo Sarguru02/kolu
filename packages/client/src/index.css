@@ -1,0 +1,182 @@
+@import "kolu-fonts";
+@import "tailwindcss";
+
+/* Suppress the browser's pull-to-refresh and scroll-chaining at the
+ * document level. Without this, swiping down at the top of the
+ * sidebar or terminal viewport hijacks the gesture into a page
+ * reload — destroying every open terminal session. `contain` keeps
+ * the local rubber-band feel intact while killing chain-up. */
+html,
+body {
+  overscroll-behavior: contain;
+}
+
+/*
+ * @theme registers color names with Tailwind and generates :root CSS custom properties.
+ * Values here double as the dark palette — :root:not(.dark) overrides them for light mode.
+ */
+@theme {
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+
+  --color-surface-0: #0c0c0e;
+  --color-surface-1: #161618;
+  --color-surface-2: #1f1f23;
+  --color-surface-3: #2a2a30;
+
+  --color-edge: #27272c;
+  --color-edge-bright: #3a3a42;
+
+  --color-fg: #e4e4e8;
+  --color-fg-2: #a0a0a8;
+  --color-fg-3: #838390;
+
+  --color-accent: #5a9ea0;
+  --color-alert: #fb923c;
+
+  --color-ok: #4ade80;
+  --color-warning: #facc15;
+  --color-danger: #f87171;
+  --color-busy: #d97757;
+}
+
+/* ── Light mode (default when .dark is absent) ───────────────── */
+:root:not(.dark) {
+  --color-surface-0: #ffffff;
+  --color-surface-1: #f4f4f6;
+  --color-surface-2: #e8e8ec;
+  --color-surface-3: #dcdce2;
+
+  --color-edge: #d0d0d8;
+  --color-edge-bright: #b8b8c2;
+
+  --color-fg: #1a1a1e;
+  --color-fg-2: #5c5c66;
+  --color-fg-3: #8a8a96;
+
+  --color-accent: #3d8486;
+  --color-alert: #ea580c;
+
+  --color-ok: #16a34a;
+  --color-warning: #ca8a04;
+  --color-danger: #dc2626;
+  --color-busy: #c4623e;
+}
+
+/* ── Spinning border animation ───────────────────────────────── */
+/* Drives `pill-border-spin` below: a conic gradient rotates around
+   the pill, leaving an animated "tire" ring via mask-composite. */
+
+@property --spin-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes border-spin {
+  to {
+    --spin-angle: 360deg;
+  }
+}
+
+/* ── Pill agent border ──────────────────────────────────────── */
+/* Single border channel encoding both `active` (which terminal is
+ * focused) and `agent state` (what its agent is doing right now).
+ * The ::before pseudo sits 2px outside the pill and uses the standard
+ * mask-composite trick so only the ring is visible — the pill's own
+ * background covers the inner area. `--card-color` is set per-pill
+ * (repo color) so the border doubles as identity.
+ *
+ * Reuses --spin-angle / @keyframes border-spin from above. */
+
+.pill-border {
+  position: relative;
+}
+.pill-border::before {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: 9999px;
+  padding: 2px;
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+.pill-border-active::before {
+  background: oklch(from var(--card-color) l c h / 0.8);
+}
+
+.pill-border-spin::before {
+  background:
+    conic-gradient(
+      from var(--spin-angle),
+      transparent 0%,
+      oklch(from var(--card-color) l calc(c * 1.3) h) 8%,
+      transparent 16%,
+      transparent 100%
+    ),
+    oklch(from var(--card-color) l c h / 0.4);
+  animation: border-spin 2s linear infinite;
+}
+
+.pill-border-waiting::before {
+  animation: pill-breathe 1.6s ease-in-out infinite;
+}
+
+@keyframes pill-breathe {
+  0%,
+  100% {
+    background: oklch(from var(--card-color) l c h / 0.15);
+  }
+  50% {
+    background: oklch(from var(--card-color) l calc(c * 1.2) h / 0.85);
+  }
+}
+
+/* Inset highlight: marks the pill as ALSO the active terminal when
+ * the border is already busy showing agent state. Sits inside the
+ * pill so it doesn't compete with the outer animated ring. */
+.pill-glow-inner {
+  box-shadow: inset 0 0 0 1px
+    oklch(from var(--card-color) l calc(c * 1.5) h / 0.7);
+}
+
+/* ── Record capsule ─────────────────────────────────────────── */
+/* A soft box-shadow halo that grows outward and fades, emulating
+ * the universal "live indicator" pulse. Uses ease-out so the ring
+ * feels like a gentle emission, not a hard beat. Paused state
+ * drops the animation entirely. */
+@keyframes record-capsule-breathe {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-danger) 50%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 6px
+      color-mix(in srgb, var(--color-danger) 0%, transparent);
+  }
+}
+
+.record-capsule-live {
+  animation: record-capsule-breathe 2s ease-out infinite;
+}
+
+/* ── Canvas grid background ─────────────────────────────────── */
+/* Fine line grid gives spatial grounding to the freeform canvas.
+   Lines use the edge color at low opacity so they adapt to light/dark themes. */
+.canvas-grid-bg {
+  background-image:
+    linear-gradient(
+      to right,
+      color-mix(in oklch, var(--color-edge) 40%, transparent) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      to bottom,
+      color-mix(in oklch, var(--color-edge) 40%, transparent) 1px,
+      transparent 1px
+    );
+  background-size: 24px 24px;
+}

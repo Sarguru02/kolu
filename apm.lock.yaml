@@ -1,21 +1,27 @@
 lockfile_version: '1'
-generated_at: '2026-04-11T14:19:24.039407+00:00'
+generated_at: '2026-04-17T12:31:31.891315+00:00'
 apm_version: 0.8.11
 dependencies:
 - repo_url: _local/agents
   package_type: apm_package
   deployed_files:
   - .claude/commands/whatchanged.md
+  - .claude/rules/apm-workflow.md
   - .claude/rules/architecture.md
   - .claude/rules/code-police-rules.md
   - .claude/rules/e2e-testing.md
   - .claude/rules/hickey-catalog.md
+  - .claude/rules/lowy-volatilities.md
   - .claude/rules/nix.md
   - .claude/rules/solidjs.md
   - .claude/rules/state.md
   - .claude/rules/streaming.md
   - .claude/rules/toast-conventions.md
   - .claude/rules/workflow.md
+  - .claude/skills/ci
+  - .claude/skills/hk
+  - .claude/skills/perf-diagnose
+  - .claude/skills/test
   source: local
   local_path: ./agents
 - repo_url: anthropics/skills
@@ -47,15 +53,27 @@ dependencies:
   content_hash: sha256:67ff7ce606ad0378af382ad6cb84d9853bf70ec52d6fe40ed6b6f82ecd2c48c3
 - repo_url: srid/agency
   host: github.com
-  resolved_commit: 888548f2483149ac304882942c60732916b34a01
+  resolved_commit: 2c32579859c5aa936e9f528e5f0418b08d04e611
   resolved_ref: master
   package_type: apm_package
   deployed_files:
-  - .claude/commands/do.md
+  - .claude/agents/hickey.md
+  - .claude/agents/lowy.md
   - .claude/commands/talk.md
   - .claude/hooks/agency/scripts/do-stop-guard.sh
   - .claude/rules/apm-sources.md
   - .claude/skills/code-police
+  - .claude/skills/do
+  - .claude/skills/elegance
+  - .claude/skills/fact-check
   - .claude/skills/forge-pr
   - .claude/skills/hickey
-  content_hash: sha256:38a20197bcb411a82c2893ef852ca47ab30db9c14852d279e8753bd9c21ae386
+  - .claude/skills/lowy
+  - .claude/skills/ralph
+  deployed_file_hashes:
+    .claude/agents/hickey.md: sha256:edde9b0d3b27b947b7372f662b2e8652d136e0bb9af7924892b00450a1e586bc
+    .claude/agents/lowy.md: sha256:a1c8e5ba115439bcfa0d7e331f96e71b2d690ff2e5fb9b824bb5f588eb43ac75
+    .claude/commands/talk.md: sha256:ea870e64c4b4d6ec064c73c0087638dd2b9c41d0216105a2c72a77065d869fdd
+    .claude/hooks/agency/scripts/do-stop-guard.sh: sha256:b9d316555a1509eabb610d32cccdcd1dacaf926b2fd831a3178c30d283756d69
+    .claude/rules/apm-sources.md: sha256:8707579e05e2a39f01278b2d225f3cb2ec97912c65c94aa57e5830954f98eab1
+  content_hash: sha256:106be9c8c4739f401e0295f5bb91c916772ef3446034ab7e51b5b095808d6111

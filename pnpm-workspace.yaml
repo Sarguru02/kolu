@@ -1,6 +1,2 @@
 packages:
-  - common
-  - integrations/claude-code
-  - server
-  - client
-  - tests
+  - packages/**
