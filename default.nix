@@ -26,6 +26,8 @@ let
       ./packages/memorable-names
       ./packages/server
       ./packages/client
+      ./packages/transcript-core
+      ./packages/transcript-html
       # pnpm.patchedDependencies entries — read by pnpm during install and
       # applied to the upstream tarball. Currently:
       #   - node-pty@1.1.0.patch: adds a foregroundPid accessor wrapping
@@ -47,7 +49,7 @@ let
     # hash-fresh` enforces this stays in sync with pnpm-lock.yaml by forcing
     # fetchPnpmDeps to re-execute (--rebuild), so stale artifacts in the
     # binary cache can't silently satisfy a hash that no longer matches.
-    hash = "sha256-kvUBaRiuiTAVNhiMxuRjCgAOQw05EnCLwsUFD5MwuYg=";
+    hash = "sha256-WS5niKsdRweul42qUk3x/oUkSKAYvxkjZ45ZeMMh0zQ=";
     fetcherVersion = 3;
   };
 

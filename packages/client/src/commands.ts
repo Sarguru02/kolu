@@ -42,6 +42,7 @@ export interface CommandDeps extends ActionContext {
   handleCopyTerminalText: () => void;
   handleRunInActiveTerminal: (command: string) => void;
   handleExportScrollbackAsPdf: () => void;
+  handleExportSessionAsHtml: () => void;
   // Theme
   committedThemeName: Accessor<string>;
   setPreviewThemeName: (name: string | undefined) => void;
@@ -129,6 +130,16 @@ export function createCommands(deps: CommandDeps): Accessor<PaletteCommand[]> {
             name: "Export scrollback as PDF",
             onSelect: () => deps.handleExportScrollbackAsPdf(),
           },
+          ...(deps.activeMeta()?.agent
+            ? [
+                {
+                  name: "Export agent session as HTML",
+                  description:
+                    "Open a self-contained transcript of the current Claude Code, OpenCode, or Codex session",
+                  onSelect: () => deps.handleExportSessionAsHtml(),
+                },
+              ]
+            : []),
           actionPaletteCommand("screenshotTerminal", deps),
         ]
       : []),
