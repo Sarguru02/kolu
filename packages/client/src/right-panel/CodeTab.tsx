@@ -6,11 +6,12 @@
  *   - Branch: working tree vs `merge-base(origin/<default>)` — same, with a
  *     branch base. Forge-agnostic "what this branch will ship".
  *
- * The mode trio is structured as a nested segmented control: All sits
- * apart from the Local/Branch pair because Local and Branch are siblings
- * (both filter to changed files; only the diff base differs), while All
- * is the unfiltered base view. Pierre's `@pierre/trees` owns the tree
- * layout/search/virtualization; `@pierre/diffs` owns diff parsing and
+ * The toolbar combines two independent filter axes — mode picker
+ * (`ModeChipPicker`) and filename input (`FileSearchInput`) — in one
+ * row. Pierre's built-in tree-header search is disabled so the
+ * `FileSearchInput` is the single source of filter state, forwarded
+ * via `PierreFileTree.searchQuery`. Pierre's `@pierre/trees` owns the
+ * tree layout/virtualization; `@pierre/diffs` owns diff parsing and
  * shiki highlighting. This component is just data flow + chrome. */
 
 import type { CodeTabView, GitDiffMode, TerminalMetadata } from "kolu-common";
@@ -28,22 +29,18 @@ import { toast } from "solid-sonner";
 import { createReactiveSubscription } from "../rpc/createReactiveSubscription";
 import { stream } from "../rpc/rpc";
 import { useColorScheme } from "../settings/useColorScheme";
-import { FileDiffIcon, GitBranchIcon } from "../ui/Icons";
+import { FileBrowseIcon, FileDiffIcon, GitBranchIcon } from "../ui/Icons";
 import PierreDiffView from "../ui/PierreDiffView";
 import PierreFileTree, { toGitStatusEntries } from "../ui/PierreFileTree";
 import BrowseFileView from "./BrowseFileView";
+import FileSearchInput from "./FileSearchInput";
+import ModeChipPicker, { type ModeOption } from "./ModeChipPicker";
 import { useRightPanel } from "./useRightPanel";
 
 const EMPTY_STATE: Record<GitDiffMode, string> = {
   local: "No local changes",
   branch: "No changes vs base",
 };
-
-/** Pill button shared by both segment groups. Inherits the same active-state
- *  chrome the canvas tile chrome uses (lifted surface-0 + soft shadow), so
- *  the mode picker reads as a continuation of kolu's existing tab language. */
-const PILL_BUTTON_CLASS =
-  "px-2 h-5 rounded text-[10px] font-mono cursor-pointer transition-colors text-fg-3/50 hover:text-fg-2 data-[active=true]:text-fg data-[active=true]:bg-surface-0 data-[active=true]:shadow-sm";
 
 const FileSelectHint: Component<{ label: string }> = (props) => (
   <div class="flex flex-col items-center justify-center h-full text-fg-3/40 gap-2">
@@ -67,6 +64,10 @@ const CodeTab: Component<{ meta: TerminalMetadata | null }> = (props) => {
   const isDiffView = () => view() !== "browse";
   const diffMode = (): GitDiffMode | undefined =>
     view() === "browse" ? undefined : (view() as GitDiffMode);
+
+  // Filename filter — drives Pierre's tree filter externally. Reset on
+  // mode switch so a stale needle doesn't hide the wrong file set.
+  const [searchQuery, setSearchQuery] = createSignal("");
 
   const status = createReactiveSubscription(
     () => {
@@ -108,8 +109,17 @@ const CodeTab: Component<{ meta: TerminalMetadata | null }> = (props) => {
 
   // Reset selection when the repo or view changes so a stale path doesn't
   // bleed across modes (e.g. a browse-mode pick showing up in diff mode).
+  // Same reset clears the filename filter — the search needle was scoped
+  // to the previous file set and rarely makes sense post-switch.
   createEffect(
-    on([repoPath, view], () => setSelectedPath(null), { defer: true }),
+    on(
+      [repoPath, view],
+      () => {
+        setSelectedPath(null);
+        setSearchQuery("");
+      },
+      { defer: true },
+    ),
   );
 
   const treePaths = createMemo(() => {
@@ -129,8 +139,39 @@ const CodeTab: Component<{ meta: TerminalMetadata | null }> = (props) => {
   const treeError = (): Error | undefined =>
     isDiffView() ? status.error() : allPaths.error();
   const treeReady = () => (isDiffView() ? status() : allPaths());
-  const branchTooltip = () =>
-    `Changes vs ${status()?.base?.ref ?? "branch base"}`;
+  const branchRef = (): string | null => status()?.base?.ref ?? null;
+
+  // Mode catalog — owns the list of views, their labels, hints, and
+  // test IDs. Adding a new mode (e.g. "stash") happens here, plus the
+  // data-source switch above. ModeChipPicker is purely a presenter.
+  const modeOptions = createMemo<ModeOption[]>(() => {
+    const ref = branchRef();
+    return [
+      {
+        view: "browse",
+        label: "All files",
+        hint: "Browse the whole repo",
+        testId: "diff-mode-browse",
+        icon: FileBrowseIcon,
+      },
+      {
+        view: "local",
+        group: "Git",
+        label: "Local",
+        hint: "Working tree vs HEAD",
+        testId: "diff-mode-local",
+        icon: GitBranchIcon,
+      },
+      {
+        view: "branch",
+        group: "Git",
+        label: "Branch",
+        hint: ref ? `vs ${ref}` : "Working tree vs branch base",
+        testId: "diff-mode-branch",
+        icon: GitBranchIcon,
+      },
+    ];
+  });
 
   /** Diff value narrowed to "this is a pure-rename" (no hunks, both old +
    *  new file names present and different). Returning the full diff so the
@@ -163,45 +204,13 @@ const CodeTab: Component<{ meta: TerminalMetadata | null }> = (props) => {
         class="flex flex-col h-full min-h-0 text-[11px]"
         data-testid="diff-tab"
       >
-        <div class="flex items-center h-7 px-1.5 bg-surface-1/30 border-b border-edge shrink-0 gap-1.5">
-          <div class="flex items-center bg-surface-2/40 rounded p-0.5">
-            <button
-              type="button"
-              onClick={() => setView("browse")}
-              title="Browse all files"
-              class={PILL_BUTTON_CLASS}
-              data-testid="diff-mode-browse"
-              data-active={view() === "browse"}
-              aria-pressed={view() === "browse"}
-            >
-              All
-            </button>
-          </div>
-          <div class="flex items-center bg-surface-2/40 rounded p-0.5 gap-0.5">
-            <button
-              type="button"
-              onClick={() => setView("local")}
-              title="Changes vs HEAD"
-              class={PILL_BUTTON_CLASS}
-              data-testid="diff-mode-local"
-              data-active={view() === "local"}
-              aria-pressed={view() === "local"}
-            >
-              Local
-            </button>
-            <button
-              type="button"
-              onClick={() => setView("branch")}
-              title={branchTooltip()}
-              class={PILL_BUTTON_CLASS}
-              data-testid="diff-mode-branch"
-              data-active={view() === "branch"}
-              aria-pressed={view() === "branch"}
-            >
-              Branch
-            </button>
-          </div>
-          <div class="flex-1" />
+        <div class="flex items-center h-7 px-1.5 bg-surface-1/30 border-b border-edge shrink-0 gap-2">
+          <ModeChipPicker
+            view={view()}
+            onViewChange={setView}
+            modes={modeOptions()}
+          />
+          <FileSearchInput value={searchQuery()} onChange={setSearchQuery} />
         </div>
 
         <div
@@ -237,6 +246,8 @@ const CodeTab: Component<{ meta: TerminalMetadata | null }> = (props) => {
                   selectedPath={selectedPath()}
                   onSelect={handleSelect}
                   initialExpansion={isDiffView() ? "open" : "closed"}
+                  search={false}
+                  searchQuery={searchQuery()}
                 />
               </Show>
             </Match>
