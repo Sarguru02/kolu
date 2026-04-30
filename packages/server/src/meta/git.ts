@@ -11,11 +11,11 @@
  */
 
 import { subscribeGitInfo } from "kolu-git";
-import type { TerminalProcess } from "../terminals.ts";
-import { subscribeForTerminal, publishForTerminal } from "../publisher.ts";
-import { updateServerMetadata } from "./index.ts";
-import { log } from "../log.ts";
 import { trackRecentRepo } from "../activity.ts";
+import { log } from "../log.ts";
+import { publishForTerminal, subscribeForTerminal } from "../publisher.ts";
+import type { TerminalProcess } from "../terminal-registry.ts";
+import { updateServerMetadata } from "./state.ts";
 
 export function startGitProvider(
   entry: TerminalProcess,

@@ -1,15 +1,15 @@
 /** Per-terminal runtime refs (xterm instance + addons).
  *
  *  Handlers outside the Terminal component sometimes need the live xterm
- *  instance or one of its addons — e.g. "Export session as PDF" needs the
+ *  instance or one of its addons — e.g. "Export scrollback as PDF" needs the
  *  SerializeAddon to produce themed HTML. Rather than drill callbacks through
  *  CanvasTile or reach into the DOM, Terminal.tsx registers its refs here on
  *  mount and unregisters on cleanup. The `__xterm` DOM attachment on the
  *  container stays as an e2e-only affordance; production code looks up refs
  *  by id through this module. */
 
-import type { Terminal as XTerm } from "@xterm/xterm";
 import type { SerializeAddon } from "@xterm/addon-serialize";
+import type { Terminal as XTerm } from "@xterm/xterm";
 import type { TerminalId } from "kolu-common";
 
 /** Volatile per-terminal probes. Unlike the stable `xterm`/`serialize`

@@ -1,6 +1,7 @@
-import { When, Then } from "@cucumber/cucumber";
-import { KoluWorld, MOD_KEY, POLL_TIMEOUT } from "../support/world.ts";
 import * as assert from "node:assert";
+import { Then, When } from "@cucumber/cucumber";
+import { type KoluWorld, MOD_KEY, POLL_TIMEOUT } from "../support/world.ts";
+
 const PALETTE_SELECTOR = '[data-testid="command-palette"]';
 
 When("I open the command palette", async function (this: KoluWorld) {
@@ -27,7 +28,7 @@ When(
     // Wait for at least one result to appear (filter is synchronous in SolidJS)
     if (text.length > 0) {
       await this.page
-        .locator(`${PALETTE_SELECTOR} li`)
+        .locator(`${PALETTE_SELECTOR} [role="option"]`)
         .first()
         .waitFor({ state: "visible", timeout: POLL_TIMEOUT })
         .catch(() => {}); // Some filters may yield zero results
@@ -47,7 +48,7 @@ When(
     const palette = this.page.locator(PALETTE_SELECTOR);
     // Use exact text match to avoid ambiguity (e.g. "Nord" vs "One Nord")
     const item = palette
-      .locator("li")
+      .locator('[role="option"]')
       .filter({ hasText: new RegExp(`^${text}`) });
     await item.first().waitFor({ state: "visible", timeout: POLL_TIMEOUT });
     await item.first().click();
@@ -70,7 +71,7 @@ Then(
 Then(
   "the command palette should show {int} result(s)",
   async function (this: KoluWorld, expected: number) {
-    const items = this.page.locator(`${PALETTE_SELECTOR} li`);
+    const items = this.page.locator(`${PALETTE_SELECTOR} [role="option"]`);
     const count = await items.count();
     assert.strictEqual(
       count,
@@ -85,7 +86,7 @@ Then(
   async function (this: KoluWorld, index: number) {
     await this.page.waitForFunction(
       ([sel, idx]) => {
-        const items = document.querySelectorAll(`${sel} li`);
+        const items = document.querySelectorAll(`${sel} [role="option"]`);
         return items[idx]?.hasAttribute("data-selected") ?? false;
       },
       [PALETTE_SELECTOR, index - 1] as const,
@@ -99,7 +100,7 @@ Then(
   async function (this: KoluWorld) {
     await this.page.waitForFunction(
       (sel) => {
-        const items = document.querySelectorAll(`${sel} li`);
+        const items = document.querySelectorAll(`${sel} [role="option"]`);
         if (items.length === 0) return false;
         return items[items.length - 1]?.hasAttribute("data-selected") ?? false;
       },
@@ -118,7 +119,7 @@ When(
     await breadcrumb.click();
     // Wait for the palette items to refresh after navigating back
     await this.page
-      .locator(`${PALETTE_SELECTOR} li`)
+      .locator(`${PALETTE_SELECTOR} [role="option"]`)
       .first()
       .waitFor({ state: "visible", timeout: POLL_TIMEOUT });
   },
@@ -150,7 +151,9 @@ Then(
   async function (this: KoluWorld, text: string) {
     const palette = this.page.locator(PALETTE_SELECTOR);
     // Anchor to start of text to avoid substring matches (e.g. "Theme" vs "Random theme")
-    const item = palette.locator("li", { hasText: new RegExp(`^${text}`) });
+    const item = palette.locator('[role="option"]', {
+      hasText: new RegExp(`^${text}`),
+    });
     await item.waitFor({ state: "visible", timeout: POLL_TIMEOUT });
     const content = await item.textContent();
     assert.ok(
@@ -164,7 +167,7 @@ Then(
   "palette item {string} should show shortcut {string}",
   async function (this: KoluWorld, text: string, shortcut: string) {
     const palette = this.page.locator(PALETTE_SELECTOR);
-    const item = palette.locator("li", { hasText: text });
+    const item = palette.locator('[role="option"]', { hasText: text });
     await item.waitFor({ state: "visible", timeout: POLL_TIMEOUT });
     const kbd = item.locator("kbd").first();
     const kbdText = await kbd.textContent();
@@ -197,7 +200,7 @@ Then(
   async function (this: KoluWorld, text: string) {
     const palette = this.page.locator(PALETTE_SELECTOR);
     const item = palette
-      .locator("li")
+      .locator('[role="option"]')
       .filter({ hasText: new RegExp(`^${text}`) });
     await item.first().waitFor({ state: "visible", timeout: POLL_TIMEOUT });
   },
@@ -239,7 +242,7 @@ Then(
   "no sendInput call should contain {string}",
   async function (this: KoluWorld, key: string) {
     const messages: string[] = await this.page.evaluate(
-      () => (window as any).__wsSent ?? [],
+      () => window.__wsSent ?? [],
     );
     for (const msg of messages) {
       if (!msg.includes("sendInput")) continue;

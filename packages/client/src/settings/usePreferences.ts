@@ -21,13 +21,13 @@
  * (activity feed, session) can no longer trigger a stomp at all.
  */
 
+import type { Preferences, PreferencesPatch } from "kolu-common";
+import { DEFAULT_PREFERENCES } from "kolu-common/config";
 import { createEffect, createRoot, on } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
 import { toast } from "solid-sonner";
 import { createSubscription } from "../rpc/createSubscription";
 import { client, stream } from "../rpc/rpc";
-import { DEFAULT_PREFERENCES } from "kolu-common/config";
-import type { Preferences, PreferencesPatch } from "kolu-common";
 
 const [prefs, setPrefs] = createStore<Preferences>(DEFAULT_PREFERENCES);
 let initialized = false;
@@ -61,7 +61,7 @@ function updatePreferences(patch: PreferencesPatch) {
   if (Object.keys(rest).length > 0) setPrefs(rest);
   if (rpPatch) {
     const { tab, ...rpRest } = rpPatch;
-    // Scalar fields of rightPanel (collapsed, size, pinned) go through the
+    // Scalar fields of rightPanel (collapsed, size) go through the
     // normal merge — any path form works for primitives.
     if (Object.keys(rpRest).length > 0) {
       setPrefs("rightPanel", rpRest as Partial<Preferences["rightPanel"]>);

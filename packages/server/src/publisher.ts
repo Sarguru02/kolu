@@ -8,12 +8,12 @@
 
 import { MemoryPublisher } from "@orpc/experimental-publisher/memory";
 import type {
-  TerminalInfo,
-  TerminalMetadata,
+  ActivityFeed,
   GitInfo,
   Preferences,
-  ActivityFeed,
   SavedSession,
+  TerminalInfo,
+  TerminalMetadata,
 } from "kolu-common";
 import { log } from "./log.ts";
 
@@ -29,6 +29,10 @@ type TerminalChannels = {
   git: GitInfo | null;
   /** Raw PTY output bytes — high frequency, drives xterm.js */
   data: string;
+  /** Raw command string from OSC 633;E preexec mark — triggers agent-command
+   *  tracking (per-terminal stash + recent-agents MRU). Not retained; each
+   *  event is an isolated "the user just typed this" notice. */
+  commandRun: string;
   /** Terminal process exited — fires once per terminal lifetime */
   exit: number;
 };
@@ -39,7 +43,7 @@ type SystemChannels = {
    *  Distinct from `session:changed`: this is the autosave *trigger*
    *  (control flow), not the saved-session content. */
   "terminals:dirty": Record<string, never>;
-  /** Terminal list changed (create/kill/reorder) — drives live list query */
+  /** Terminal list changed (create/kill) — drives live list query */
   "terminal-list": TerminalInfo[];
   /** User preferences changed — drives the preferences live query.
    *  Fired on every `updatePreferences` write. */
@@ -54,7 +58,17 @@ type SystemChannels = {
 
 // The publisher accepts any string channel at runtime.
 // Terminal channels are namespaced as "channel:terminalId"; system channels are used as-is.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+//
+// `MemoryPublisher` constrains its generic to `Record<string, object>`,
+// which excludes the primitive payloads kolu actually publishes (strings
+// like terminal data + cwd + title, numbers like exit codes). The
+// generic itself is dead weight here: type safety on actual publish/
+// subscribe calls is enforced by the typed wrappers below
+// (`publishForTerminal` / `publishSystem` / `subscribeForTerminal` /
+// `subscribeSystem`) using Kolu's own `TerminalChannels` and
+// `SystemChannels`. So this `any` widens *only* the unused library
+// generic; every real call site is still strictly typed.
+// biome-ignore lint/suspicious/noExplicitAny: library's Record<string, object> generic is too strict for our primitive payloads (data: string, exit: number, …); call-site types come from the typed wrappers below, not from this generic.
 export const publisher = new MemoryPublisher<Record<string, any>>();
 
 /** Total pending events + active listeners across all channels. Exposed for

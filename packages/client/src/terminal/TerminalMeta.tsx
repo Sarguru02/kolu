@@ -10,10 +10,13 @@
  *  separate components, with shared bits (skeleton, agent progress)
  *  exported below for reuse. */
 
+import { prUnavailableSource, prValue } from "kolu-common/pr";
 import { type Component, Show } from "solid-js";
-import ChecksIndicator from "./ChecksIndicator";
-import Tip from "../ui/Tip";
 import { PrStateIcon, WorktreeIcon } from "../ui/Icons";
+import Tip from "../ui/Tip";
+import ChecksIndicator from "./ChecksIndicator";
+import { copyTextWithToast } from "./clipboard";
+import { PrUnavailableButton } from "./PrUnavailablePopover";
 import type { TerminalDisplayInfo } from "./terminalDisplay";
 
 const TerminalMeta: Component<{
@@ -35,7 +38,7 @@ const TerminalMeta: Component<{
            *  process title. */}
           <div class="flex items-center gap-1.5 min-h-7 text-sm font-medium min-w-0">
             <NameSpan info={info()} />
-            <Show when={info().meta.displaySuffix}>
+            <Show when={info().key.suffix}>
               {(suffix) => (
                 <span
                   data-testid="terminal-meta-suffix"
@@ -74,8 +77,7 @@ const TerminalMeta: Component<{
             </Show>
           </div>
 
-          {/* Branch + PR — combined row. Tooltip on branch shows full
-           *  name when truncated. PR (if present) follows inline:
+          {/* Branch + PR — combined row. PR (if present) follows inline:
            *  state icon, checks indicator, linked #N, truncated title. */}
           <Show
             when={info().meta.git}
@@ -87,17 +89,28 @@ const TerminalMeta: Component<{
           >
             {(git) => (
               <div class="flex items-center gap-1.5 min-w-0 text-xs">
-                <Tip label={git().branch}>
-                  <span
+                <Tip label="Copy branch name">
+                  <button
+                    type="button"
                     data-testid="terminal-meta-branch"
-                    class="truncate shrink-0 max-w-[16ch]"
+                    aria-label={`Copy branch ${git().branch} to clipboard`}
+                    class="appearance-none bg-transparent border-0 p-0 text-left [font:inherit] truncate shrink-0 max-w-[16ch] cursor-pointer hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 rounded-sm"
                     style={{ color: info().branchColor }}
                     classList={{ "text-fg-2": !info().branchColor }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void copyTextWithToast(git().branch, {
+                        success: "Copied branch name to clipboard",
+                        failure: "Failed to copy branch name",
+                      });
+                    }}
+                    onDblClick={(e) => e.stopPropagation()}
                   >
                     {git().branch}
-                  </span>
+                  </button>
                 </Tip>
-                <Show when={info().meta.pr}>
+                <Show when={prValue(info().meta.pr)}>
                   {(pr) => (
                     <span
                       class="flex items-center gap-1 text-fg-2 truncate min-w-0"
@@ -119,6 +132,14 @@ const TerminalMeta: Component<{
                       </a>
                       <span class="truncate">{pr().title}</span>
                     </span>
+                  )}
+                </Show>
+                <Show when={prUnavailableSource(info().meta.pr)}>
+                  {(source) => (
+                    <PrUnavailableButton
+                      source={source()}
+                      testId="terminal-meta-pr-unavailable"
+                    />
                   )}
                 </Show>
               </div>
@@ -148,21 +169,19 @@ export const TerminalMetaCompact: Component<{
           </Show>
           <Show when={info().meta.git}>
             {(git) => (
-              <Tip label={git().branch}>
-                <span
-                  data-testid="terminal-meta-branch"
-                  class="text-xs truncate min-w-0"
-                  style={{ color: info().branchColor }}
-                  classList={{ "text-fg-2": !info().branchColor }}
-                >
-                  {git().branch}
-                </span>
-              </Tip>
+              <span
+                data-testid="terminal-meta-branch"
+                class="text-xs truncate min-w-0"
+                style={{ color: info().branchColor }}
+                classList={{ "text-fg-2": !info().branchColor }}
+              >
+                {git().branch}
+              </span>
             )}
           </Show>
           {/* Anchor stops propagation so a tap on the PR doesn't toggle
            *  the enclosing Drawer.Trigger. */}
-          <Show when={info().meta.pr}>
+          <Show when={prValue(info().meta.pr)}>
             {(pr) => (
               <a
                 data-testid="terminal-meta-pr-compact"
@@ -176,6 +195,14 @@ export const TerminalMetaCompact: Component<{
               >
                 #{pr().number}
               </a>
+            )}
+          </Show>
+          <Show when={prUnavailableSource(info().meta.pr)}>
+            {(source) => (
+              <PrUnavailableButton
+                source={source()}
+                testId="terminal-meta-pr-unavailable-compact"
+              />
             )}
           </Show>
           <Show when={info().meta.agent?.taskProgress}>
@@ -199,7 +226,7 @@ const NameSpan: Component<{ info: TerminalDisplayInfo }> = (props) => (
     style={{ color: props.info.repoColor }}
     title={props.info.meta.cwd}
   >
-    {props.info.name}
+    {props.info.key.group}
   </span>
 );
 

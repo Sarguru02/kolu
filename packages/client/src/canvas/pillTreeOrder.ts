@@ -5,11 +5,7 @@
  *  handler so the two views never diverge. */
 
 import type { TerminalId } from "kolu-common";
-import { cwdBasename } from "../path";
-import {
-  terminalName,
-  type TerminalDisplayInfo,
-} from "../terminal/terminalDisplay";
+import type { TerminalDisplayInfo } from "../terminal/terminalDisplay";
 import type { TileLayout } from "./TileLayout";
 
 export interface PillBranch {
@@ -18,7 +14,8 @@ export interface PillBranch {
   label: string;
   /** Short id-prefix suffix ("#a3f2") shown after the label when this
    *  terminal collides on identity with another (same repo+branch, or
-   *  same cwd for non-git). Mirrors `meta.displaySuffix` from the server. */
+   *  same cwd for non-git). Derived client-side from the live terminal
+   *  set via `computeTerminalKeys`. */
   suffix?: string;
 }
 
@@ -34,15 +31,15 @@ export interface PillRepoGroup {
  *  themselves sort by the min-x of their branches — so the pill tree
  *  reads left-to-right exactly as tiles sit on the canvas. Tiles
  *  without a layout (yet) and the no-layout caller (mobile, where
- *  there is no canvas) fall back to `sortOrder` — caller passes ids in
- *  sortOrder, and the original insertion order is preserved as the
- *  fallback. */
+ *  there is no canvas) fall back to the caller's input order, which
+ *  is the server's canonical Map insertion order. */
 export function groupByRepo(
   ids: TerminalId[],
   getDisplayInfo: (id: TerminalId) => TerminalDisplayInfo | undefined,
   getLayout?: (id: TerminalId) => TileLayout | undefined,
 ): PillRepoGroup[] {
-  const order: string[] = [];
+  // `Map` preserves insertion order, so this single structure is the
+  // sole source of truth for both grouping and traversal order.
   const groups = new Map<string, PillRepoGroup>();
   // Per-id layout cached for sort comparisons — undefined when no
   // layout yet OR when the caller didn't provide `getLayout`.
@@ -53,39 +50,35 @@ export function groupByRepo(
   for (const id of ids) {
     const info = getDisplayInfo(id);
     if (!info) continue;
-    const meta = info.meta;
-    const repoName = meta.git?.repoName || cwdBasename(meta.cwd) || "terminal";
-    let group = groups.get(repoName);
+    const groupKey = info.key.group;
+    let group = groups.get(groupKey);
     if (!group) {
-      group = { repoName, branches: [] };
-      groups.set(repoName, group);
-      order.push(repoName);
+      group = { repoName: groupKey, branches: [] };
+      groups.set(groupKey, group);
     }
     group.branches.push({
       id,
-      label: meta.git?.branch ?? terminalName(meta),
-      suffix: meta.displaySuffix,
+      label: info.key.label,
+      suffix: info.key.suffix,
     });
     if (getLayout) {
       const layout = getLayout(id);
       layoutOf.set(id, layout);
       if (layout) {
-        const prev = repoMinX.get(repoName);
+        const prev = repoMinX.get(groupKey);
         if (prev === undefined || layout.x < prev) {
-          repoMinX.set(repoName, layout.x);
+          repoMinX.set(groupKey, layout.x);
         }
       }
     }
   }
 
-  if (!getLayout) {
-    return order.map((name) => groups.get(name)!);
-  }
+  if (!getLayout) return [...groups.values()];
 
   // Spatial sort. Tiles without a layout sort to the END of their
   // repo group (using +Infinity); repos with no laid-out tiles sort
-  // to the end (using +Infinity). Ties broken by sortOrder via the
-  // pre-existing array order — `sort` is stable in modern engines.
+  // to the end (using +Infinity). Ties broken by input array order via
+  // the pre-existing array order — `sort` is stable in modern engines.
   for (const group of groups.values()) {
     group.branches.sort((a, b) => {
       const ax = layoutOf.get(a.id)?.x ?? Infinity;
@@ -96,12 +89,12 @@ export function groupByRepo(
       return ay - by;
     });
   }
-  return order
-    .slice()
+  return [...groups.entries()]
     .sort(
-      (a, b) => (repoMinX.get(a) ?? Infinity) - (repoMinX.get(b) ?? Infinity),
+      ([a], [b]) =>
+        (repoMinX.get(a) ?? Infinity) - (repoMinX.get(b) ?? Infinity),
     )
-    .map((name) => groups.get(name)!);
+    .map(([, group]) => group);
 }
 
 /** Flat traversal of the grouped order — used by mobile swipe to cycle

@@ -1,12 +1,12 @@
-import { Given, When, Then } from "@cucumber/cucumber";
+import * as assert from "node:assert";
+import * as os from "node:os";
+import { Given, Then, When } from "@cucumber/cucumber";
+import type { SavedTerminal } from "kolu-common";
 import {
-  KoluWorld,
+  type KoluWorld,
   PILL_TREE_ENTRY_SELECTOR,
   POLL_TIMEOUT,
 } from "../support/world.ts";
-import * as assert from "node:assert";
-import * as os from "node:os";
-import type { SavedTerminal } from "kolu-common";
 
 /** Post the saved-session payload to the server. Used both at scenario
  *  setup (Given) and as a self-heal in the assertion. Idempotent. */
@@ -17,7 +17,7 @@ async function postSavedSession(
   const dirs = [os.homedir(), os.tmpdir(), "/"].slice(0, count);
   await postSavedSessionPayload(
     page,
-    dirs.map((cwd, i) => ({ id: String(i), cwd })),
+    dirs.map((cwd, i) => ({ id: String(i), cwd, git: null })),
   );
 }
 
@@ -127,30 +127,24 @@ Then(
 
 // --- Ordering scenario ---
 
-/** Directories used for the reversed-sort-order scenario.
- *  Array order is alphabetical; sortOrder is assigned in reverse so that
- *  a correct restore should produce pill tree order /etc, /tmp, /var
- *  (sortOrder 1000, 2000, 3000) even though the array is /etc, /tmp, /var. */
-const ORDERED_DIRS = ["/etc", "/tmp", "/var"];
+/** Directories for the array-order scenario. Posted in this non-alphabetical
+ *  order to prove the client honors the saved session's array order rather
+ *  than silently re-sorting by cwd or anything else derived. */
+const ORDERED_DIRS = ["/var", "/tmp", "/etc"];
 
-Given(
-  "a saved session with reversed sort order",
-  async function (this: KoluWorld) {
-    this.savedSessionTerminalCount = ORDERED_DIRS.length;
-    // Array order: /etc(3000), /tmp(2000), /var(1000)
-    // Expected pill tree order after restore: /var, /tmp, /etc (ascending sortOrder)
-    const terminals = ORDERED_DIRS.map((cwd, i) => ({
-      id: String(i),
-      cwd,
-      sortOrder: (ORDERED_DIRS.length - i) * 1000,
-    }));
-    this.savedSessionTerminals = terminals;
-    await postSavedSessionPayload(this.page, terminals);
-  },
-);
+Given("a saved session in a specific order", async function (this: KoluWorld) {
+  this.savedSessionTerminalCount = ORDERED_DIRS.length;
+  const terminals = ORDERED_DIRS.map((cwd, i) => ({
+    id: String(i),
+    cwd,
+    git: null,
+  }));
+  this.savedSessionTerminals = terminals;
+  await postSavedSessionPayload(this.page, terminals);
+});
 
 Then(
-  "the pill tree entries should be in sort order",
+  "the pill tree entries should be in the saved order",
   async function (this: KoluWorld) {
     const entries = this.page.locator(PILL_TREE_ENTRY_SELECTOR);
     const count = await entries.count();
@@ -159,12 +153,10 @@ Then(
       const title = await entries.nth(i).getAttribute("title");
       titles.push(title ?? "");
     }
-    // Ascending sortOrder: /var(1000), /tmp(2000), /etc(3000)
-    const expected = [...ORDERED_DIRS].reverse();
     assert.deepStrictEqual(
       titles,
-      expected,
-      `Pill tree order ${JSON.stringify(titles)} doesn't match expected ${JSON.stringify(expected)}`,
+      ORDERED_DIRS,
+      `Pill tree order ${JSON.stringify(titles)} doesn't match expected ${JSON.stringify(ORDERED_DIRS)}`,
     );
   },
 );
@@ -175,9 +167,53 @@ Given(
   "a saved session with theme {string}",
   async function (this: KoluWorld, themeName: string) {
     this.savedSessionTerminalCount = 1;
-    const terminals = [{ id: "0", cwd: os.homedir(), themeName }];
+    const terminals = [{ id: "0", cwd: os.homedir(), git: null, themeName }];
     this.savedSessionTerminals = terminals;
     await postSavedSessionPayload(this.page, terminals);
+  },
+);
+
+// --- Canvas layout restore scenario ---
+
+Given(
+  "a saved session with canvas layout at x={int} y={int} w={int} h={int}",
+  async function (this: KoluWorld, x: number, y: number, w: number, h: number) {
+    this.savedSessionTerminalCount = 1;
+    const terminals = [
+      {
+        id: "0",
+        cwd: os.homedir(),
+        git: null,
+        canvasLayout: { x, y, w, h },
+      },
+    ];
+    this.savedSessionTerminals = terminals;
+    await postSavedSessionPayload(this.page, terminals);
+  },
+);
+
+Then(
+  "the canvas tile should be at x={int} y={int} w={int} h={int}",
+  async function (this: KoluWorld, x: number, y: number, w: number, h: number) {
+    // Poll — the tile's inline style may briefly reflect a pending layout
+    // while the server's metadata echo is in flight on first paint.
+    await this.page.waitForFunction(
+      (expected) => {
+        const tile = document.querySelector<HTMLElement>(
+          '[data-testid="canvas-tile"]',
+        );
+        if (!tile) return false;
+        const s = tile.style;
+        return (
+          s.left === `${expected.x}px` &&
+          s.top === `${expected.y}px` &&
+          s.width === `${expected.w}px` &&
+          s.height === `${expected.h}px`
+        );
+      },
+      { x, y, w, h },
+      { timeout: POLL_TIMEOUT },
+    );
   },
 );
 
@@ -204,6 +240,128 @@ Then(
         return entry?.hasAttribute("data-active") ?? false;
       },
       id,
+      { timeout: POLL_TIMEOUT },
+    );
+  },
+);
+
+// --- Agent-resume scenarios ---
+
+Given(
+  "terminal {int} has captured agent command {string}",
+  async function (this: KoluWorld, index: number, command: string) {
+    // Idempotent edit to the saved session's `lastAgentCommand` field for
+    // the matching terminal. Relies on an earlier
+    // "a saved session with N terminals" step seeding ids "0", "1", … and
+    // stashing the payload on `this.savedSessionTerminals`.
+    const id = String(index);
+    const terminals =
+      this.savedSessionTerminals ??
+      [...Array(this.savedSessionTerminalCount ?? 0)].map((_, i) => ({
+        id: String(i),
+        cwd: [os.homedir(), os.tmpdir(), "/"][i] ?? "/",
+        git: null,
+      }));
+    const updated: SavedTerminal[] = terminals.map((t) =>
+      t.id === id ? { ...t, lastAgentCommand: command } : t,
+    );
+    this.savedSessionTerminals = updated;
+    await postSavedSessionPayload(this.page, updated);
+  },
+);
+
+Then(
+  "the restore card should show agent command {string}",
+  async function (this: KoluWorld, command: string) {
+    await this.page.waitForFunction(
+      (cmd) => {
+        const nodes = document.querySelectorAll(
+          '[data-testid="resume-command"]',
+        );
+        return Array.from(nodes).some((n) => n.textContent?.trim() === cmd);
+      },
+      command,
+      { timeout: POLL_TIMEOUT },
+    );
+  },
+);
+
+Then(
+  "the restore button should not mention {string}",
+  async function (this: KoluWorld, text: string) {
+    const btn = this.page.locator('[data-testid="restore-session"]');
+    await btn.waitFor({ state: "visible", timeout: POLL_TIMEOUT });
+    const content = await btn.textContent();
+    assert.ok(
+      !content?.includes(text),
+      `Expected restore button NOT to contain "${text}", got "${content}"`,
+    );
+  },
+);
+
+When("I turn off the resume-agents toggle", async function (this: KoluWorld) {
+  const toggle = this.page.locator('[data-testid="resume-agents-toggle"]');
+  await toggle.waitFor({ state: "visible", timeout: POLL_TIMEOUT });
+  await toggle.click();
+});
+
+Then(
+  "the restore card should not show agent command {string}",
+  async function (this: KoluWorld, command: string) {
+    // Wait for the command row to disappear. Uses waitForFunction so we poll
+    // the reactive DOM rather than race the toggle's state flush.
+    await this.page.waitForFunction(
+      (cmd) => {
+        const nodes = document.querySelectorAll(
+          '[data-testid="resume-command"]',
+        );
+        return !Array.from(nodes).some((n) => n.textContent?.trim() === cmd);
+      },
+      command,
+      { timeout: POLL_TIMEOUT },
+    );
+  },
+);
+
+// --- #714 regression: heading is basename, not full cwd ---
+
+Given(
+  "a saved session at cwd {string}",
+  async function (this: KoluWorld, cwd: string) {
+    this.savedSessionTerminalCount = 1;
+    const terminals: SavedTerminal[] = [{ id: "0", cwd, git: null }];
+    this.savedSessionTerminals = terminals;
+    await postSavedSessionPayload(this.page, terminals);
+  },
+);
+
+Then(
+  "the restore card heading should be {string}",
+  async function (this: KoluWorld, expected: string) {
+    await this.page.waitForFunction(
+      (exp) => {
+        const heading = document.querySelector('[data-testid="repo-heading"]');
+        return heading?.textContent?.trim() === exp;
+      },
+      expected,
+      { timeout: POLL_TIMEOUT },
+    );
+  },
+);
+
+Then(
+  "the restore card heading should not contain {string}",
+  async function (this: KoluWorld, forbidden: string) {
+    // Poll instead of reading once: the prior step settled the heading, but a
+    // bare textContent() + assert races SolidJS reactivity flushes on slow
+    // machines (e2e-poll-async-state rule).
+    await this.page.waitForFunction(
+      (f) => {
+        const heading = document.querySelector('[data-testid="repo-heading"]');
+        const text = heading?.textContent?.trim() ?? "";
+        return text.length > 0 && !text.includes(f);
+      },
+      forbidden,
       { timeout: POLL_TIMEOUT },
     );
   },

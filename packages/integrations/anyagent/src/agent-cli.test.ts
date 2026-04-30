@@ -1,7 +1,7 @@
 /** Unit tests for agent CLI parsing and normalization. */
 
-import { describe, it, expect } from "vitest";
-import { parseAgentCommand } from "./agent-cli.ts";
+import { describe, expect, it } from "vitest";
+import { parseAgentCommand, resumeAgentCommand } from "./agent-cli.ts";
 
 describe("parseAgentCommand", () => {
   // Table from juspay/kolu#452
@@ -95,6 +95,56 @@ describe("parseAgentCommand", () => {
     );
   });
 
+  it("preserves --yolo for opencode", () => {
+    expect(parseAgentCommand("opencode --yolo")).toBe("opencode --yolo");
+  });
+
+  it("preserves --yolo for codex", () => {
+    expect(parseAgentCommand("codex --yolo")).toBe("codex --yolo");
+  });
+
+  it("preserves --config for codex", () => {
+    expect(
+      parseAgentCommand(
+        `codex --yolo --model gpt-5.5 --config model_reasoning_effort="xhigh"`,
+      ),
+    ).toBe(
+      `codex --yolo --model gpt-5.5 --config model_reasoning_effort="xhigh"`,
+    );
+  });
+
+  it("preserves session-defining flags for codex", () => {
+    expect(
+      parseAgentCommand(
+        "codex --profile dev --sandbox workspace-write --ask-for-approval on-failure --full-auto --oss",
+      ),
+    ).toBe(
+      "codex --profile dev --sandbox workspace-write --ask-for-approval on-failure --full-auto --oss",
+    );
+  });
+
+  it("preserves -c short form for codex --config", () => {
+    expect(parseAgentCommand("codex -c model_reasoning_effort=high")).toBe(
+      "codex -c model_reasoning_effort=high",
+    );
+  });
+
+  it("preserves session-defining flags for claude", () => {
+    expect(
+      parseAgentCommand(
+        "claude --permission-mode plan --add-dir /tmp/foo --agent reviewer --mcp-config mcp.json --strict-mcp-config --append-system-prompt terse --settings settings.json --bare --disallowedTools Bash",
+      ),
+    ).toBe(
+      "claude --permission-mode plan --add-dir /tmp/foo --agent reviewer --mcp-config mcp.json --strict-mcp-config --append-system-prompt terse --settings settings.json --bare --disallowedTools Bash",
+    );
+  });
+
+  it("preserves --agent and --pure for opencode", () => {
+    expect(parseAgentCommand("opencode --agent build --pure")).toBe(
+      "opencode --agent build --pure",
+    );
+  });
+
   it("recognizes all known agents", () => {
     for (const agent of [
       "claude",
@@ -107,5 +157,42 @@ describe("parseAgentCommand", () => {
     ]) {
       expect(parseAgentCommand(agent)).toBe(agent);
     }
+  });
+});
+
+describe("resumeAgentCommand", () => {
+  it.each([
+    ["claude", "claude -c"],
+    ["claude --model sonnet", "claude -c --model sonnet"],
+    [
+      "claude --permission-mode plan --add-dir /tmp/foo",
+      "claude -c --permission-mode plan --add-dir /tmp/foo",
+    ],
+    ["codex", "codex resume --last"],
+    ["codex --yolo", "codex resume --last --yolo"],
+    [
+      `codex --yolo --model gpt-5.5 --config model_reasoning_effort="xhigh"`,
+      `codex resume --last --yolo --model gpt-5.5 --config model_reasoning_effort="xhigh"`,
+    ],
+    ["opencode", "opencode --continue"],
+    [
+      "opencode --agent build --pure",
+      "opencode --continue --agent build --pure",
+    ],
+  ])("resume form of %j → %j", (normalized, expected) => {
+    expect(resumeAgentCommand(normalized)).toBe(expected);
+  });
+
+  it("returns null for detection-only agents", () => {
+    expect(resumeAgentCommand("aider")).toBeNull();
+    expect(resumeAgentCommand("aider --model opus")).toBeNull();
+    expect(resumeAgentCommand("goose")).toBeNull();
+    expect(resumeAgentCommand("gemini")).toBeNull();
+    expect(resumeAgentCommand("cursor-agent")).toBeNull();
+  });
+
+  it("returns null for empty input", () => {
+    expect(resumeAgentCommand("")).toBeNull();
+    expect(resumeAgentCommand("   ")).toBeNull();
   });
 });

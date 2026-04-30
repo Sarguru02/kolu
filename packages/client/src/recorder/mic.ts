@@ -62,14 +62,13 @@ export async function openMicPreview(deviceId: string): Promise<void> {
       if (!preview) return;
       preview.analyser.getFloatTimeDomainData(preview.buf);
       let sum = 0;
-      for (let i = 0; i < preview.buf.length; i++) {
-        const v = preview.buf[i]!;
+      for (const v of preview.buf) {
         sum += v * v;
       }
       // Light nonlinear shaping so talking registers visibly without
       // clipping on louder syllables.
       const rms = Math.sqrt(sum / preview.buf.length);
-      const next = Math.min(1, Math.pow(rms, 0.5) * 2);
+      const next = Math.min(1, rms ** 0.5 * 2);
       if (Math.abs(next - level()) > 0.01) setLevel(next);
       preview.raf = requestAnimationFrame(tick);
     };

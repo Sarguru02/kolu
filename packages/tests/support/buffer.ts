@@ -25,7 +25,7 @@ export function readBufferText(
   index = 0,
 ): Promise<string> {
   return page.evaluate(
-    ({ sel, idx }) => (window as any).__readXtermBuffer(sel, idx),
+    ({ sel, idx }) => window.__readXtermBuffer?.(sel, idx) ?? "",
     { sel: selector, idx: index },
   );
 }
@@ -42,11 +42,15 @@ export async function waitForBufferContains(
 ): Promise<string> {
   const handle = await page.waitForFunction(
     ({ sel, idx, exp }) => {
-      const content = (window as any).__readXtermBuffer(sel, idx);
+      const content = window.__readXtermBuffer?.(sel, idx) ?? "";
       return content.includes(exp) ? content : null;
     },
     { sel: selector, idx: index, exp: expected },
     { timeout },
   );
-  return (await handle.jsonValue())!;
+  // The handle's predicate above returns either a non-null string (match)
+  // or `null`, and `waitForFunction` only resolves on a truthy value — so
+  // `jsonValue()` is structurally always a string by the time we read it.
+  // The `?? ""` fallback satisfies the type checker without a `!`.
+  return (await handle.jsonValue()) ?? "";
 }

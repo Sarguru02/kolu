@@ -17,16 +17,70 @@
  */
 
 import Conf from "conf";
-import { z } from "zod";
-import { DEFAULT_PREFERENCES } from "kolu-common/config";
 import {
-  PreferencesSchema,
-  RecentRepoSchema,
-  RecentAgentSchema,
-  SavedSessionSchema,
+  type GitInfo,
   type Preferences,
+  PreferencesSchema,
+  RecentAgentSchema,
+  RecentRepoSchema,
+  SavedSessionSchema,
 } from "kolu-common";
+import { DEFAULT_PREFERENCES } from "kolu-common/config";
+import { z } from "zod";
 import { log } from "./log.ts";
+
+/** Best-effort `GitInfo` from the legacy flat `repoName`/`branch` fields
+ *  shipped before #702. Path fields are seeded from `cwd` — a defensible
+ *  default for the common case (terminal at the repo root) that the live
+ *  git provider overwrites with the real values on first restore via
+ *  `subscribeGitInfo`. No empty-string sentinels: every `string` field
+ *  carries an honest path, just possibly the wrong one until re-resolution.
+ *
+ *  Exported so `state.test.ts` can exercise the synthesis directly without
+ *  spinning up a `Conf` store under `KOLU_STATE_DIR`. */
+export function migrateLegacyTerminal_1_18_0(
+  t: Record<string, unknown>,
+): Record<string, unknown> {
+  const {
+    sortOrder: _sortOrder,
+    repoName,
+    branch,
+    git: existingGit,
+    ...kept
+  } = t;
+  // Already-present `git` key wins — idempotent on migrated data, and a
+  // populated record beats a synthesized one if a corrupt entry has both.
+  if ("git" in t) {
+    return {
+      ...kept,
+      git: (existingGit as GitInfo | null | undefined) ?? null,
+    };
+  }
+  // Pre-#702 entry: synthesize from the flat fields, using cwd as the
+  // best-guess for paths. Skip synthesis (and stamp `git: null`) if cwd
+  // is missing — falling back to "" would silently reintroduce the
+  // empty-string sentinel this rewrite is trying to remove. Live git
+  // provider re-resolves on first restore via subscribeGitInfo, so the
+  // worktree case (cwd ≠ mainRepoRoot) self-corrects.
+  if (
+    typeof repoName === "string" &&
+    typeof branch === "string" &&
+    typeof kept.cwd === "string"
+  ) {
+    return {
+      ...kept,
+      git: {
+        repoName,
+        branch,
+        repoRoot: kept.cwd,
+        worktreePath: kept.cwd,
+        isWorktree: false,
+        mainRepoRoot: kept.cwd,
+      },
+    };
+  }
+  return { ...kept, git: null };
+}
 
 /** What conf stores to disk — survives server restart. Internal: clients see
  *  the per-domain shapes (Preferences / ActivityFeed / SavedSession), not
@@ -45,7 +99,7 @@ type PersistedState = z.infer<typeof PersistedStateSchema>;
  * Must be valid semver. `conf` runs all migration handlers
  * whose keys are > the last-seen version and ≤ this value.
  */
-const SCHEMA_VERSION = "1.15.0";
+const SCHEMA_VERSION = "1.18.0";
 
 // Callers must pass an explicit directory via KOLU_STATE_DIR. A bare launch
 // with no env would silently clobber whatever happens to live at conf's
@@ -74,8 +128,10 @@ export const store = new Conf<PersistedState>({
     preferences: DEFAULT_PREFERENCES,
   },
   migrations: {
-    // sortOrder added to SavedTerminal — old sessions don't have it.
-    // No-op: sortOrder is optional on SavedTerminalSchema, assigned sequentially on restore.
+    // 1.1.0 legacy: sortOrder added to SavedTerminal. The field was
+    // removed entirely in 1.18.0 (replaced by Map insertion order);
+    // this migration stays as a no-op so users who walked through
+    // earlier versions keep their ladder position intact.
     "1.1.0": () => {},
     // Preferences added — old state files don't have them.
     // conf auto-merges defaults, but explicit migration ensures clean shape.
@@ -269,6 +325,43 @@ export const store = new Conf<PersistedState>({
       const current = store.get("preferences") as Record<string, unknown>;
       const { canvasMode: _cm, sidebarAgentPreviews: _sap, ...rest } = current;
       store.set("preferences", rest as Preferences);
+    },
+    // terminalRenderer enum widened from ["auto","dom"] to ["auto","webgl","dom"].
+    // Existing on-disk values ("auto" and "dom") are valid literals of the
+    // widened enum, so no value transformation is required. The bump is
+    // recorded here for the ladder's sake (see .claude/rules/state.md).
+    "1.16.0": () => {},
+    // rightPanel.pinned removed — the panel now always docks, so the
+    // pin/overlay toggle (1.11.0) is gone. Strip the field from disk so
+    // the 1.17.0 preferences shape matches the schema exactly.
+    "1.17.0": (store: Conf<PersistedState>) => {
+      const current = store.get("preferences");
+      const rp = current.rightPanel as Record<string, unknown>;
+      if (rp.pinned !== undefined) {
+        const { pinned: _pinned, ...rest } = rp;
+        store.set("preferences", {
+          ...current,
+          rightPanel: rest as typeof current.rightPanel,
+        });
+      }
+    },
+    // SavedTerminal unified with TerminalMetadata — the flattened
+    // `repoName`/`branch` (now read from `git`) and the `sortOrder`
+    // index (replaced by Map insertion order) are gone. The legacy
+    // `repoName`/`branch` are converted into a synthesized `GitInfo`
+    // (see `migrateLegacyTerminal_1_18_0`) so the restore card keeps
+    // showing repo names instead of full cwd paths — the original
+    // 1.18.0 release stamped `git: null` and lost that context (#714).
+    "1.18.0": (store: Conf<PersistedState>) => {
+      const session = store.get("session");
+      if (!session) return;
+      const terminals = (
+        session.terminals as unknown as Record<string, unknown>[]
+      ).map(migrateLegacyTerminal_1_18_0);
+      store.set("session", {
+        ...session,
+        terminals: terminals as typeof session.terminals,
+      });
     },
   },
 });

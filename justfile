@@ -40,9 +40,13 @@ _dev: install _dev-parallel
 [parallel]
 _dev-parallel: server client
 
-# Run TypeScript type checking across all packages — fast static-correctness gate
+# Run TypeScript type checking + Biome lint across all packages — fast static-correctness gate
 check: install
-    {{ nix_shell }} pnpm typecheck
+    {{ nix_shell }} sh -c 'pnpm typecheck && pnpm exec biome lint .'
+
+# Biome lint only — mirrors ci::biome. Format stays on Prettier for now (see biome.jsonc).
+lint: install
+    {{ nix_shell }} pnpm exec biome lint .
 
 # Run server with auto-reload
 server:
@@ -92,17 +96,21 @@ test-quick *args: install
         ./node_modules/@cucumber/cucumber/bin/cucumber-js \
         --profile ui {{ args }}
 
+# Boot the packaged Kolu and verify /api/health — production-like runtime smoke
+smoke:
+    {{ nix_shell }} bash ci/smoke.sh
+
 # Remove all gitignored files (node_modules, build artifacts, etc.)
 clean:
     git clean -fdX
 
 # Format all files in-place
 fmt: install
-    {{ nix_shell }} sh -c 'pnpm exec prettier --write --cache --ignore-unknown . && nixpkgs-fmt *.nix nix/**/*.nix website/*.nix'
+    {{ nix_shell }} sh -c 'pnpm exec biome format --write . && nixpkgs-fmt *.nix nix/**/*.nix website/*.nix'
 
 # Check formatting without modifying files (used by CI)
 fmt-check: install
-    {{ nix_shell }} sh -c 'pnpm exec prettier --check --cache --ignore-unknown . && nixpkgs-fmt --check *.nix nix/**/*.nix website/*.nix'
+    {{ nix_shell }} sh -c 'pnpm exec biome format . && nixpkgs-fmt --check *.nix nix/**/*.nix website/*.nix'
 
 # Nix build (server + client)
 build:

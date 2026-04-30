@@ -1,6 +1,30 @@
-import { describe, it, expect } from "vitest";
-import { createRoot, createEffect } from "solid-js";
-import { createSubscription } from "./createSubscription";
+import * as assert from "node:assert";
+import { createEffect, createRoot } from "solid-js";
+import { describe, expect, it } from "vitest";
+import { createSubscription, type Subscription } from "./createSubscription";
+
+/** Test-local: read the current value of a subscription, throwing with a
+ *  descriptive message if it hasn't yielded yet. Replaces inline non-null
+ *  assertions on `sub()` so the failure mode is "subscription expected a
+ *  value but had none" rather than "Cannot read property of undefined".
+ *  Only the `undefined` case (no value yet) throws — `null` is a legitimate
+ *  yielded value, exercised by the "handles null values" test. */
+function readSub<T>(sub: Subscription<T>): T {
+  const value = sub();
+  if (value === undefined) {
+    throw new Error("subscription has not yielded a value yet");
+  }
+  return value;
+}
+
+/** Test-local: assert that a subscription is in error state and return
+ *  the error. `assert.ok` narrows `err` from `Error | undefined` to
+ *  `Error` for the read on the next line. */
+function readSubError<T>(sub: Subscription<T>): Error {
+  const err = sub.error();
+  assert.ok(err !== undefined, "expected sub.error() to be set");
+  return err;
+}
 
 /** Create an async iterable from an array, yielding items with optional delay. */
 async function* fromArray<T>(items: T[], delayMs = 0): AsyncGenerator<T> {
@@ -28,8 +52,9 @@ function controllableStream<T>() {
 
   async function* iterate(): AsyncGenerator<T> {
     while (true) {
-      if (queue.length > 0) {
-        yield queue.shift()!;
+      const head = queue.shift();
+      if (head !== undefined) {
+        yield head;
         continue;
       }
       if (done) return;
@@ -76,7 +101,7 @@ describe("createSubscription", () => {
             stream.push(42);
             await flush();
 
-            resolve({ value: sub()!, pending: sub.pending() });
+            resolve({ value: readSub(sub), pending: sub.pending() });
             stream.close();
             dispose();
           });
@@ -98,15 +123,15 @@ describe("createSubscription", () => {
           const values: number[] = [];
           stream.push(1);
           await flush();
-          values.push(sub()!);
+          values.push(readSub(sub));
 
           stream.push(2);
           await flush();
-          values.push(sub()!);
+          values.push(readSub(sub));
 
           stream.push(3);
           await flush();
-          values.push(sub()!);
+          values.push(readSub(sub));
 
           resolve(values);
           stream.close();
@@ -126,7 +151,7 @@ describe("createSubscription", () => {
             Promise.resolve(fromArray(["hello"])),
           );
           await flush();
-          resolve(sub()!);
+          resolve(readSub(sub));
           dispose();
         });
       });
@@ -141,7 +166,7 @@ describe("createSubscription", () => {
             Promise.resolve(fromArray([true])),
           );
           await flush();
-          resolve(sub()!);
+          resolve(readSub(sub));
           dispose();
         });
       });
@@ -156,7 +181,7 @@ describe("createSubscription", () => {
             Promise.resolve(fromArray([null as unknown as string])),
           );
           await flush();
-          resolve(sub()! as unknown as null);
+          resolve(readSub(sub) as unknown as null);
           dispose();
         });
       });
@@ -176,7 +201,7 @@ describe("createSubscription", () => {
 
           stream.push({ a: 1, b: 2 });
           await flush();
-          resolve(sub()!);
+          resolve(readSub(sub));
           stream.close();
           dispose();
         });
@@ -195,7 +220,6 @@ describe("createSubscription", () => {
 
           stream.push({ a: 1, b: 2 });
           await flush();
-          const first = sub()!;
 
           // Track whether reading `a` re-fires when only `b` changes
           let aFired = false;
@@ -225,7 +249,7 @@ describe("createSubscription", () => {
             Promise.resolve(fromArray([[1, 2, 3]])),
           );
           await flush();
-          resolve([...(sub()! as unknown as number[])]);
+          resolve([...(readSub(sub) as unknown as number[])]);
           dispose();
         });
       });
@@ -256,7 +280,7 @@ describe("createSubscription", () => {
           stream.push(3);
           await flush();
 
-          resolve([...(sub()! as number[])]);
+          resolve([...(readSub(sub) as number[])]);
           stream.close();
           dispose();
         });
@@ -268,9 +292,11 @@ describe("createSubscription", () => {
     it("throws if reduce is provided without initial", () => {
       expect(() => {
         createRoot((dispose) => {
+          // @ts-expect-error testing the runtime guard fires when
+          // `initial` is omitted (the type system would normally require it).
           createSubscription(() => Promise.resolve(fromArray([1])), {
             reduce: (acc: number, item: number) => acc + item,
-          } as any);
+          });
           dispose();
         });
       }).toThrow("'initial' is required when using 'reduce'");
@@ -311,7 +337,7 @@ describe("createSubscription", () => {
             await flush();
 
             resolve({
-              error: sub.error()!.message,
+              error: readSubError(sub).message,
               pending: sub.pending(),
             });
             dispose();
@@ -335,7 +361,7 @@ describe("createSubscription", () => {
           );
 
           await flush();
-          resolve(sub.error()!.message);
+          resolve(readSubError(sub).message);
           dispose();
         });
       });
@@ -432,8 +458,7 @@ describe("createSubscription", () => {
           stream.push(3); // should not be received
           await flush();
 
-          const values = sub();
-          resolve([values!]);
+          resolve([readSub(sub)]);
           stream.close();
           dispose();
         });
@@ -454,7 +479,7 @@ describe("createSubscription", () => {
           stream.push(1);
           await flush();
 
-          resolve({ valueBefore: sub()! });
+          resolve({ valueBefore: readSub(sub) });
           dispose(); // triggers onCleanup → abort
         });
 
@@ -524,7 +549,7 @@ describe("createSubscription", () => {
 
             await flush();
             resolve({
-              error: sub.error()!.message,
+              error: readSubError(sub).message,
               pending: sub.pending(),
             });
             dispose();

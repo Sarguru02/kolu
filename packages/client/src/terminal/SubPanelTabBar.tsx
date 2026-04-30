@@ -1,8 +1,11 @@
 /** Tab bar for sub-terminals within a parent's sub-panel. */
 
+import {
+  cwdBasename,
+  type TerminalId,
+  type TerminalMetadata,
+} from "kolu-common";
 import { type Component, For } from "solid-js";
-import type { TerminalId, TerminalMetadata } from "kolu-common";
-import { cwdBasename } from "../path";
 
 const SubPanelTabBar: Component<{
   subIds: TerminalId[];
@@ -31,6 +34,7 @@ const SubPanelTabBar: Component<{
           return (
             <div class="group relative">
               <button
+                type="button"
                 class="px-3 pr-6 py-1 rounded text-fg-3 hover:text-fg transition-colors cursor-pointer truncate max-w-[120px]"
                 classList={{
                   "bg-surface-2 text-fg font-medium": isActive(),
@@ -40,7 +44,8 @@ const SubPanelTabBar: Component<{
               >
                 {label()}
               </button>
-              <span
+              <button
+                type="button"
                 data-testid="sub-tab-close"
                 class="absolute top-0.5 right-0.5 hidden group-hover:flex items-center justify-center w-4 h-4 rounded text-fg-3 hover:text-fg hover:bg-surface-3 transition-colors cursor-pointer text-xs"
                 onClick={(e) => {
@@ -50,12 +55,13 @@ const SubPanelTabBar: Component<{
                 title="Close sub-terminal"
               >
                 ×
-              </span>
+              </button>
             </div>
           );
         }}
       </For>
       <button
+        type="button"
         class="px-2 py-1 text-fg-3 hover:text-fg transition-colors cursor-pointer"
         onClick={props.onCreate}
         title="Split terminal"
@@ -64,6 +70,7 @@ const SubPanelTabBar: Component<{
       </button>
       <div class="flex-1" />
       <button
+        type="button"
         class="flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-mono text-fg-3 hover:text-fg-2 hover:bg-surface-2 transition-colors cursor-pointer"
         onClick={props.onCollapse}
         title="Hide terminal split"

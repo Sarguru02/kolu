@@ -9,19 +9,19 @@
  * coexist without port collisions.
  */
 
-import { Before, After, BeforeAll, AfterAll, Status } from "@cucumber/cucumber";
-import { chromium } from "playwright";
-import type { Browser } from "playwright";
-import getPort from "get-port";
-import { KoluWorld } from "./world.ts";
+import type { ChildProcess } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ChildProcess } from "node:child_process";
-import { spawn } from "node:child_process";
+import { After, AfterAll, Before, BeforeAll, Status } from "@cucumber/cucumber";
+import getPort from "get-port";
+import type { Browser, BrowserContext, Page } from "playwright";
+import { chromium } from "playwright";
+import type { KoluWorld } from "./world.ts";
 
-const workerId = parseInt(process.env.CUCUMBER_WORKER_ID || "0");
+const workerId = parseInt(process.env.CUCUMBER_WORKER_ID || "0", 10);
 
 /** One base $TMPDIR per worker holds everything this test run creates:
  *  the kolu server's state dir and the Claude Code mock harness's
@@ -50,6 +50,50 @@ const claudeProjectsDir = mkSubDir("claude-projects");
 process.env.KOLU_CLAUDE_SESSIONS_DIR = claudeSessionsDir;
 process.env.KOLU_CLAUDE_PROJECTS_DIR = claudeProjectsDir;
 
+/** Per-worker temp roots for the Codex and OpenCode mock harnesses —
+ *  see `codex_steps.ts` and `opencode_steps.ts`. Both providers key off
+ *  `state.cwd`, so the fixture DB rows carry a cwd that the scenario
+ *  also `cd`s into so `findSessionByDirectory` returns the mock row. */
+const codexDir = mkSubDir("codex");
+const opencodeDbDir = mkSubDir("opencode");
+const opencodeDbPath = path.join(opencodeDbDir, "opencode.db");
+process.env.KOLU_CODEX_DIR = codexDir;
+process.env.KOLU_OPENCODE_DB = opencodeDbPath;
+
+/** Fake agent binaries the codex/opencode mock scenarios invoke by
+ *  absolute path to bypass PATH resolution — the user's shell rc (e.g.
+ *  ~/.bashrc) may prepend `~/.npm-global/bin` on startup and shadow any
+ *  PATH override we set via the whitelist, so a real codex/opencode
+ *  install on the host silently wins against the fake.
+ *
+ *  Each stub is a copy of `bash`, renamed to `codex` / `opencode`. The
+ *  kernel's `/proc/<pid>/comm` (Linux) and sysctl KERN_PROC_PATHNAME
+ *  (macOS) both reflect the execve basename, so a bash copy launched as
+ *  `.../bin/codex -c "..."` shows up with comm="codex" — satisfying
+ *  `readForegroundBasename() === "codex"` without requiring the real
+ *  CLI to be installed.
+ *
+ *  `/bin/sleep` tempted as a simpler stub but fails on nixpkgs: coreutils
+ *  ships as a multi-call binary that inspects argv[0] and errors with
+ *  "unknown program 'codex'" when renamed. Bash is a single-purpose
+ *  binary and copies cleanly.
+ *
+ *  Paths are surfaced to step definitions via KOLU_FAKE_CODEX_BIN and
+ *  KOLU_FAKE_OPENCODE_BIN env vars (on this worker's process env, not
+ *  forwarded to the spawned server — the step defs read them directly
+ *  and type the absolute path into the pty). */
+const fakeBinDir = mkSubDir("bin");
+const bashPath = execSync("command -v bash", { encoding: "utf8" }).trim();
+const fakeBins: Record<string, string> = {};
+for (const name of ["codex", "opencode"]) {
+  const target = path.join(fakeBinDir, name);
+  fs.copyFileSync(bashPath, target);
+  fs.chmodSync(target, 0o755);
+  fakeBins[name] = target;
+}
+process.env.KOLU_FAKE_CODEX_BIN = fakeBins.codex;
+process.env.KOLU_FAKE_OPENCODE_BIN = fakeBins.opencode;
+
 /** Per-worker ephemeral state dir for the kolu server under test. Routing
  *  to $TMPDIR keeps test state out of `~/.config`; nesting under
  *  `testBaseDir` means the whole run's scratch space cleans up together. */
@@ -63,8 +107,46 @@ let serverProcess: ChildProcess | undefined;
 // accumulation on macOS (see #334).
 const keepAliveAgent = new http.Agent({ keepAlive: true });
 
+const TRANSIENT_SETUP_ERRORS = [
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EPIPE",
+  "socket hang up",
+  "read ECONNRESET",
+];
+
+function isTransientSetupError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return TRANSIENT_SETUP_ERRORS.some((needle) => msg.includes(needle));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function retryTransient<T>(
+  label: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  let last: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      last = err;
+      if (!isTransientSetupError(err) || attempt === 3) break;
+      await sleep(100 * attempt);
+    }
+  }
+  throw last instanceof Error
+    ? new Error(`${label} failed after retries: ${last.message}`, {
+        cause: last,
+      })
+    : new Error(`${label} failed after retries: ${String(last)}`);
+}
+
 /** POST JSON to a local URL, reusing TCP connections via keepAlive. */
-function postJSON(url: string, body: object): Promise<void> {
+function postJSONOnce(url: string, body: object): Promise<void> {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const req = http.request(
@@ -87,6 +169,10 @@ function postJSON(url: string, body: object): Promise<void> {
   });
 }
 
+function postJSON(url: string, body: object): Promise<void> {
+  return retryTransient(`POST ${url}`, () => postJSONOnce(url, body));
+}
+
 /** GET a URL, reusing TCP connections via keepAlive. */
 function httpGet(url: string): Promise<{ ok: boolean }> {
   return new Promise((resolve, reject) => {
@@ -101,9 +187,14 @@ function httpGet(url: string): Promise<{ ok: boolean }> {
       },
       (res) => {
         res.resume();
-        res.on("end", () =>
-          resolve({ ok: res.statusCode! >= 200 && res.statusCode! < 300 }),
-        );
+        res.on("end", () => {
+          // `res.statusCode` is typed `number | undefined` because the parser
+          // can technically receive a malformed first line; in practice
+          // node's `http` always supplies it once `end` fires, but treat
+          // an absent code as a non-2xx response rather than asserting.
+          const code = res.statusCode ?? 0;
+          resolve({ ok: code >= 200 && code < 300 });
+        });
         res.on("error", reject);
       },
     );
@@ -129,6 +220,34 @@ const ciArgs = [
   "--headless=new",
 ];
 
+async function newScenarioPage(
+  isMobile: boolean,
+): Promise<{ context: BrowserContext; page: Page }> {
+  let previousContext: BrowserContext | undefined;
+  return retryTransient("create Playwright page", async () => {
+    if (previousContext) {
+      await previousContext.close().catch(() => undefined);
+      previousContext = undefined;
+    }
+    const context = await browser.newContext({
+      viewport: isMobile
+        ? { width: 390, height: 844 }
+        : { width: 1280, height: 720 },
+      ...(isMobile && { hasTouch: true, isMobile: true }),
+      baseURL: baseUrl,
+      ignoreHTTPSErrors: true,
+      // clipboard-write: lets tests place images in the clipboard for paste testing.
+      // clipboard-read: lets tests verify clipboard contents after copy operations.
+      // Production code never calls clipboard.read — these are test-only permissions.
+      permissions: ["clipboard-write", "clipboard-read"],
+    });
+    previousContext = context;
+    const page = await context.newPage();
+    previousContext = undefined;
+    return { context, page };
+  });
+}
+
 async function waitForHealth(url: string, timeoutMs: number): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -145,7 +264,7 @@ async function waitForHealth(url: string, timeoutMs: number): Promise<void> {
   );
 }
 
-BeforeAll(async function () {
+BeforeAll(async () => {
   const koluServer = process.env.KOLU_SERVER;
   if (!koluServer) throw new Error("KOLU_SERVER must be a URL or binary path");
 
@@ -176,11 +295,21 @@ BeforeAll(async function () {
           KOLU_STATE_DIR: koluStateDir,
           KOLU_CLAUDE_SESSIONS_DIR: claudeSessionsDir,
           KOLU_CLAUDE_PROJECTS_DIR: claudeProjectsDir,
+          KOLU_CODEX_DIR: codexDir,
+          KOLU_OPENCODE_DB: opencodeDbPath,
         },
       },
     );
     serverProcess.stderr?.on("data", (data: Buffer) => {
       process.stderr.write(`[server:${workerId}] ${data}`);
+    });
+    // Drain stdout so the pipe buffer can't fill and block the server's
+    // pino writes (pino targets stdout). Forward to stderr when
+    // KOLU_TEST_VERBOSE is set for local debugging.
+    serverProcess.stdout?.on("data", (data: Buffer) => {
+      if (process.env.KOLU_TEST_VERBOSE) {
+        process.stderr.write(`[server:${workerId}:out] ${data}`);
+      }
     });
     await waitForHealth(`${baseUrl}/api/health`, 10_000);
     console.log(`[worker:${workerId}] Server is healthy.`);
@@ -193,7 +322,7 @@ BeforeAll(async function () {
   });
 });
 
-AfterAll(async function () {
+AfterAll(async () => {
   if (browser) await browser.close();
   keepAliveAgent.destroy();
   killServer();
@@ -232,7 +361,6 @@ Before(async function (this: KoluWorld, scenario) {
           collapsed: true,
           size: 0.25,
           tab: { kind: "inspector" },
-          pinned: true,
         },
       },
     }),
@@ -248,19 +376,9 @@ Before(async function (this: KoluWorld, scenario) {
   const isMobile = scenario.pickle.tags.some((t) => t.name === "@mobile");
 
   this.browser = browser;
-  this.context = await browser.newContext({
-    viewport: isMobile
-      ? { width: 390, height: 844 }
-      : { width: 1280, height: 720 },
-    ...(isMobile && { hasTouch: true, isMobile: true }),
-    baseURL: baseUrl,
-    ignoreHTTPSErrors: true,
-    // clipboard-write: lets tests place images in the clipboard for paste testing.
-    // clipboard-read: lets tests verify clipboard contents after copy operations.
-    // Production code never calls clipboard.read — these are test-only permissions.
-    permissions: ["clipboard-write", "clipboard-read"],
-  });
-  this.page = await this.context.newPage();
+  const created = await newScenarioPage(isMobile);
+  this.context = created.context;
+  this.page = created.page;
   // Disable CSS transitions/animations so Corvu dialogs open/close instantly.
   // prefers-reduced-motion tells well-behaved libraries to skip animations.
   // The style override catches anything that doesn't respect the media query.
@@ -295,7 +413,7 @@ Before(async function (this: KoluWorld, scenario) {
 
 After(async function (this: KoluWorld, scenario) {
   // Screenshot on failure
-  if (scenario.result?.status === Status.FAILED) {
+  if (scenario.result?.status === Status.FAILED && this.page) {
     const dir = path.resolve(
       import.meta.dirname,
       "..",
@@ -304,10 +422,17 @@ After(async function (this: KoluWorld, scenario) {
     );
     fs.mkdirSync(dir, { recursive: true });
     const name = scenario.pickle.name.replace(/\s+/g, "-").toLowerCase();
-    await this.page.screenshot({
-      path: path.join(dir, `${name}.png`),
-      fullPage: true,
-    });
+    await this.page
+      .screenshot({
+        path: path.join(dir, `${name}.png`),
+        fullPage: true,
+      })
+      .catch((err) => {
+        console.error(
+          `[worker:${workerId}] Failed to capture failure screenshot:`,
+          err,
+        );
+      });
   }
   if (this.context) await this.context.close();
 });

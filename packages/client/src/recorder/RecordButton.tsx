@@ -16,17 +16,18 @@
  *
  *  Hidden when the File System Access API isn't available. */
 
-import { type Component, Match, Switch, Show, createSignal } from "solid-js";
+import { type Component, createSignal, Match, Show, Switch } from "solid-js";
 import { match } from "ts-pattern";
+import { ACTIONS } from "../input/actions";
+import { formatKeybind } from "../input/keyboard";
+import { PauseIcon, RecordIcon, ResumeIcon, WebcamIcon } from "../ui/Icons";
+import Tip from "../ui/Tip";
+import RecordPopover from "./RecordPopover";
 import {
   formatElapsed,
   isRecordingSupported,
   useRecorder,
 } from "./useRecorder";
-import RecordPopover from "./RecordPopover";
-import { RecordIcon, PauseIcon, ResumeIcon, WebcamIcon } from "../ui/Icons";
-import Tip from "../ui/Tip";
-import { formatKeybind, SHORTCUTS } from "../input/keyboard";
 
 const RecordButton: Component = () => {
   if (!isRecordingSupported()) return null;
@@ -52,8 +53,8 @@ const RecordButton: Component = () => {
 
   const pauseLabel = () =>
     isPaused()
-      ? `Resume (${formatKeybind(SHORTCUTS.toggleRecordingPause.keybind)})`
-      : `Pause (${formatKeybind(SHORTCUTS.toggleRecordingPause.keybind)})`;
+      ? `Resume (${formatKeybind(ACTIONS.toggleRecordingPause.keybind)})`
+      : `Pause (${formatKeybind(ACTIONS.toggleRecordingPause.keybind)})`;
 
   const webcamLabel = () =>
     recorder.webcamEnabled() ? "Hide webcam" : "Show webcam";
@@ -85,6 +86,7 @@ const RecordButton: Component = () => {
           <div class="pointer-events-auto">
             <Tip label={idleLabel()}>
               <button
+                type="button"
                 ref={setTriggerEl}
                 data-testid="record-toggle"
                 data-phase={recorder.phase()}
@@ -115,6 +117,7 @@ const RecordButton: Component = () => {
           {/* Pause / resume */}
           <Tip label={pauseLabel()} class="flex">
             <button
+              type="button"
               data-testid="record-pause"
               class="w-7 flex items-center justify-center transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
               classList={{
@@ -137,6 +140,7 @@ const RecordButton: Component = () => {
 
           <Tip label="Stop recording" class="flex">
             <button
+              type="button"
               data-testid="record-stop"
               class="flex items-center gap-1.5 px-2.5 transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
               classList={{
@@ -167,6 +171,7 @@ const RecordButton: Component = () => {
           {/* Webcam toggle — end cap. */}
           <Tip label={webcamLabel()} class="flex">
             <button
+              type="button"
               data-testid="record-webcam"
               class={`w-7 flex items-center justify-center transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 ${webcamBtnAccent()}`}
               onClick={() => void recorder.toggleWebcam()}

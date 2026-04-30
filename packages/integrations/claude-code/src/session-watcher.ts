@@ -10,22 +10,22 @@
  */
 
 import fs from "node:fs";
-import { match } from "ts-pattern";
 import { agentInfoEqual } from "anyagent";
+import { match } from "ts-pattern";
 import {
-  type SessionFile,
-  type ClaudeCodeInfo,
-  PROJECTS_DIR,
-  TAIL_BYTES,
-  encodeProjectPath,
-  findTranscriptPath,
-  tailJsonlLines,
   deriveState,
-  extractTasks,
   deriveTaskProgress,
-  watchOrWaitForDir,
+  encodeProjectPath,
+  extractTasks,
   fetchSessionSummary,
-} from "./index.ts";
+  findTranscriptPath,
+  PROJECTS_DIR,
+  type SessionFile,
+  TAIL_BYTES,
+  tailJsonlLines,
+  watchOrWaitForDir,
+} from "./core.ts";
+import type { ClaudeCodeInfo } from "./schemas.ts";
 
 // --- Tuning constants ---
 
@@ -54,8 +54,9 @@ type TranscriptWatching =
 
 // --- Logger interface ---
 
-import type { Logger } from "anyagent";
-export type { Logger as WatcherLog } from "anyagent";
+import type { Logger } from "kolu-shared";
+
+export type { Logger as WatcherLog } from "kolu-shared";
 
 // --- Diagnostics counter ---
 
@@ -97,7 +98,7 @@ export function createSessionWatcher(
   let transcriptWatching: TranscriptWatching = { kind: "none" };
   let lastInfo: ClaudeCodeInfo | null = null;
   let lastSummary: string | null = null;
-  let taskMap = new Map<string, "pending" | "in_progress" | "completed">();
+  const taskMap = new Map<string, "pending" | "in_progress" | "completed">();
   let taskScanOffset = 0;
   // Partial final line from the previous chunked scan. Carried across
   // calls so a line straddling a chunk or EOF boundary resolves to a
@@ -115,7 +116,13 @@ export function createSessionWatcher(
     match(transcriptWatching)
       .with({ kind: "none" }, () => {})
       .with({ kind: "waiting" }, ({ dirWatcher }) => dirWatcher())
-      .with({ kind: "watching" }, ({ fileWatcher }) => fileWatcher.close())
+      .with({ kind: "watching" }, ({ path, fileWatcher }) => {
+        fileWatcher.close();
+        plog.info(
+          { path, session: session.sessionId },
+          "claude-code: transcript watcher retired",
+        );
+      })
       .exhaustive();
     transcriptWatching = { kind: "none" };
   }
@@ -138,6 +145,10 @@ export function createSessionWatcher(
     try {
       const fileWatcher = fs.watch(tp, () => scheduleTranscriptCheck());
       transcriptWatching = { kind: "watching", path: tp, fileWatcher };
+      plog.info(
+        { path: tp, session: session.sessionId },
+        "claude-code: transcript watcher installed",
+      );
     } catch (err) {
       plog.error({ err, path: tp }, "failed to watch transcript");
       transcriptWatching = { kind: "none" };
@@ -156,9 +167,11 @@ export function createSessionWatcher(
       { session: session.sessionId, cwd: session.cwd },
       "transcript not found yet (JSONL created after first message)",
     );
-    const projectDir = PROJECTS_DIR + "/" + encodeProjectPath(session.cwd);
-    const dirWatcher = watchOrWaitForDir(projectDir, () =>
-      onProjectDirChanged(),
+    const projectDir = `${PROJECTS_DIR}/${encodeProjectPath(session.cwd)}`;
+    const dirWatcher = watchOrWaitForDir(
+      projectDir,
+      () => onProjectDirChanged(),
+      plog,
     );
     transcriptWatching = { kind: "waiting", dirWatcher };
   }
@@ -197,6 +210,7 @@ export function createSessionWatcher(
       model: derived.model,
       summary: lastSummary,
       taskProgress: deriveTaskProgress(taskMap),
+      contextTokens: derived.contextTokens,
     };
 
     if (!agentInfoEqual(info, lastInfo)) {
@@ -208,7 +222,10 @@ export function createSessionWatcher(
       onUpdate(info);
     }
 
-    refreshSummary();
+    // Fire-and-forget: refreshSummary owns its try/catch/finally and
+    // the pendingSummaryFetches counter. Not awaited so the caller
+    // (transcript-change handler) doesn't block on the network fetch.
+    void refreshSummary();
   }
 
   /** Incrementally scan the transcript for TaskCreate/TaskUpdate entries.

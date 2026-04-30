@@ -36,7 +36,15 @@ Feature: Canvas workspace
     And the canvas tiles should be visible in the viewport
     And there should be no page errors
 
-  Scenario: New terminal opens at viewport center
+  Scenario: New terminal shifts when an existing tile occupies the viewport center
+    When I create a terminal with keyboard shortcut
+    Then there should be 2 canvas tiles
+    And canvas tile 2 should be offset from canvas tile 1
+
+  Scenario: Creating a terminal after panning opens at the new viewport center
+    When I record the canvas transform
+    And I scroll the wheel over the canvas background
+    Then the canvas transform should have changed
     When I create a terminal with keyboard shortcut
     Then there should be 2 canvas tiles
     And the newest canvas tile should be centered in the viewport
@@ -73,22 +81,11 @@ Feature: Canvas workspace
 
   Scenario: Minimap shows zoom bar on the canvas
     Then the minimap should be visible
-    And the minimap toggle button should be visible
     And there should be no page errors
 
   Scenario: Minimap expands with multiple terminals
     Given I create a terminal
     And I create a terminal
-    Then the minimap map should be visible
-    And there should be no page errors
-
-  Scenario: Minimap toggle collapses and expands the map
-    Given I create a terminal
-    And I create a terminal
-    Then the minimap map should be visible
-    When I click the minimap toggle
-    Then the minimap map should not be visible
-    When I click the minimap toggle
     Then the minimap map should be visible
     And there should be no page errors
 
@@ -98,6 +95,15 @@ Feature: Canvas workspace
     When I save the canvas viewport state
     And I drag the minimap viewport rect
     Then the canvas viewport state should have changed
+    And there should be no page errors
+
+  Scenario: Dragging a minimap tile rect moves the canvas tile
+    Given I create a terminal
+    And I create a terminal
+    When I save canvas tile 1 position
+    And I drag minimap tile rect 1 by x=24 y=18
+    Then canvas tile 1 position should have changed
+    And canvas tile 1 should be the active tile
     And there should be no page errors
 
   # Viewport-pan assertion is flaky after the maximize signal landed
@@ -129,6 +135,16 @@ Feature: Canvas workspace
     When I click canvas tile 1
     Then exactly 1 canvas tile should use the webgl renderer
     And the focused canvas tile should use the webgl renderer
+    And there should be no page errors
+
+  Scenario: Renderer preference "webgl" forces WebGL on every tile
+    Given I create a terminal
+    Then there should be 2 canvas tiles
+    And exactly 1 canvas tile should use the webgl renderer
+    When I click the settings button
+    Then the settings popover should be visible
+    When I click the "webgl" renderer button
+    Then exactly 2 canvas tiles should use the webgl renderer
     And there should be no page errors
 
   Scenario: Double-clicking the title bar maximizes the tile

@@ -3,70 +3,64 @@
  *  Per #622 the workspace is mode-less: desktop is always the canvas; mobile
  *  is a single fullscreen tile with swipe nav. Per-terminal chrome (theme
  *  pill, agent indicator, screenshot, split toggle) lives on the tile title
- *  bar via `renderTileTitleActions`. The header is intentionally minimal. */
+ *  bar via `canvas/TileTitleActions`. The header is intentionally minimal. */
 
+import Dialog from "@corvu/dialog";
+import { Title } from "@solidjs/meta";
+import type { TerminalId } from "kolu-common";
 import {
   type Component,
-  createSignal,
   createEffect,
   createMemo,
+  createSignal,
   on,
   Show,
 } from "solid-js";
-import { Title } from "@solidjs/meta";
 import { Toaster } from "solid-sonner";
 import { match } from "ts-pattern";
-import { isMobile } from "./useMobile";
 import ChromeBar from "./ChromeBar";
-import TerminalContent from "./terminal/TerminalContent";
-import TerminalMeta from "./terminal/TerminalMeta";
-import AgentIndicator from "./terminal/AgentIndicator";
-import TerminalCanvas from "./canvas/TerminalCanvas";
+import CloseConfirm, { type CloseConfirmTarget } from "./CloseConfirm";
+import CommandPalette from "./CommandPalette";
+import "kolu-common/test-hooks";
 import CanvasWatermark from "./canvas/CanvasWatermark";
 import PillTree from "./canvas/PillTree";
-import { groupByRepo, flatPillOrder } from "./canvas/pillTreeOrder";
-import MobileTileView from "./MobileTileView";
-import MobileKeyBar from "./MobileKeyBar";
-import CommandPalette from "./CommandPalette";
-import ShortcutsHelp from "./ShortcutsHelp";
-import DiagnosticInfo from "./DiagnosticInfo";
-import ModalDialog, { refocusTerminal } from "./ui/ModalDialog";
-import Dialog from "@corvu/dialog";
-import EmptyState from "./EmptyState";
-import RightPanelLayout from "./right-panel/RightPanelLayout";
-import CloseConfirm, { type CloseConfirmTarget } from "./CloseConfirm";
-import { createCommands } from "./commands";
-import { exportSessionAsPdf } from "./exportSessionAsPdf";
-import { screenshotTerminal } from "./screenshotTerminal";
-import WebcamOverlay from "./recorder/WebcamOverlay";
-import { useRecorder } from "./recorder/useRecorder";
-import { ScreenshotIcon, SearchIcon } from "./ui/Icons";
-import Tip from "./ui/Tip";
-
-import type { TerminalId } from "kolu-common";
-import { client, wsStatus, serverProcessId } from "./rpc/rpc";
-import TransportOverlay from "./rpc/TransportOverlay";
-import { useTerminals } from "./terminal/useTerminals";
-import { useThemeManager } from "./useThemeManager";
-import { useShortcuts } from "./input/useShortcuts";
-import { useSubPanel } from "./terminal/useSubPanel";
+import { flatPillOrder, groupByRepo } from "./canvas/pillTreeOrder";
+import TerminalCanvas from "./canvas/TerminalCanvas";
+import TileTitleActions from "./canvas/TileTitleActions";
+import { useViewPosture } from "./canvas/useViewPosture";
 import { useCanvasViewport } from "./canvas/viewport/useCanvasViewport";
+import { createCommands } from "./commands";
+import DiagnosticInfo from "./DiagnosticInfo";
+import EmptyState from "./EmptyState";
+import { exportScrollbackAsPdf } from "./exportScrollbackAsPdf";
+import { exportSessionAsHtml } from "./exportSessionAsHtml";
+import type { ActionContext } from "./input/actions";
+import { useShortcuts } from "./input/useShortcuts";
+import MobileKeyBar from "./MobileKeyBar";
+import MobileTileView from "./MobileTileView";
+import { useRecorder } from "./recorder/useRecorder";
+import WebcamOverlay from "./recorder/WebcamOverlay";
+import RightPanelLayout from "./right-panel/RightPanelLayout";
 import { useRightPanel } from "./right-panel/useRightPanel";
+import { client, serverProcessId, wsStatus } from "./rpc/rpc";
+import TransportOverlay from "./rpc/TransportOverlay";
+import ShortcutsHelp from "./ShortcutsHelp";
+import { screenshotTerminal } from "./screenshotTerminal";
 import { useColorScheme } from "./settings/useColorScheme";
 import { useTips } from "./settings/useTips";
-import { CONTEXTUAL_TIPS, pillTreeSwitchTip } from "./settings/tips";
-import { toggleMinimap } from "./canvas/CanvasMinimap";
-
-/** Tile chrome buttons share this affordance. Theme pill is wider — it shows
- *  the theme name. Other buttons are square. */
-const TILE_BUTTON_CLASS =
-  "flex items-center justify-center h-7 rounded-lg transition-colors cursor-pointer shrink-0 pointer-events-auto hover:bg-black/20 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50";
+import TerminalContent from "./terminal/TerminalContent";
+import TerminalMeta from "./terminal/TerminalMeta";
+import { useSubPanel } from "./terminal/useSubPanel";
+import { useTerminals } from "./terminal/useTerminals";
+import ModalDialog, { refocusTerminal } from "./ui/ModalDialog";
+import { isMobile } from "./useMobile";
+import { useThemeManager } from "./useThemeManager";
 
 const App: Component = () => {
   const { store, crud, session, worktree, alerts } = useTerminals();
 
-  // Expose for e2e test access
-  (window as any).__koluSimulateAlert = alerts.simulateAlert;
+  // Expose for e2e test access — type comes from "kolu-common/test-hooks"
+  window.__koluSimulateAlert = alerts.simulateAlert;
 
   const {
     committedThemeName,
@@ -81,9 +75,9 @@ const App: Component = () => {
 
   const subPanel = useSubPanel();
   const rightPanel = useRightPanel();
-  const { colorScheme, setColorScheme } = useColorScheme();
+  const { colorScheme } = useColorScheme();
   const canvasViewport = useCanvasViewport();
-  const { showTipOnce } = useTips();
+  const posture = useViewPosture();
 
   // Pill-tree-grouped order — single source for the desktop pill tree AND
   // the mobile swipe handler so the two views never drift.
@@ -91,7 +85,8 @@ const App: Component = () => {
   // Desktop: pass `getLayout` so the tree mirrors the canvas spatially
   // (left tile → first pill, right tile → last pill). Reorders live as
   // tiles are dragged. Mobile has no canvas, so layouts are absent and
-  // the function falls back to sortOrder.
+  // the function falls back to the caller's input order — the server's
+  // Map insertion order (terminal creation order).
   const pillGroups = createMemo(() =>
     groupByRepo(
       store.terminalIds(),
@@ -138,7 +133,7 @@ const App: Component = () => {
   const [searchOpen, setSearchOpen] = createSignal(false);
   createEffect(on(store.activeId, () => setSearchOpen(false), { defer: true }));
 
-  const { initTipTriggers, startupTips, setStartupTips } = useTips();
+  const { initTipTriggers } = useTips();
   initTipTriggers({ terminalIds: store.terminalIds });
 
   /** Toggle sub-panel: create first split if none exist, otherwise toggle visibility. */
@@ -153,10 +148,16 @@ const App: Component = () => {
     }
   }
 
-  function handleExportSessionAsPdf() {
+  function handleExportScrollbackAsPdf() {
     const id = store.activeId();
     if (id === null) return;
-    exportSessionAsPdf(id, store.getMetadata(id));
+    exportScrollbackAsPdf(id, store.getMetadata(id));
+  }
+
+  function handleExportSessionAsHtml() {
+    const id = store.activeId();
+    if (id === null) return;
+    void exportSessionAsHtml(id);
   }
 
   function handleScreenshotTerminal(id?: TerminalId) {
@@ -173,22 +174,19 @@ const App: Component = () => {
     if (tile) canvasViewport.centerOnTile(tile);
   }
 
-  function selectTerminalFromPill(id: TerminalId) {
-    const idx = orderedIds().indexOf(id);
-    if (idx >= 0 && idx < 9) showTipOnce(pillTreeSwitchTip(idx));
-    store.setActiveId(id);
-  }
-
-  useShortcuts({
+  // Shared between the keyboard dispatcher and the command palette so a single
+  // wiring keeps both surfaces in sync. Palette-only deps (theme management,
+  // dialog setters, debug, etc.) are added below in the createCommands call.
+  const actionContext: ActionContext = {
     terminalIds: store.terminalIds,
     activeId: store.activeId,
     setActiveId: store.setActiveId,
     mruOrder: store.mruOrder,
+    activeMeta: store.activeMeta,
     handleCreate: (cwd?: string) => void crud.handleCreate(cwd),
     handleCreateSubTerminal: (parentId, cwd) =>
       void crud.handleCreateSubTerminal(parentId, cwd),
     openNewTerminalMenu: () => openPaletteGroup("New terminal"),
-    activeMeta: store.activeMeta,
     setPaletteOpen,
     setShortcutsHelpOpen,
     setSearchOpen,
@@ -200,12 +198,13 @@ const App: Component = () => {
         direction,
       ),
     handleShuffleTheme,
-    handleExportSessionAsPdf,
     handleScreenshotTerminal: () => handleScreenshotTerminal(),
     toggleRightPanel: rightPanel.togglePanel,
     canvasCenterActive: handleCanvasCenterActive,
     toggleRecordingPause: () => useRecorder().togglePause(),
-  });
+  };
+
+  useShortcuts(actionContext);
 
   function openPalette() {
     setPaletteInitialGroup(undefined);
@@ -237,27 +236,26 @@ const App: Component = () => {
       return;
     }
     const splitCount = store.getSubTerminalIds(id).length;
-    setCloseConfirmTarget({ id, meta, splitCount });
+    const worktreePath = meta.git?.isWorktree
+      ? meta.git.worktreePath
+      : undefined;
+    const worktreeRemoval = worktreePath
+      ? store.isWorktreeShared(worktreePath, id)
+        ? ({ eligible: false, reason: "sharedWithOtherTerminals" } as const)
+        : ({ eligible: true } as const)
+      : undefined;
+    setCloseConfirmTarget({ id, meta, splitCount, worktreeRemoval });
   }
 
   const commands = createCommands({
-    terminalIds: store.terminalIds,
-    activeId: store.activeId,
-    setActiveId: store.setActiveId,
-    activeMeta: store.activeMeta,
-    handleCreate: (cwd) => void crud.handleCreate(cwd),
-    handleCreateSubTerminal: (parentId, cwd) =>
-      void crud.handleCreateSubTerminal(parentId, cwd),
+    ...actionContext,
     handleCopyTerminalText: () => void crud.handleCopyTerminalText(),
     handleRunInActiveTerminal: (cmd) => crud.handleRunInActiveTerminal(cmd),
-    handleExportSessionAsPdf,
-    handleScreenshotTerminal: () => handleScreenshotTerminal(),
-    toggleSubPanel: handleToggleSubPanel,
+    handleExportScrollbackAsPdf,
+    handleExportSessionAsHtml,
     committedThemeName,
     setPreviewThemeName,
     handleSetTheme,
-    handleShuffleTheme,
-    setShortcutsHelpOpen,
     setAboutOpen,
     setDiagnosticInfoOpen,
     handleCreateWorktree: (repoPath, initialCommand) =>
@@ -268,9 +266,6 @@ const App: Component = () => {
     },
     handleCloseAll: () => void crud.handleCloseAll(),
     simulateAlert: alerts.simulateAlert,
-    toggleRightPanel: rightPanel.togglePanel,
-    canvasCenterActive: handleCanvasCenterActive,
-    toggleMinimap,
     isMobile,
   });
 
@@ -287,125 +282,6 @@ const App: Component = () => {
         if (!anyDialogOpen) refocusTerminal();
       });
     }
-  }
-
-  /** Per-tile chrome rendered into the CanvasTile title bar.
-   *  Order (left → right between title and close): agent indicator, theme
-   *  pill, split toggle, search, screenshot. */
-  function renderTileTitleActions(id: TerminalId) {
-    const meta = store.getMetadata(id);
-    const themeName = () =>
-      store.activeId() === id ? activeThemeName() : meta?.themeName;
-    const subCount = () => store.getSubTerminalIds(id).length;
-    const splitExpanded = () =>
-      subCount() > 0 && !subPanel.getSubPanel(id).collapsed;
-    return (
-      <>
-        <Show when={meta?.agent}>
-          {(agent) => (
-            <button
-              class={`${TILE_BUTTON_CLASS} px-2`}
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={(e) => {
-                e.stopPropagation();
-                store.setActiveId(id);
-                rightPanel.expandPanel();
-              }}
-              title="Open inspector"
-            >
-              <AgentIndicator agent={agent()} />
-            </button>
-          )}
-        </Show>
-        <Show when={themeName()}>
-          {(name) => (
-            <Tip label={`Theme: ${name()}`}>
-              <button
-                data-testid="tile-theme-pill"
-                class={`${TILE_BUTTON_CLASS} px-2 max-w-[14ch] truncate text-xs`}
-                style={{ color: "var(--color-fg-3, currentColor)" }}
-                onPointerDown={(e) => e.stopPropagation()}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  store.setActiveId(id);
-                  openPaletteGroup("Theme");
-                  setTimeout(
-                    () => showTipOnce(CONTEXTUAL_TIPS.themeFromPalette),
-                    500,
-                  );
-                }}
-              >
-                {name()}
-              </button>
-            </Tip>
-          )}
-        </Show>
-        <Tip label={subCount() > 0 ? "Toggle split" : "Add split"}>
-          <button
-            data-testid="tile-split-toggle"
-            class={`${TILE_BUTTON_CLASS} gap-1 px-1.5`}
-            classList={{ "bg-black/20": splitExpanded() }}
-            style={{ color: "var(--color-fg-3, currentColor)" }}
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.stopPropagation();
-              store.setActiveId(id);
-              handleToggleSubPanel(id);
-            }}
-            aria-label="Toggle split"
-          >
-            <svg
-              class="w-3.5 h-3.5"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-              stroke-width="2"
-              aria-hidden="true"
-            >
-              <rect x="3" y="3" width="18" height="18" rx="2" />
-              <line x1="3" y1="13" x2="21" y2="13" />
-            </svg>
-            <Show when={subCount() > 0}>
-              <span
-                data-testid="sub-count"
-                class="text-[0.65rem] tabular-nums leading-none"
-              >
-                {subCount()}
-              </span>
-            </Show>
-          </button>
-        </Tip>
-        <Tip label="Find in terminal">
-          <button
-            data-testid="tile-find"
-            class={`${TILE_BUTTON_CLASS} w-7`}
-            style={{ color: "var(--color-fg-3, currentColor)" }}
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={(e) => {
-              e.stopPropagation();
-              store.setActiveId(id);
-              setSearchOpen(true);
-            }}
-            aria-label="Find in terminal"
-          >
-            <SearchIcon />
-          </button>
-        </Tip>
-        <button
-          class={`${TILE_BUTTON_CLASS} w-7`}
-          style={{ color: "var(--color-fg-3, currentColor)" }}
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={(e) => {
-            e.stopPropagation();
-            handleScreenshotTerminal(id);
-          }}
-          title="Screenshot terminal"
-          data-testid="screenshot-button"
-        >
-          <ScreenshotIcon />
-        </button>
-      </>
-    );
   }
 
   /** Canvas tile body — every tile stays mounted (`visible={true}`) so
@@ -580,7 +456,7 @@ const App: Component = () => {
               groups={pillGroups()}
               onSelect={(id) => {
                 store.setActiveId(id);
-                if (!store.canvasMaximized()) {
+                if (!posture.maximized()) {
                   const layout = store.getMetadata(id)?.canvasLayout;
                   if (layout) canvasViewport.centerOnTile(layout);
                 }
@@ -620,7 +496,7 @@ const App: Component = () => {
                 <CanvasWatermark text={appTitle()} />
                 <EmptyState
                   savedSession={session.savedSession() ?? undefined}
-                  onRestore={() => void session.handleRestoreSession()}
+                  onRestore={(opts) => void session.handleRestoreSession(opts)}
                 />
               </div>
             }
@@ -656,7 +532,15 @@ const App: Component = () => {
                     renderTileTitle={(id) => (
                       <TerminalMeta info={store.getDisplayInfo(id)} />
                     )}
-                    renderTileTitleActions={renderTileTitleActions}
+                    renderTileTitleActions={(id) => (
+                      <TileTitleActions
+                        id={id}
+                        onOpenPaletteGroup={openPaletteGroup}
+                        onToggleSubPanel={handleToggleSubPanel}
+                        onOpenSearch={() => setSearchOpen(true)}
+                        onScreenshot={handleScreenshotTerminal}
+                      />
+                    )}
                     renderTileBody={renderCanvasTileBody}
                   />
                 ))

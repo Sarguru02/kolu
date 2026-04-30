@@ -4,42 +4,43 @@
  * Server implements this contract. Client uses the contract type
  * for end-to-end type safety without importing server code.
  */
-import { oc, eventIterator } from "@orpc/contract";
+import { eventIterator, oc } from "@orpc/contract";
+import { z } from "zod";
 import {
-  TerminalInfoSchema,
-  TerminalCreateInputSchema,
-  TerminalResizeInputSchema,
-  TerminalSendInputSchema,
-  TerminalSetThemeInputSchema,
-  TerminalSetCanvasLayoutInputSchema,
-  TerminalSetSubPanelInputSchema,
+  ActivityFeedSchema,
+  ExportTranscriptHtmlInputSchema,
+  ExportTranscriptHtmlOutputSchema,
+  FsListAllInputSchema,
+  FsListAllOutputSchema,
+  FsReadFileInputSchema,
+  FsReadFileOutputSchema,
+  GitDiffInputSchema,
+  GitDiffOutputSchema,
+  GitStatusInputSchema,
+  GitStatusOutputSchema,
+  PreferencesPatchSchema,
+  PreferencesSchema,
+  SavedSessionSchema,
+  ServerInfoSchema,
   SetActiveTerminalInputSchema,
   TerminalAttachInputSchema,
   TerminalAttachOutputSchema,
-  TerminalOnExitOutputSchema,
-  TerminalReorderInputSchema,
-  TerminalSetParentInputSchema,
+  TerminalCreateInputSchema,
+  TerminalInfoSchema,
   TerminalMetadataSchema,
+  TerminalOnExitOutputSchema,
   TerminalPasteImageInputSchema,
+  TerminalResizeInputSchema,
   TerminalScreenTextInputSchema,
-  ServerInfoSchema,
+  TerminalSendInputSchema,
+  TerminalSetCanvasLayoutInputSchema,
+  TerminalSetParentInputSchema,
+  TerminalSetSubPanelInputSchema,
+  TerminalSetThemeInputSchema,
   WorktreeCreateInputSchema,
   WorktreeCreateOutputSchema,
   WorktreeRemoveInputSchema,
-  GitStatusInputSchema,
-  GitStatusOutputSchema,
-  GitDiffInputSchema,
-  GitDiffOutputSchema,
-  PreferencesSchema,
-  PreferencesPatchSchema,
-  ActivityFeedSchema,
-  SavedSessionSchema,
-  FsListDirInputSchema,
-  FsListDirOutputSchema,
-  FsReadFileInputSchema,
-  FsReadFileOutputSchema,
 } from "./index";
-import { z } from "zod";
 
 export const contract = oc.router({
   server: {
@@ -47,7 +48,7 @@ export const contract = oc.router({
   },
   terminal: {
     create: oc.input(TerminalCreateInputSchema).output(TerminalInfoSchema),
-    // Stream terminal list changes (create/kill/reorder). Yields current list immediately.
+    // Stream terminal list changes (create/kill). Yields current list immediately.
     list: oc.output(eventIterator(z.array(TerminalInfoSchema))),
     resize: oc.input(TerminalResizeInputSchema).output(z.void()),
     sendInput: oc.input(TerminalSendInputSchema).output(z.void()),
@@ -75,33 +76,49 @@ export const contract = oc.router({
     pasteImage: oc.input(TerminalPasteImageInputSchema).output(z.void()),
     // Kill a single terminal
     kill: oc.input(TerminalAttachInputSchema).output(TerminalInfoSchema),
-    // Reorder terminals to match the given ID list
-    reorder: oc.input(TerminalReorderInputSchema).output(z.void()),
     // Set or clear a terminal's parent (for orphan promotion)
     setParent: oc.input(TerminalSetParentInputSchema).output(z.void()),
     // Kill and remove all terminals (test-only: reset server state between scenarios)
     killAll: oc.output(z.void()),
+    // One-shot: read the active agent's transcript from disk and render
+    // a self-contained HTML export. Errors with PRECONDITION_FAILED if the
+    // terminal has no agent session attached.
+    exportTranscriptHtml: oc
+      .input(ExportTranscriptHtmlInputSchema)
+      .output(ExportTranscriptHtmlOutputSchema),
   },
   git: {
     worktreeCreate: oc
       .input(WorktreeCreateInputSchema)
       .output(WorktreeCreateOutputSchema),
     worktreeRemove: oc.input(WorktreeRemoveInputSchema).output(z.void()),
-    /** List files changed for the given mode: `local` = vs HEAD
-     *  (working tree + staged + untracked); `branch` = vs merge-base
-     *  with `origin/<defaultBranch>` (what this branch will ship). */
-    status: oc.input(GitStatusInputSchema).output(GitStatusOutputSchema),
-    /** Raw unified diff plus old/new file contents for `@git-diff-view`.
-     *  Base depends on mode — HEAD in local mode, merge-base with
-     *  `origin/<defaultBranch>` in branch mode. */
-    diff: oc.input(GitDiffInputSchema).output(GitDiffOutputSchema),
+    /** Stream changed-files list for the given mode (`local` = vs HEAD;
+     *  `branch` = vs merge-base with `origin/<defaultBranch>`). Yields
+     *  current state immediately, then a fresh full snapshot every time
+     *  the underlying repo state changes (HEAD, reflog, index, working
+     *  tree). Server dedups against the last yielded value. */
+    onStatusChange: oc
+      .input(GitStatusInputSchema)
+      .output(eventIterator(GitStatusOutputSchema)),
+    /** Stream unified diff for one file. Yields current diff, then a fresh
+     *  full snapshot whenever the repo state changes. Server dedups. */
+    onDiffChange: oc
+      .input(GitDiffInputSchema)
+      .output(eventIterator(GitDiffOutputSchema)),
   },
   fs: {
-    /** List entries in a directory, filtered by git (tracked + untracked-but-not-ignored).
-     *  Used by the Code tab's file tree browser. */
-    listDir: oc.input(FsListDirInputSchema).output(FsListDirOutputSchema),
-    /** Read a file's UTF-8 content, path-traversal guarded. */
-    readFile: oc.input(FsReadFileInputSchema).output(FsReadFileOutputSchema),
+    /** Stream the flat repo-relative path list (tracked + untracked-but-
+     *  not-ignored). Yields current list, then a fresh full snapshot on
+     *  every repo state change. Drives the Code-view's All-mode tree. */
+    onListAllChange: oc
+      .input(FsListAllInputSchema)
+      .output(eventIterator(FsListAllOutputSchema)),
+    /** Stream a file's UTF-8 content. Yields current content, then a
+     *  fresh full snapshot whenever the file or HEAD changes. Path-
+     *  traversal guarded. Drives the Code-view's All-mode body. */
+    onReadFileChange: oc
+      .input(FsReadFileInputSchema)
+      .output(eventIterator(FsReadFileOutputSchema)),
   },
   preferences: {
     // Stream user preferences. Yields current value immediately, then on each change.
@@ -121,6 +138,8 @@ export const contract = oc.router({
   session: {
     // Stream the persisted saved-session blob (or null when none). Read-only —
     // server writes via debounced autosave on terminal-list changes.
+    // The per-terminal `lastAgentCommand` field rides inside `SavedTerminal`
+    // and drives the resume offer in EmptyState.
     get: oc.output(eventIterator(SavedSessionSchema.nullable())),
     // Reset saved session (test-only: seed/clear between scenarios)
     test__set: oc.input(SavedSessionSchema.nullable()).output(z.void()),

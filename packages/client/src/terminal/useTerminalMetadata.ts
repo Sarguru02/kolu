@@ -4,13 +4,15 @@
  *  git, PR, agent status). Each event replaces the previous; only
  *  current state matters.
  *
- *  Terminal IDs are derived from the live list subscription data.
- *  Order is derived from metadata sortOrder — no separate ordering state.
+ *  Terminal IDs are derived from the live list subscription data. Order
+ *  is the server's Map insertion order (terminal creation order) — no
+ *  client-side sort, no per-terminal ordering field.
  *
  *  Per-terminal subscriptions use mapArray for lifecycle — SolidJS creates
  *  a reactive owner per item and disposes it when the item leaves the list.
  *  No manual Map, AbortController, or version signals needed. */
 
+import type { TerminalId, TerminalInfo, TerminalMetadata } from "kolu-common";
 import { type Accessor, createMemo, mapArray } from "solid-js";
 import { toast } from "solid-sonner";
 import {
@@ -18,7 +20,6 @@ import {
   type Subscription,
 } from "../rpc/createSubscription";
 import { stream } from "../rpc/rpc";
-import type { TerminalId, TerminalInfo, TerminalMetadata } from "kolu-common";
 import {
   buildTerminalDisplayInfos,
   type TerminalDisplayInfo,
@@ -61,27 +62,41 @@ export function useTerminalMetadata(deps: {
     );
   }
 
-  // --- Order derived from metadata sortOrder ---
+  // --- Order: server Map insertion order, filtered by parent relationship ---
 
-  const bySortOrder = (a: TerminalId, b: TerminalId) =>
-    (getMetadata(a)?.sortOrder ?? 0) - (getMetadata(b)?.sortOrder ?? 0);
-
-  /** Top-level terminal IDs sorted by sortOrder.
+  /** Top-level terminal IDs in server-provided order.
    *  Terminals whose metadata hasn't arrived yet are excluded (still loading). */
   const terminalIds = createMemo(() =>
-    terminalIdList()
-      .filter((id) => {
-        const m = getMetadata(id);
-        return m && !m.parentId;
-      })
-      .sort(bySortOrder),
+    terminalIdList().filter((id) => {
+      const m = getMetadata(id);
+      return m && !m.parentId;
+    }),
   );
 
-  /** Sub-terminal IDs for a parent, sorted by sortOrder. */
+  /** Sub-terminal IDs for a parent, in server-provided order. */
   function getSubTerminalIds(parentId: TerminalId): TerminalId[] {
-    return terminalIdList()
-      .filter((id) => getMetadata(id)?.parentId === parentId)
-      .sort(bySortOrder);
+    return terminalIdList().filter(
+      (id) => getMetadata(id)?.parentId === parentId,
+    );
+  }
+
+  /** True if any terminal outside of `excludeId`'s tree is also on
+   *  `worktreePath`. Callers use this to decide whether removing the
+   *  worktree would yank it out from under a live terminal.
+   *
+   *  A sub-terminal of a different top-level must also count: its git
+   *  metadata is derived from its own CWD and it survives when
+   *  `excludeId` dies. */
+  function isWorktreeShared(
+    worktreePath: string,
+    excludeId: TerminalId,
+  ): boolean {
+    const onWorktree = (id: TerminalId) =>
+      getMetadata(id)?.git?.worktreePath === worktreePath;
+    return terminalIds().some((otherId) => {
+      if (otherId === excludeId) return false;
+      return onWorktree(otherId) || getSubTerminalIds(otherId).some(onWorktree);
+    });
   }
 
   // --- Derived accessors ---
@@ -109,6 +124,7 @@ export function useTerminalMetadata(deps: {
     getMetadata,
     terminalIds,
     getSubTerminalIds,
+    isWorktreeShared,
     activeMeta,
     getDisplayInfo,
     terminalLabel,

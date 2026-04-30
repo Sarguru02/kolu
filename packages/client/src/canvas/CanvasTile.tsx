@@ -10,26 +10,22 @@
  *    disabled. The maximize signal lives in `TerminalCanvas`, exposed here
  *    so chrome reflects state and double-click toggles it. */
 
-import { type Component, For, type JSX, Show } from "solid-js";
 import { createDraggable } from "@thisbeyond/solid-dnd";
-import type { TileLayout } from "./TileLayout";
-import { RESIZE_HANDLES, type ResizeDirection } from "./resizeGeometry";
+import { type Component, For, type JSX, Show } from "solid-js";
+import { CHROME_ICON_BUTTON_CLASS } from "../ui/chromeSpacing";
 import { MaximizeIcon, RestoreIcon } from "../ui/Icons";
+import { RESIZE_HANDLES, type ResizeDirection } from "./resizeGeometry";
+import type { TileLayout } from "./TileLayout";
 import {
   type TileTheme,
+  tileChromeButton,
+  tileFgTier,
   tileTitleBarBg,
   tileTitleBarBorder,
-  tileFgTier,
-  tileChromeButton,
 } from "./tileChrome";
+import { DEFAULT_TILE_H, DEFAULT_TILE_W } from "./tilePlacement";
 
 export type { TileTheme };
-
-// 800×540 fits ~88 cols × 27 rows at the default font (~9px × 20px cell),
-// safely above the legacy 80×24 baseline that downstream tools (`stty`,
-// `$COLUMNS`, less, vim) treat as the floor.
-const DEFAULT_W = 800;
-const DEFAULT_H = 540;
 
 const CanvasTile: Component<{
   id: string;
@@ -60,7 +56,7 @@ const CanvasTile: Component<{
   const { id } = props;
   const draggable = createDraggable(id);
   const layout = () =>
-    props.layouts[id] ?? { x: 0, y: 0, w: DEFAULT_W, h: DEFAULT_H };
+    props.layouts[id] ?? { x: 0, y: 0, w: DEFAULT_TILE_W, h: DEFAULT_TILE_H };
 
   const bg = () => props.theme.bg;
 
@@ -103,6 +99,13 @@ const CanvasTile: Component<{
         "inset-0 z-40": props.maximized,
         "rounded-xl": !props.maximized,
         "border-accent/60 shadow-xl": props.active && !props.maximized,
+        // Active-tile right edge is the visual handshake to the right
+        // panel (the panel inspects this tile). The other three edges
+        // stay at accent/60 via the rule above; this overrides only the
+        // right edge to full accent so the cue reads asymmetrically as
+        // "this side points at the inspector." Sits in classList rather
+        // than tiledStyle() so it isn't re-evaluated on every drag tick.
+        "border-r-[var(--color-accent)]": props.active && !props.maximized,
         "border-edge/40 hover:border-edge/60":
           !props.active && !props.maximized,
         "border-transparent": props.maximized,
@@ -137,6 +140,12 @@ const CanvasTile: Component<{
           "--color-fg-2": tileFgTier(props.theme, 2),
           "--color-fg-3": tileFgTier(props.theme, 3),
         }}
+        // Non-interactive chrome: prevent the browser's default
+        // mousedown focus shift so clicks on the title bar don't blur
+        // the xterm textarea. solid-dnd's drag uses pointerdown, not
+        // mousedown, so drag is unaffected; child buttons handle their
+        // own focus via stopPropagation on pointerdown.
+        onMouseDown={(e) => e.preventDefault()}
         onDblClick={(e) => {
           e.stopPropagation();
           props.onToggleMaximize();
@@ -147,8 +156,9 @@ const CanvasTile: Component<{
         <div class="flex items-center gap-1 shrink-0">
           {props.renderTitleActions?.()}
           <button
+            type="button"
             data-testid="canvas-tile-maximize"
-            class="flex items-center justify-center w-7 h-7 rounded-lg transition-colors cursor-pointer pointer-events-auto hover:bg-black/20"
+            class={`${CHROME_ICON_BUTTON_CLASS} pointer-events-auto hover:bg-black/20`}
             style={{
               color: tileChromeButton(props.theme),
             }}
@@ -164,8 +174,9 @@ const CanvasTile: Component<{
             </Show>
           </button>
           <button
+            type="button"
             data-testid="canvas-tile-close"
-            class="flex items-center justify-center w-7 h-7 rounded-lg transition-colors cursor-pointer pointer-events-auto hover:bg-black/20 text-sm"
+            class={`${CHROME_ICON_BUTTON_CLASS} pointer-events-auto text-sm`}
             style={{
               color: tileChromeButton(props.theme),
             }}

@@ -6,6 +6,9 @@
  *                                                    ↓
  *   title:<id>  →  process provider  ────────→  metadata:<id>
  *   title:<id> + agent external-change signal  →  agent provider (×N)  →  metadata:<id>
+ *   commandRun:<id>  →  agent-command tracker  →  lastAgentCommandName stash
+ *                                                 + metadata:<id> (lastAgentCommand)
+ *                                                 + activity:changed
  *
  * Providers publish server-derived fields via `updateServerMetadata`; client
  * RPC handlers persist client-owned fields via `updateClientMetadata` (or
@@ -16,107 +19,40 @@
  *
  * No provider subscribes to the aggregated "metadata" channel — that's client-facing only.
  *
- * Agent-detection providers (claude-code, opencode, future aider/codex/…)
+ * Agent-detection providers (claude-code, codex, opencode, future aider/…)
  * share a single generic orchestrator (`startAgentProvider`) that consumes
  * an `AgentProvider` instance from the integration package. Adding a new
  * agent is a new provider instance and one extra line below — not a new
  * server-side adapter file.
+ *
+ * Module layout:
+ *   - `./state.ts`        — `createMetadata` / `updateServerMetadata` /
+ *                           `updateClientMetadata`. Leaf (no imports from
+ *                           peer providers).
+ *   - `./agent-command.ts`, `./agent.ts`, `./git.ts`, `./github.ts`,
+ *     `./process.ts` — per-provider start functions. Each imports from
+ *                      `./state.ts` and `../terminal-registry.ts`.
+ *   - `./index.ts`        — this file. Composes them via `startProviders`
+ *                           and re-exports the metadata mutators so
+ *                           external callers (terminals.ts, router.ts)
+ *                           keep one import path.
  */
 
-import type {
-  TerminalMetadata,
-  TerminalServerMetadata,
-  TerminalClientMetadata,
-} from "kolu-common";
-import {
-  type TerminalProcess,
-  recomputeDisplaySuffixes,
-  getTerminal,
-} from "../terminals.ts";
-import { publishForTerminal, publishSystem } from "../publisher.ts";
 import { claudeCodeProvider } from "kolu-claude-code";
+import { codexProvider } from "kolu-codex";
 import { opencodeProvider } from "kolu-opencode";
+import type { TerminalProcess } from "../terminal-registry.ts";
+import { startAgentProvider } from "./agent.ts";
+import { startAgentCommandTracker } from "./agent-command.ts";
 import { startGitProvider } from "./git.ts";
 import { startGitHubPrProvider } from "./github.ts";
-import { startAgentProvider } from "./agent.ts";
 import { startProcessProvider } from "./process.ts";
-import { log } from "../log.ts";
 
-/** Create initial metadata state for a new terminal. */
-export function createMetadata(
-  cwd: string,
-  sortOrder: number,
-): TerminalMetadata {
-  return {
-    cwd,
-    git: null,
-    pr: null,
-    agent: null,
-    foreground: null,
-    sortOrder,
-  };
-}
-
-/** Log + publish the current metadata snapshot and trigger debounced
- *  session auto-save. Shared tail for both `updateServerMetadata` and
- *  `updateClientMetadata` so the publish/audit path is identical regardless
- *  of who wrote the fields.
- *
- *  Also recomputes `displaySuffix` across the live set: any cwd/git
- *  change can flip another terminal between "unique" and "collision"
- *  status. Affected terminals get their own metadata republish so each
- *  per-terminal stream stays in sync. */
-function publishMetadata(entry: TerminalProcess, terminalId: string): void {
-  const m = entry.info.meta;
-  log.debug(
-    {
-      terminal: terminalId,
-      cwd: m.cwd,
-      repo: m.git?.repoName,
-      branch: m.git?.branch,
-      pr: m.pr?.number ?? null,
-      checks: m.pr?.checks ?? null,
-      // Only include agent/foreground fields when present to avoid noisy null logs
-      ...(m.agent && { agent: `${m.agent.kind}:${m.agent.state}` }),
-      ...(m.foreground && { foreground: m.foreground.name }),
-    },
-    "metadata publish",
-  );
-  const suffixChanges = recomputeDisplaySuffixes();
-  publishForTerminal("metadata", terminalId, { ...m });
-  for (const id of suffixChanges) {
-    if (id === terminalId) continue; // already published above
-    const other = getTerminal(id);
-    if (other) publishForTerminal("metadata", id, { ...other.info.meta });
-  }
-  publishSystem("terminals:dirty", {});
-}
-
-/** Atomically mutate server-derived metadata (cwd, git, pr, agent,
- *  foreground) and publish. The mutator is narrowed to
- *  `TerminalServerMetadata` so providers cannot accidentally write
- *  client-owned fields. */
-export function updateServerMetadata(
-  entry: TerminalProcess,
-  terminalId: string,
-  mutate: (meta: TerminalServerMetadata) => void,
-): void {
-  mutate(entry.info.meta);
-  publishMetadata(entry, terminalId);
-}
-
-/** Atomically mutate client-owned metadata (themeName, parentId, sortOrder,
- *  canvasLayout, subPanel) and publish. The mutator is narrowed to
- *  `TerminalClientMetadata` so RPC handlers cannot accidentally overwrite
- *  provider-owned state. */
-export function updateClientMetadata(
-  entry: TerminalProcess,
-  terminalId: string,
-  mutate: (meta: TerminalClientMetadata) => void,
-): void {
-  mutate(entry.info.meta);
-  publishMetadata(entry, terminalId);
-}
+export {
+  createMetadata,
+  updateClientMetadata,
+  updateServerMetadata,
+} from "./state.ts";
 
 /**
  * Start all metadata providers for a terminal.
@@ -126,15 +62,21 @@ export function startProviders(
   entry: TerminalProcess,
   terminalId: string,
 ): () => void {
+  // Subscribe the tracker before any provider — the stash it maintains is
+  // read by `startAgentProvider`'s reconcile via `getLastAgentCommandName`.
+  const stopAgentCommand = startAgentCommandTracker(terminalId);
   const stopGit = startGitProvider(entry, terminalId);
   const stopGitHubPr = startGitHubPrProvider(entry, terminalId);
   const stopClaude = startAgentProvider(claudeCodeProvider, entry, terminalId);
+  const stopCodex = startAgentProvider(codexProvider, entry, terminalId);
   const stopOpenCode = startAgentProvider(opencodeProvider, entry, terminalId);
   const stopProcess = startProcessProvider(entry, terminalId);
   return () => {
+    stopAgentCommand();
     stopGit();
     stopGitHubPr();
     stopClaude();
+    stopCodex();
     stopOpenCode();
     stopProcess();
   };

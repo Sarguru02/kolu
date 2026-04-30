@@ -1,8 +1,14 @@
-import { Given, When, Then } from "@cucumber/cucumber";
-import { KoluWorld } from "../support/world.ts";
+import * as assert from "node:assert";
+import { Given, Then, When } from "@cucumber/cucumber";
 import { readBufferText, waitForBufferContains } from "../support/buffer.ts";
 import { pollUntil } from "../support/poll.ts";
-import * as assert from "node:assert";
+import type { KoluWorld } from "../support/world.ts";
+
+async function clearClipboard(world: KoluWorld) {
+  await world.page
+    .evaluate(() => navigator.clipboard?.writeText?.(""))
+    .catch(() => undefined);
+}
 
 /** Count terminals by reading canvas tile entries from the DOM. */
 async function countTerminals(world: KoluWorld) {
@@ -15,6 +21,7 @@ async function countTerminals(world: KoluWorld) {
 
 Given("the terminal is ready", async function (this: KoluWorld) {
   await this.page.goto("/");
+  await clearClipboard(this);
   await this.waitForReady();
 });
 
@@ -182,6 +189,19 @@ When("I click the terminal canvas", async function (this: KoluWorld) {
   await this.canvas.click();
 });
 
+When("I click the terminal tile title bar", async function (this: KoluWorld) {
+  // Scope to the active tile (`data-active="true"`) so the click lands on
+  // the same tile the user was just typing into, regardless of how many
+  // terminals are mounted.
+  await this.page
+    .locator(
+      '[data-testid="canvas-tile"][data-active="true"] [data-testid="canvas-tile-titlebar"]',
+    )
+    .first()
+    .click();
+  await this.waitForFrame();
+});
+
 Then("the terminal input should be focused", async function (this: KoluWorld) {
   const focused = await this.page.evaluate(
     () => !!document.activeElement?.closest("[data-visible]"),
@@ -196,10 +216,10 @@ Given("I intercept oRPC sendInput calls", async function (this: KoluWorld) {
   // oRPC sends JSON-encoded messages over WS.
   await this.page.evaluate(() => {
     const origSend = WebSocket.prototype.send;
-    (window as any).__wsSent = [];
-    WebSocket.prototype.send = function (data: any) {
+    window.__wsSent = [];
+    WebSocket.prototype.send = function (data) {
       if (typeof data === "string") {
-        (window as any).__wsSent.push(data);
+        window.__wsSent?.push(data);
       }
       return origSend.call(this, data);
     };
@@ -210,7 +230,7 @@ Then(
   "no sendInput call should contain {string} {string} {string}",
   async function (this: KoluWorld, k1: string, k2: string, k3: string) {
     const messages: string[] = await this.page.evaluate(
-      () => (window as any).__wsSent ?? [],
+      () => window.__wsSent ?? [],
     );
     // Look for sendInput calls whose data field contains zoom key chars
     for (const msg of messages) {
@@ -241,11 +261,11 @@ Then(
           return NaN;
         }
       },
-      (n) => !isNaN(n) && n > min,
+      (n) => !Number.isNaN(n) && n > min,
       { attempts: 30 },
     );
     assert.ok(
-      !isNaN(cols) && cols > min,
+      !Number.isNaN(cols) && cols > min,
       `Expected ${filePath} to contain a number > ${min}, got: "${cols}"`,
     );
   },
@@ -257,11 +277,9 @@ Then(
   "the font size should be larger than before",
   async function (this: KoluWorld) {
     const current = await this.fontSize();
-    assert.ok(this.savedFontSize !== undefined, "No saved font size");
-    assert.ok(
-      current > this.savedFontSize!,
-      `Font size ${current} not larger than ${this.savedFontSize}`,
-    );
+    const saved = this.savedFontSize;
+    assert.ok(saved !== undefined, "No saved font size");
+    assert.ok(current > saved, `Font size ${current} not larger than ${saved}`);
   },
 );
 
@@ -269,10 +287,11 @@ Then(
   "the font size should be smaller than the original",
   async function (this: KoluWorld) {
     const current = await this.fontSize();
-    assert.ok(this.savedFontSize !== undefined, "No saved font size");
+    const saved = this.savedFontSize;
+    assert.ok(saved !== undefined, "No saved font size");
     assert.ok(
-      current < this.savedFontSize!,
-      `Font size ${current} not smaller than ${this.savedFontSize}`,
+      current < saved,
+      `Font size ${current} not smaller than ${saved}`,
     );
   },
 );

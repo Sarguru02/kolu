@@ -12,16 +12,17 @@
  *  action (branch select, palette open, inspector toggle) so the
  *  parent can close the drawer. */
 
-import { type Component, For, Show, createSignal } from "solid-js";
-import { SettingsIcon } from "./ui/Icons";
-import { formatKeybind, SHORTCUTS } from "./input/keyboard";
-import Kbd from "./ui/Kbd";
-import SettingsPopover from "./settings/SettingsPopover";
-import { useRightPanel } from "./right-panel/useRightPanel";
-import { type PillRepoGroup, repoColor } from "./canvas/pillTreeOrder";
-import { useTerminalStore } from "./terminal/useTerminalStore";
 import type { TerminalId } from "kolu-common";
+import { type Component, createSignal, For, Show } from "solid-js";
+import { type PillRepoGroup, repoColor } from "./canvas/pillTreeOrder";
+import { ACTIONS } from "./input/actions";
+import { formatKeybind } from "./input/keyboard";
+import { useRightPanel } from "./right-panel/useRightPanel";
 import type { WsStatus } from "./rpc/rpc";
+import SettingsPopover from "./settings/SettingsPopover";
+import { useTerminalStore } from "./terminal/useTerminalStore";
+import { SettingsIcon } from "./ui/Icons";
+import Kbd from "./ui/Kbd";
 
 const statusStyles: Record<WsStatus, string> = {
   connecting: "bg-warning animate-pulse",
@@ -66,6 +67,7 @@ const MobileChromeSheet: Component<{
         <span
           data-ws-status={props.status}
           class={`inline-block w-2 h-2 rounded-full ${statusStyles[props.status]}`}
+          role="status"
           aria-label="Connection status"
         />
       </div>
@@ -88,6 +90,7 @@ const MobileChromeSheet: Component<{
                   const unread = () => store.isUnread(b.id);
                   return (
                     <button
+                      type="button"
                       data-testid="mobile-pill-branch"
                       data-terminal-id={b.id}
                       data-active={active() ? "" : undefined}
@@ -129,6 +132,7 @@ const MobileChromeSheet: Component<{
        *  (which would suppress the click). */}
       <div class="flex items-center gap-2 px-3 py-2 border-t border-edge/50">
         <button
+          type="button"
           data-testid="palette-trigger"
           class="flex-1 h-9 flex items-center justify-center gap-2 text-sm text-fg-2 bg-surface-2 rounded-lg border border-edge active:bg-surface-3"
           onPointerDown={(e) => e.stopPropagation()}
@@ -137,11 +141,12 @@ const MobileChromeSheet: Component<{
             props.onClose();
           }}
         >
-          <Kbd>{formatKeybind(SHORTCUTS.commandPalette.keybind)}</Kbd>
+          <Kbd>{formatKeybind(ACTIONS.commandPalette.keybind)}</Kbd>
           <span>Palette</span>
         </button>
         <div>
           <button
+            type="button"
             ref={settingsTriggerRef}
             data-testid="settings-trigger"
             class="h-9 w-9 flex items-center justify-center text-fg-2 bg-surface-2 rounded-lg border border-edge active:bg-surface-3"
@@ -158,6 +163,7 @@ const MobileChromeSheet: Component<{
           />
         </div>
         <button
+          type="button"
           data-testid="inspector-toggle"
           class="h-9 w-9 flex items-center justify-center text-fg-2 bg-surface-2 rounded-lg border border-edge active:bg-surface-3"
           classList={{

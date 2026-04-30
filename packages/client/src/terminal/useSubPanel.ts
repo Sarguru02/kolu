@@ -1,8 +1,9 @@
 /** Sub-panel UI state — singleton module. Tracks collapsed, size, active tab per parent terminal.
  *  Reported to server for session snapshots; seeded from server on restore. */
 
-import { createStore, produce } from "solid-js/store";
 import type { TerminalId } from "kolu-common";
+import { nonEmpty } from "nonempty";
+import { createStore, produce } from "solid-js/store";
 import { client } from "../rpc/rpc";
 
 interface SubPanelState {
@@ -19,15 +20,16 @@ const DEFAULT_PANEL_SIZE = 0.3;
 const [state, setState] = createStore<Record<TerminalId, SubPanelState>>({});
 
 function ensureState(parentId: TerminalId): SubPanelState {
-  if (!state[parentId]) {
-    setState(parentId, {
-      collapsed: false,
-      panelSize: DEFAULT_PANEL_SIZE,
-      activeSubTab: null,
-      focusTarget: "sub",
-    });
-  }
-  return state[parentId]!;
+  const existing = state[parentId];
+  if (existing) return existing;
+  const seeded: SubPanelState = {
+    collapsed: false,
+    panelSize: DEFAULT_PANEL_SIZE,
+    activeSubTab: null,
+    focusTarget: "sub",
+  };
+  setState(parentId, seeded);
+  return seeded;
 }
 
 /** Report sub-panel state to server for session persistence. */
@@ -82,11 +84,12 @@ export function useSubPanel() {
 
     /** Cycle to the next/previous sub-tab within a parent's sub-panel. */
     cycleSubTab(parentId: TerminalId, subIds: TerminalId[], direction: 1 | -1) {
-      if (subIds.length === 0) return;
+      const ne = nonEmpty(subIds);
+      if (!ne) return;
       const panel = ensureState(parentId);
-      const current = subIds.indexOf(panel.activeSubTab as string);
-      const next = (current + direction + subIds.length) % subIds.length;
-      setState(parentId, "activeSubTab", subIds[next]!);
+      const current = ne.indexOf(panel.activeSubTab as string);
+      const next = (current + direction + ne.length) % ne.length;
+      setState(parentId, "activeSubTab", ne[next] ?? ne[0]);
     },
 
     setFocusTarget(parentId: TerminalId, target: "main" | "sub") {

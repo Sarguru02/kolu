@@ -3,62 +3,71 @@
  *  All fallible functions return GitResult<T> instead of throwing.
  *  Functions accept an optional Logger for instrumentation. */
 
-// Error types
-export { type GitError, type GitResult, ok, err } from "./errors.ts";
-
-// Schemas
+// Name generation
+export { randomName } from "memorable-names";
+// File tree browsing
+export { listAll, readFile } from "./browse.ts";
+// Equality predicates for streamed snapshot dedup
 export {
-  GitInfoSchema,
-  WorktreeCreateInputSchema,
-  WorktreeCreateOutputSchema,
-  WorktreeRemoveInputSchema,
-  GitChangeStatusSchema,
-  GitChangedFileSchema,
-  GitDiffModeSchema,
-  GitBaseRefSchema,
-  GitStatusInputSchema,
-  GitStatusOutputSchema,
-  GitDiffInputSchema,
-  GitDiffOutputSchema,
-  FsListDirInputSchema,
-  FsDirEntrySchema,
-  FsListDirOutputSchema,
-  FsReadFileInputSchema,
-  FsReadFileOutputSchema,
-  type GitInfo,
-  type GitChangeStatus,
-  type GitChangedFile,
-  type GitDiffMode,
-  type GitBaseRef,
-  type GitStatusOutput,
-  type GitDiffOutput,
-  type FsListDirOutput,
-} from "./schemas.ts";
-
+  fsListAllOutputEqual,
+  fsReadFileOutputEqual,
+  gitDiffOutputEqual,
+  gitStatusOutputEqual,
+} from "./equals.ts";
+// Error types
+export { err, type GitError, type GitResult, ok } from "./errors.ts";
+// HEAD watcher (refcounted shared singleton)
+export { watchGitHead } from "./head-watcher.ts";
+// Index watcher (refcounted shared singleton, axis 3)
+export { watchGitIndex } from "./index-watcher.ts";
+// Reflog watcher (refcounted shared singleton, axis 2)
+export { watchGitReflog } from "./reflog-watcher.ts";
+// Composed primitives for the live Code-view streaming endpoints
+export { subscribeFileChange, subscribeRepoChange } from "./repo-change.ts";
 // Repository resolution
 export {
-  resolveGitInfo,
-  watchGitHead,
   gitInfoEqual,
   hasGitDir,
+  resolveGitInfo,
   subscribeGitInfo,
 } from "./resolve.ts";
 
-// Worktree operations
-export {
-  worktreeCreate,
-  worktreeRemove,
-  detectDefaultBranch,
-} from "./worktree.ts";
-
 // Diff review
-export { getStatus, getDiff, parseNameStatus } from "./review.ts";
-
-// File tree browsing
-export { listDir, readFile } from "./browse.ts";
-
+export { getDiff, getStatus, parseNameStatus } from "./review.ts";
 // Path security
 export { resolveUnder } from "./safe-path.ts";
-
-// Name generation
-export { randomName } from "memorable-names";
+// Schemas
+export {
+  FsListAllInputSchema,
+  type FsListAllOutput,
+  FsListAllOutputSchema,
+  FsReadFileInputSchema,
+  FsReadFileOutputSchema,
+  type GitBaseRef,
+  GitBaseRefSchema,
+  type GitChangedFile,
+  GitChangedFileSchema,
+  type GitChangeStatus,
+  GitChangeStatusSchema,
+  GitDiffInputSchema,
+  type GitDiffMode,
+  GitDiffModeSchema,
+  type GitDiffOutput,
+  GitDiffOutputSchema,
+  type GitInfo,
+  GitInfoSchema,
+  GitStatusInputSchema,
+  type GitStatusOutput,
+  GitStatusOutputSchema,
+  WorktreeCreateInputSchema,
+  WorktreeCreateOutputSchema,
+  WorktreeRemoveInputSchema,
+} from "./schemas.ts";
+// Working-tree watcher (axis 4, parcel-watcher backed)
+export { watchWorkingTree } from "./working-tree-watcher.ts";
+// Worktree operations
+export {
+  detectDefaultBranch,
+  worktreeCreate,
+  worktreeRemove,
+} from "./worktree.ts";

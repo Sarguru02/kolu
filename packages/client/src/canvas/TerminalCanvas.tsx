@@ -15,34 +15,37 @@
  *  axis (gestures, transforms, coordinates) per Lowy analysis. */
 
 import {
-  type Component,
-  For,
-  Show,
-  createEffect,
-  createMemo,
-  createSignal,
-  on,
-  type JSX,
-} from "solid-js";
-import {
   DragDropProvider,
   DragDropSensors,
   type DragEvent,
 } from "@thisbeyond/solid-dnd";
 import type { TerminalId } from "kolu-common";
-import type { TileLayout } from "./TileLayout";
-import { useCanvasViewport } from "./viewport/useCanvasViewport";
-import { capturePointerGesture } from "./viewport/capturePointerGesture";
-import { applyResize, type ResizeDirection } from "./resizeGeometry";
-import CanvasTile from "./CanvasTile";
-import CanvasMinimap from "./CanvasMinimap";
-import CanvasWatermark from "./CanvasWatermark";
+import {
+  type Component,
+  createEffect,
+  createMemo,
+  createSignal,
+  For,
+  type JSX,
+  on,
+  Show,
+} from "solid-js";
 import { useTerminalStore } from "../terminal/useTerminalStore";
+import CanvasMinimap from "./CanvasMinimap";
+import CanvasTile from "./CanvasTile";
+import CanvasWatermark from "./CanvasWatermark";
+import { applyResize, type ResizeDirection } from "./resizeGeometry";
+import type { TileLayout } from "./TileLayout";
+import {
+  DEFAULT_TILE_H,
+  DEFAULT_TILE_W,
+  findFreeTilePosition,
+} from "./tilePlacement";
 import { useTileTheme } from "./useTileTheme";
+import { useViewPosture } from "./useViewPosture";
+import { capturePointerGesture } from "./viewport/capturePointerGesture";
+import { useCanvasViewport } from "./viewport/useCanvasViewport";
 
-const DEFAULT_W = 800;
-const DEFAULT_H = 540;
-const CASCADE_OFFSET = 30;
 const MIN_W = 300;
 const MIN_H = 200;
 
@@ -81,6 +84,7 @@ const TerminalCanvas: Component<{
   const viewport = useCanvasViewport();
   const store = useTerminalStore();
   const tileTheme = useTileTheme();
+  const posture = useViewPosture();
 
   /** Pending per-tile layout overrides — used for three cases, all bridging
    *  a gap until the server's metadata echo arrives:
@@ -137,28 +141,39 @@ const TerminalCanvas: Component<{
   // The pending seed makes the tile paint at the cascade position on its
   // first render — without it, there would be a (0,0) frame while waiting
   // for the server's metadata echo.
+  //
+  // Contract: the default-placement runs only for tiles whose `getLayout(id)`
+  // is falsy on their first appearance in `tileIds`. Callers that intend
+  // to preserve a pre-existing layout (session restore, tile clone, …) are
+  // responsible for making `getLayout(id)` return it by then — e.g. by
+  // seeding server metadata before the list snapshot yields (#642). Any
+  // path that seeds AFTER the first `tileIds` fire will lose to this
+  // effect and overwrite the intended layout.
   createEffect(
     on(
       () => props.tileIds,
       (ids) => {
-        // Viewport center in canvas-space — stable within this batch
-        const cx =
-          viewport.panX() + containerRef.clientWidth / (2 * viewport.zoom());
-        const cy =
-          viewport.panY() + containerRef.clientHeight / (2 * viewport.zoom());
-        let newIndex = 0;
+        const { width, height } = viewport.viewportSize();
+        const zoom = viewport.zoom();
+        const cx = viewport.panX() + width / (2 * zoom);
+        const cy = viewport.panY() + height / (2 * zoom);
+        const placed: TileLayout[] = [];
         for (const id of ids) {
-          if (layoutOf(id)) continue;
-          const offset = newIndex * CASCADE_OFFSET;
+          const existing = layoutOf(id);
+          if (existing) {
+            placed.push(existing);
+            continue;
+          }
+          const { x, y } = findFreeTilePosition(cx, cy, placed);
           const defaultLayout: TileLayout = {
-            x: viewport.snapToGrid(cx - DEFAULT_W / 2 + offset),
-            y: viewport.snapToGrid(cy - DEFAULT_H / 2 + offset),
-            w: DEFAULT_W,
-            h: DEFAULT_H,
+            x,
+            y,
+            w: DEFAULT_TILE_W,
+            h: DEFAULT_TILE_H,
           };
           setPendingLayout(id, defaultLayout);
           props.onLayoutChange(id, defaultLayout);
-          newIndex++;
+          placed.push(defaultLayout);
         }
       },
     ),
@@ -252,7 +267,6 @@ const TerminalCanvas: Component<{
   // is centered (matches what a pill-tree click does). If there's no
   // active tile, fall back to centering the bounding box of all tiles so
   // restored sessions whose tiles live far from (0,0) don't open empty.
-  let containerRef!: HTMLDivElement;
   const isDefaultViewport = () =>
     viewport.panX() === 0 && viewport.panY() === 0 && viewport.zoom() === 1;
 
@@ -277,7 +291,7 @@ const TerminalCanvas: Component<{
       maxX = Math.max(maxX, l.x + l.w);
       maxY = Math.max(maxY, l.y + l.h);
     }
-    if (!isFinite(minX)) return;
+    if (!Number.isFinite(minX)) return;
     requestAnimationFrame(() => {
       viewport.panTo((minX + maxX) / 2, (minY + maxY) / 2);
     });
@@ -287,10 +301,7 @@ const TerminalCanvas: Component<{
     <DragDropProvider onDragMove={handleDragMove} onDragEnd={handleDragEnd}>
       <DragDropSensors />
       <div
-        ref={(el) => {
-          containerRef = el;
-          viewport.setContainerRef(el, isWheelTargetTerminal);
-        }}
+        ref={(el) => viewport.setContainerRef(el, isWheelTargetTerminal)}
         data-testid="canvas-container"
         data-zoom={viewport.zoom()}
         class="flex-1 min-h-0 overflow-hidden relative canvas-grid-bg"
@@ -314,11 +325,11 @@ const TerminalCanvas: Component<{
               theme={tileTheme(id)}
               onSelect={() => props.onSelect(id)}
               onClose={() => props.onClose(id)}
-              onToggleMaximize={store.toggleCanvasMaximized}
+              onToggleMaximize={posture.toggle}
               renderTitle={() => props.renderTileTitle(id)}
               renderTitleActions={
                 props.renderTileTitleActions
-                  ? () => props.renderTileTitleActions!(id)
+                  ? () => props.renderTileTitleActions?.(id)
                   : undefined
               }
               renderBody={() =>
@@ -334,7 +345,7 @@ const TerminalCanvas: Component<{
               {/* Tiled canvas — tiles live inside the pan/zoom transform.
                *  Hidden entirely when maximized; no reason to paint
                *  tiles the user can't see. */}
-              <Show when={!store.canvasMaximized()}>
+              <Show when={!posture.maximized()}>
                 <div
                   data-testid="canvas-transform"
                   style={{
@@ -350,7 +361,7 @@ const TerminalCanvas: Component<{
 
               {/* Maximized view — only the active tile, outside any
                *  transform, covering the canvas via `absolute inset-0`. */}
-              <Show when={store.canvasMaximized() && store.activeId()} keyed>
+              <Show when={posture.maximized() && store.activeId()} keyed>
                 {(id) => renderTile(id, true)}
               </Show>
             </>
@@ -359,11 +370,32 @@ const TerminalCanvas: Component<{
 
         {/* Minimap: spatial dashboard; hides in fullscreen-single-tile mode
          *  since there's nothing spatial to summarize. */}
-        <Show when={!store.canvasMaximized()}>
+        <Show when={!posture.maximized()}>
           <CanvasMinimap
             tileIds={props.tileIds}
             layouts={layouts()}
             onSelect={props.onSelect}
+            onStartTileDrag={(id) => {
+              const origin = layoutOf(id);
+              if (!origin) return null;
+              return {
+                preview: (dx, dy) =>
+                  setPendingLayout(id, {
+                    ...origin,
+                    x: origin.x + dx,
+                    y: origin.y + dy,
+                  }),
+                commit: (dx, dy) => {
+                  const next: TileLayout = {
+                    ...origin,
+                    x: viewport.snapToGrid(origin.x + dx),
+                    y: viewport.snapToGrid(origin.y + dy),
+                  };
+                  setPendingLayout(id, next);
+                  props.onLayoutChange(id, next);
+                },
+              };
+            }}
           />
         </Show>
       </div>

@@ -2,22 +2,22 @@
  *
  *  ARCHITECTURE: This file wires together focused modules:
  *    - useTerminalStore.ts    — live subscriptions + client view state
- *    - useTerminalCrud.ts     — create, kill, close-all, theme, reorder, copy
+ *    - useTerminalCrud.ts     — create, kill, close-all, theme, copy
  *    - useSessionRestore.ts   — hydration, session restore
  *    - useWorktreeOps.ts      — worktree create/remove
  *    - useTerminalAlerts.ts   — Claude state detection (watches metadata subscriptions)
  *  New features should go in the appropriate module (or a new one),
  *  not back into this composition root. See #221, #242. */
 
-import { toast } from "solid-sonner";
 import type { TerminalId } from "kolu-common";
+import { toast } from "solid-sonner";
 import { stream } from "../rpc/rpc";
 import { isExpectedCleanupError } from "../rpc/streamCleanup";
-import { useTerminalStore } from "./useTerminalStore";
-import { useTerminalCrud } from "./useTerminalCrud";
 import { useSessionRestore } from "./useSessionRestore";
-import { useWorktreeOps } from "./useWorktreeOps";
 import { useTerminalAlerts } from "./useTerminalAlerts";
+import { useTerminalCrud } from "./useTerminalCrud";
+import { useTerminalStore } from "./useTerminalStore";
+import { useWorktreeOps } from "./useWorktreeOps";
 
 export function useTerminals() {
   const store = useTerminalStore();
@@ -25,8 +25,10 @@ export function useTerminals() {
   const alerts = useTerminalAlerts({
     activeId: store.activeId,
     getMetadata: store.getMetadata,
-    isUnread: store.isUnread,
+    hasBadgeAttention: store.hasBadgeAttention,
+    clearBadgeAttention: store.clearBadgeAttention,
     markUnread: store.markUnread,
+    markBadgeAttention: store.markBadgeAttention,
     terminalIds: store.terminalIds,
     terminalLabel: store.terminalLabel,
   });
@@ -39,7 +41,10 @@ export function useTerminals() {
    *  itself is still removed via the list subscription in useTerminalStore,
    *  so correctness is preserved even if the toast is lost. */
   function subscribeExit(id: TerminalId) {
-    (async () => {
+    // Fire-and-forget: the IIFE owns its try/catch so the floating
+    // promise never rejects out into the caller. `void` makes the
+    // discard explicit for noFloatingPromises.
+    void (async () => {
       try {
         const iter = await stream.exit(id);
         for await (const code of iter) {

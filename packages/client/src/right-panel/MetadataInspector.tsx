@@ -1,14 +1,16 @@
 /** MetadataInspector — live view of the active terminal's full context.
  *  Pure rendering: receives metadata, renders sections. */
 
+import type { TerminalMetadata } from "kolu-common";
+import { prUnavailableSource, prValue } from "kolu-common/pr";
 import { type Component, Show } from "solid-js";
 import { Dynamic } from "solid-js/web";
-import type { TerminalMetadata } from "kolu-common";
-import { PrStateIcon, TerminalIcon, WorktreeIcon } from "../ui/Icons";
 import ChecksIndicator from "../terminal/ChecksIndicator";
+import { ProviderUnavailableContent } from "../terminal/PrUnavailablePopover";
 import { agentIcons, agentNames, stateLabels } from "../ui/agentDisplay";
-import Section from "../ui/Section";
+import { PrStateIcon, TerminalIcon, WorktreeIcon } from "../ui/Icons";
 import Row from "../ui/Row";
+import Section from "../ui/Section";
 
 const MetadataInspector: Component<{
   meta: TerminalMetadata | null;
@@ -71,7 +73,7 @@ const MetadataInspector: Component<{
           </Show>
 
           {/* Pull Request */}
-          <Show when={meta().pr}>
+          <Show when={prValue(meta().pr)}>
             {(pr) => (
               <Section title="Pull Request">
                 <div class="space-y-0.5">
@@ -97,6 +99,18 @@ const MetadataInspector: Component<{
                       </Row>
                     )}
                   </Show>
+                </div>
+              </Section>
+            )}
+          </Show>
+          <Show when={prUnavailableSource(meta().pr)}>
+            {(source) => (
+              <Section title="Pull Request">
+                <div
+                  data-testid="inspector-pr-unavailable"
+                  class="space-y-2 text-xs"
+                >
+                  <ProviderUnavailableContent source={source()} />
                 </div>
               </Section>
             )}
@@ -147,6 +161,15 @@ const MetadataInspector: Component<{
                       </Row>
                     )}
                   </Show>
+                  <Show when={agent().contextTokens}>
+                    {(tokens) => (
+                      <Row label="Context">
+                        <span class="font-mono text-fg">
+                          {tokens().toLocaleString()} tokens
+                        </span>
+                      </Row>
+                    )}
+                  </Show>
                 </div>
               </Section>
             )}
@@ -177,6 +200,7 @@ const MetadataInspector: Component<{
             {(name) => (
               <Section title="Theme">
                 <button
+                  type="button"
                   data-testid="inspector-theme-button"
                   class="text-[11px] text-accent hover:underline cursor-pointer"
                   onClick={props.onThemeClick}

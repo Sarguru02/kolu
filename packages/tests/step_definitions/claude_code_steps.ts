@@ -10,12 +10,12 @@
  * makes the provider's foreground-pid lookup succeed.
  */
 
-import { When, Then, After } from "@cucumber/cucumber";
+import * as assert from "node:assert";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as assert from "node:assert";
-import { KoluWorld, POLL_TIMEOUT } from "../support/world.ts";
-import { readBufferText, ACTIVE_TERMINAL } from "../support/buffer.ts";
+import { After, Then, When } from "@cucumber/cucumber";
+import { ACTIVE_TERMINAL, readBufferText } from "../support/buffer.ts";
+import { type KoluWorld, POLL_TIMEOUT } from "../support/world.ts";
 
 const SESSION_ID = "test-claude-session-00000000-0000-0000-0000";
 // Read these lazily rather than at module load — `hooks.ts` sets per-worker
@@ -35,7 +35,7 @@ async function getTerminalPid(world: KoluWorld): Promise<number> {
   // Uses the shared __readXtermBuffer helper (injected by hooks.ts).
   const handle = await world.page.waitForFunction(
     ({ marker, sel }) => {
-      const text = (window as any).__readXtermBuffer(sel, 0) as string;
+      const text = window.__readXtermBuffer?.(sel, 0) ?? "";
       if (!text) return null;
       const lines = text.split("\n").map((l: string) => l.trim());
       // Find the marker on a line that's NOT the typed echo command.
@@ -45,8 +45,10 @@ async function getTerminalPid(world: KoluWorld): Promise<number> {
       if (markerIdx <= 0) return null;
       // Walk backwards from marker to find the PID (first purely numeric line).
       for (let i = markerIdx - 1; i >= 0; i--) {
-        const num = parseInt(lines[i]!, 10);
-        if (!isNaN(num) && num > 0 && String(num) === lines[i]) return num;
+        const line = lines[i];
+        if (line === undefined) continue;
+        const num = parseInt(line, 10);
+        if (!Number.isNaN(num) && num > 0 && String(num) === line) return num;
       }
       return null;
     },
@@ -90,7 +92,7 @@ function buildTranscript(state: "thinking" | "tool_use" | "waiting"): string {
   if (state === "waiting") lines.push(assistantMsg("end_turn"));
   // "thinking" = user message only (no assistant response yet)
 
-  return lines.join("\n") + "\n";
+  return `${lines.join("\n")}\n`;
 }
 
 /** Unique CWD per scenario to avoid collisions in parallel workers. */
@@ -116,7 +118,7 @@ function cleanup() {
   mockTranscriptPath = null;
 }
 
-After(function () {
+After(() => {
   cleanup();
 });
 
@@ -208,14 +210,14 @@ When(
     const stalePath = path.join(projectDir, "stale-previous-session.jsonl");
     fs.writeFileSync(
       stalePath,
-      JSON.stringify({
+      `${JSON.stringify({
         type: "assistant",
         message: {
           model: "claude-opus-4-6",
           stop_reason: "end_turn",
           content: [{ type: "text", text: "previous" }],
         },
-      }) + "\n",
+      })}\n`,
     );
     // Future mtime so an MRU fallback would always pick this over the
     // current-session JSONL.
@@ -358,7 +360,7 @@ function buildTaskLines(
       );
     }
   }
-  return lines.join("\n") + "\n";
+  return `${lines.join("\n")}\n`;
 }
 
 When(

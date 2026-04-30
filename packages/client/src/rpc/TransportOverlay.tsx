@@ -12,6 +12,7 @@
  */
 import { type Component, Show } from "solid-js";
 import { match } from "ts-pattern";
+import { forceUpdateAndReload } from "../pwa";
 import { lifecycle } from "./rpc";
 
 const TransportOverlay: Component = () => {
@@ -45,7 +46,7 @@ const TransportOverlay: Component = () => {
                 <button
                   type="button"
                   class="bg-accent text-surface-1 font-semibold rounded px-3 py-1.5 hover:opacity-90"
-                  onClick={() => location.reload()}
+                  onClick={forceUpdateAndReload}
                 >
                   Reload
                 </button>

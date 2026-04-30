@@ -1,11 +1,11 @@
-import { When, Then } from "@cucumber/cucumber";
+import * as assert from "node:assert";
+import { Then, When } from "@cucumber/cucumber";
 import {
-  KoluWorld,
-  PILL_TREE_ENTRY_SELECTOR,
+  type KoluWorld,
   MOD_KEY,
+  PILL_TREE_ENTRY_SELECTOR,
   POLL_TIMEOUT,
 } from "../support/world.ts";
-import * as assert from "node:assert";
 
 /** Synthesize a click directly on the close-button DOM node. Real-mouse
  *  clicks on a stacked canvas tile lose to the active tile (z-10) on top —
@@ -57,9 +57,11 @@ When(
       .waitFor({ state: "visible", timeout: POLL_TIMEOUT });
     await palette.locator("input").fill("Close terminal");
     await palette
-      .locator("li", { hasText: "Close terminal" })
+      .locator('[role="option"]', { hasText: "Close terminal" })
       .waitFor({ state: "visible", timeout: POLL_TIMEOUT });
-    await palette.locator("li", { hasText: "Close terminal" }).click();
+    await palette
+      .locator('[role="option"]', { hasText: "Close terminal" })
+      .click();
     // Confirm in the dialog — every close goes through CloseConfirm.
     const confirm = this.page.locator('[data-testid="close-confirm"]');
     await confirm.waitFor({ state: "visible", timeout: POLL_TIMEOUT });

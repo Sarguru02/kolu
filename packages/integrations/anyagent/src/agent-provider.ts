@@ -6,7 +6,7 @@
  *  1. How a terminal maps to a session         → `resolveSession`
  *  2. Session-identity derivation               → `sessionKey`
  *  3. Per-session state watching + derivation   → `createWatcher`
- *  4. External signals that may change the match → `subscribeExternalChanges`
+ *  4. External signals that may change the match → `externalChanges`
  *     (optional — only agents whose session-match answer can change without
  *     a title event need this; see the field's JSDoc.)
  *
@@ -17,8 +17,8 @@
  * suffices for every provider.
  */
 
-import type { Logger } from "./index.ts";
-import type { TaskProgress } from "./index.ts";
+import type { Logger } from "kolu-shared";
+import type { TaskProgress } from "./schemas.ts";
 
 /** Snapshot of a terminal's observable state, passed to `resolveSession`.
  *  Fields are the inputs every agent's session-matching logic can draw from;
@@ -35,6 +35,14 @@ export interface AgentTerminalState {
    *  claude-code) avoid invoking it. Idempotent within one snapshot — the
    *  second call returns the cached value without a second syscall. */
   readForegroundBasename: () => string | null;
+  /** Agent name parsed from the most recent OSC 633;E preexec hint (e.g.
+   *  "codex", "opencode"), or null. Populated by the shell's preexec hook
+   *  before the command runs, so it reflects the user's typed command even
+   *  when the kernel-level process is an interpreter shim (npm-installed
+   *  `codex` shows up as `node` to the kernel). Only set while a command
+   *  is actively running — clears to null once the shell is idle at the
+   *  prompt again, so stale hints don't outlive the process they name. */
+  lastAgentCommandName: string | null;
 }
 
 /** Handle returned by `createWatcher`. Callers invoke `destroy()` when the
@@ -54,6 +62,13 @@ export interface AgentInfoShape {
   model: string | null;
   summary: string | null;
   taskProgress: TaskProgress | null;
+  /** Running context-window token count for the current session, or null
+   *  if the agent doesn't expose telemetry (or hasn't yet produced an
+   *  assistant turn). Derivation is per-integration — Claude Code sums
+   *  input+cache_creation+cache_read from the latest assistant entry's
+   *  `message.usage`; OpenCode reads `tokens.total` from the latest
+   *  assistant message. Both collapse to the same scalar meaning. */
+  contextTokens: number | null;
 }
 
 /** Agent-detection contract. Type parameters: `Session` is the provider's
@@ -85,19 +100,56 @@ export interface AgentProvider<Session, Info extends AgentInfoShape> {
     log: Logger,
   ): AgentWatcher;
 
-  /** Optional subscription to external signals that may cause `resolveSession`
-   *  to change its answer without a title event — e.g. a new session file
-   *  appearing for an agent the terminal was already running. If an agent's
-   *  match depends only on title-event-triggered state (foreground process,
-   *  cwd), omit this method; the orchestrator just skips the wiring.
+  /** Optional integration with external-change signals — filesystem events,
+   *  DB WAL writes, or anything else that can change the answer of
+   *  `resolveSession` without a title event. If an agent's match depends
+   *  only on title-event-triggered state (foreground process, cwd), omit
+   *  this field; the orchestrator just skips the wiring.
    *
    *  Must NOT be used for per-session state changes — those are the
-   *  responsibility of the watcher returned by `createWatcher`. */
-  subscribeExternalChanges?: (
-    onChange: () => void,
-    onError: (err: unknown) => void,
-    log: Logger,
-  ) => () => void;
+   *  responsibility of the watcher returned by `createWatcher`.
+   *
+   *  Lazy activation: the orchestrator calls `install` at most once per
+   *  process, the first time any terminal's state satisfies `isPresent`.
+   *  Until then, zero watchers fire for this provider — a fresh machine
+   *  where the user has never run this agent pays no watcher cost and
+   *  logs no missing-directory errors. Once installed, the subscription
+   *  lives for the remainder of the process; there is no uninstall,
+   *  matching how the underlying singletons (Codex's WAL watcher,
+   *  Claude's SESSIONS_DIR watcher) already work. */
+  externalChanges?: {
+    /** True if this agent is (or might soon be) relevant on this machine
+     *  — either because the foreground process is (or looks like) this
+     *  agent, or because its on-disk state is already present (the user
+     *  has used the agent here before, even if no terminal currently
+     *  hosts it). Called on every reconcile; the first `true` across any
+     *  terminal for this provider triggers `install`. Must NOT require
+     *  `resolveSession` to have succeeded — for Codex, the foreground
+     *  process is `codex` before any DB row exists, and the WAL watcher
+     *  is what catches the row's appearance. */
+    isPresent(state: AgentTerminalState): boolean;
+    /** Install the process-wide watcher and wire its events to `onChange`.
+     *  Called at most once per process. `onError` receives exceptions
+     *  thrown by `onChange`. */
+    install(
+      onChange: () => void,
+      onError: (err: unknown) => void,
+      log: Logger,
+    ): void;
+  };
+}
+
+/** True if the preexec hint or the kernel basename names `agentName`.
+ *  Preexec hint comes first so interpreter-shim matches skip the darwin
+ *  sysctl inside `readForegroundBasename`. */
+export function matchesAgent(
+  state: AgentTerminalState,
+  agentName: string,
+): boolean {
+  return (
+    state.lastAgentCommandName === agentName ||
+    state.readForegroundBasename() === agentName
+  );
 }
 
 /** Structural equality over the shared 5-field AgentInfo shape, plus `kind`.
@@ -115,6 +167,7 @@ export function agentInfoEqual<A extends AgentInfoShape>(
   if (a.sessionId !== b.sessionId) return false;
   if (a.model !== b.model) return false;
   if (a.summary !== b.summary) return false;
+  if (a.contextTokens !== b.contextTokens) return false;
   return taskProgressEqual(a.taskProgress, b.taskProgress);
 }
 

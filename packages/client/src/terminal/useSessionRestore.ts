@@ -1,17 +1,26 @@
 /** Session restore — hydration from server state, session restore handler. */
 
-import { createSignal, createEffect } from "solid-js";
+import { resumeAgentCommand } from "anyagent/cli";
+import type {
+  InitialTerminalMetadata,
+  SavedSession,
+  TerminalId,
+  TerminalInfo,
+} from "kolu-common";
+import { createEffect, createSignal } from "solid-js";
 import { toast } from "solid-sonner";
-import { useSubPanel } from "./useSubPanel";
-import { useSavedSession } from "../settings/useSavedSession";
 import { client, lifecycle } from "../rpc/rpc";
-import type { TerminalId, TerminalInfo, SavedSession } from "kolu-common";
+import { useSavedSession } from "../settings/useSavedSession";
+import { useSubPanel } from "./useSubPanel";
 import type { TerminalStore } from "./useTerminalStore";
 
 export function useSessionRestore(deps: {
   store: TerminalStore;
   subscribeExit: (id: TerminalId) => void;
-  handleCreate: (cwd?: string, themeName?: string) => Promise<TerminalId>;
+  handleCreate: (
+    cwd?: string,
+    initial?: InitialTerminalMetadata,
+  ) => Promise<TerminalId>;
   handleCreateSubTerminal: (
     parentId: TerminalId,
     cwd?: string,
@@ -59,8 +68,13 @@ export function useSessionRestore(deps: {
     // Initialize sub-panel active tabs for parents with sub-terminals
     const subs: Record<TerminalId, TerminalId[]> = {};
     for (const t of existing) {
-      if (t.meta.parentId) {
-        (subs[t.meta.parentId] ??= []).push(t.id);
+      const parentId = t.meta.parentId;
+      if (!parentId) continue;
+      const existingList = subs[parentId];
+      if (existingList) {
+        existingList.push(t.id);
+      } else {
+        subs[parentId] = [t.id];
       }
     }
     for (const [parentId, subIds] of Object.entries(subs)) {
@@ -73,10 +87,9 @@ export function useSessionRestore(deps: {
     // Prefer the server-persisted active terminal; fall back to first in order.
     // `store.activeId()` starts as null after refresh (lost makePersisted in
     // #554), so on refresh the server snapshot is the only source of truth
-    // for "which terminal was active".
-    const topLevel = existing
-      .filter((t) => !t.meta.parentId)
-      .sort((a, b) => a.meta.sortOrder - b.meta.sortOrder);
+    // for "which terminal was active". `existing` arrives in the server's
+    // Map insertion order, which is the canonical ordering.
+    const topLevel = existing.filter((t) => !t.meta.parentId);
     const topIds = topLevel.map((t) => t.id);
     const picked =
       serverActiveId && topIds.includes(serverActiveId as TerminalId)
@@ -116,56 +129,73 @@ export function useSessionRestore(deps: {
     }
   });
 
-  async function handleRestoreSession() {
+  async function handleRestoreSession(
+    options: { resumeIds?: ReadonlySet<string> } = {},
+  ) {
     const session = savedSession();
     if (!session) return;
     setSavedSession(null);
+    const resumeIds = options.resumeIds;
     const id = toast.loading(
       `Restoring ${session.terminals.length} terminals…`,
     );
     try {
       const oldToNew = new Map<string, TerminalId>();
-      const bySortOrder = (
-        a: { sortOrder?: number },
-        b: { sortOrder?: number },
-      ) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0);
-      const topLevel = session.terminals
-        .filter((t) => !t.parentId)
-        .sort(bySortOrder);
-      const subTerminals = session.terminals
-        .filter((t) => t.parentId)
-        .sort(bySortOrder);
+      // Array order is the ordering — the server wrote terminals in Map
+      // insertion order, and that order round-trips verbatim through disk.
+      const topLevel = session.terminals.filter((t) => !t.parentId);
+      // Type predicate so the body of the loop below sees `parentId`
+      // narrowed to `string` instead of `string | undefined`.
+      const subTerminals = session.terminals.filter(
+        (t): t is typeof t & { parentId: string } => t.parentId !== undefined,
+      );
+      let resumed = 0;
+      // Seed each new terminal with its saved metadata atomically at create
+      // time — the server embeds it into the first `terminal.list` snapshot,
+      // so the canvas cascade effect sees the saved layout on its first run
+      // and skips the default-cascade branch (#642).
       for (const t of topLevel) {
-        const newId = await deps.handleCreate(t.cwd, t.themeName);
+        const newId = await deps.handleCreate(t.cwd, {
+          themeName: t.themeName,
+          canvasLayout: t.canvasLayout,
+          subPanel: t.subPanel,
+        });
         oldToNew.set(t.id, newId);
+        // Client-side sub-panel state (activeSubTab, focusTarget) isn't
+        // server-persisted — seed it locally so the restored panel reopens
+        // to the same tab. The server-persisted fields (collapsed, panelSize)
+        // ride along via handleCreate above.
+        if (t.subPanel) subPanel.seedPanel(newId, t.subPanel);
+        // Auto-launch the resume form of the previously captured agent
+        // command, if the user didn't opt out. The command is already
+        // normalized (prompts/positionals stripped by the allowlist at
+        // capture time), so there's nothing arbitrary to smuggle through.
+        const optedIn = !resumeIds || resumeIds.has(t.id);
+        if (t.lastAgentCommand && optedIn) {
+          const resumeForm = resumeAgentCommand(t.lastAgentCommand);
+          if (resumeForm) {
+            await client.terminal.sendInput({
+              id: newId,
+              data: `${resumeForm}\r`,
+            });
+            resumed++;
+          }
+        }
       }
       for (const t of subTerminals) {
-        const newParentId = oldToNew.get(t.parentId!);
+        const newParentId = oldToNew.get(t.parentId);
         if (newParentId) await deps.handleCreateSubTerminal(newParentId, t.cwd);
-      }
-      // Restore canvas layouts and sub-panel state under the new terminal IDs.
-      // Canvas layouts go straight to the server — the metadata subscription
-      // delivers them back to the canvas for rendering.
-      for (const t of session.terminals) {
-        const newId = oldToNew.get(t.id);
-        if (!newId) continue;
-        if (t.canvasLayout) {
-          void client.terminal
-            .setCanvasLayout({ id: newId, layout: t.canvasLayout })
-            .catch((err: Error) =>
-              toast.error(`Failed to restore canvas layout: ${err.message}`),
-            );
-        }
-        if (t.subPanel) {
-          subPanel.seedPanel(newId, t.subPanel);
-        }
       }
       // Restore active terminal
       if (session.activeTerminalId) {
         const newActiveId = oldToNew.get(session.activeTerminalId);
         if (newActiveId) store.setActiveId(newActiveId);
       }
-      toast.success("Session restored", { id });
+      const summary =
+        resumed > 0
+          ? `Restored ${session.terminals.length} terminals, resumed ${resumed} agent${resumed > 1 ? "s" : ""}`
+          : "Session restored";
+      toast.success(summary, { id });
     } catch (err) {
       toast.error(`Restore failed: ${(err as Error).message}`, { id });
       throw err;

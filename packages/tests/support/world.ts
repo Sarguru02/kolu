@@ -4,17 +4,22 @@
  */
 
 import {
-  World,
-  setWorldConstructor,
   setDefaultTimeout,
+  setWorldConstructor,
+  World,
 } from "@cucumber/cucumber";
-import type { Browser, BrowserContext, Page, Locator } from "playwright";
+import type { Browser, BrowserContext, Locator, Page } from "playwright";
+// Side-effect import: pulls in the `Window`/`HTMLDivElement`/`Navigator`
+// augmentations every step definition needs (window.__readXtermBuffer,
+// `__xterm` on tile divs, the Badging API stubs, …) so tests can read
+// them without `(window as any)` / `(this as any)` casts.
+import "kolu-common/test-hooks";
 
 setDefaultTimeout(30_000);
 
-const READY_TIMEOUT = 10_000;
+const READY_TIMEOUT = 20_000;
 /** Shared timeout for element polling (waitFor / waitForFunction). Generous for darwin CI under load. */
-export const POLL_TIMEOUT = 10_000;
+export const POLL_TIMEOUT = 20_000;
 export const MOD_KEY = process.platform === "darwin" ? "Meta" : "Control";
 
 /** Locator for the app's settled state: either a visible terminal screen or the empty state tip. */
@@ -47,6 +52,23 @@ export class KoluWorld extends World {
   savedScrollTop?: number;
   savedVisibleText?: string;
   snapshotCols?: Record<string, number>;
+  /** Snapshot of `data-zoom` from `before I zoom the canvas in` so the
+   *  follow-up `Then the canvas zoom level should have changed` step can
+   *  compare. */
+  zoomBefore?: number;
+  /** Snapshot of zoom + transform attributes captured by the
+   *  `When I save the canvas viewport state` step. */
+  savedViewportState?: {
+    zoom: string | null;
+    transform: string | null;
+  } | null;
+  /** Map of tile-index → tile geometry captured by `When I save canvas
+   *  tile {int} position`, read back by minimap-drag and position-changed
+   *  steps. */
+  savedCanvasTilePositions?: Record<
+    number,
+    { id: string; left: number; top: number }
+  >;
   _scrollFifo?: string;
   createdTerminalIds: string[] = [];
   shuffleHistory: string[] = [];

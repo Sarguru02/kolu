@@ -4,7 +4,7 @@
 
 # kolu
 
-A browser cockpit for coding agents. Bring your own CLI, run them anywhere.
+A terminal-native cockpit for coding agents. Bring your own CLI, run them anywhere.
 
 Unlike agent command centers that wrap a single model behind their own chat UI, kolu stays out of the agent's way: the terminal is the universal interface, so `claude`, `opencode`, or whatever ships next week works out of the box — and you can drop to a plain shell whenever you want. It's an [Agentic Development Environment](https://x.com/jdegoes/status/2036931874057314390) (ADE) that treats terminals as the thesis, not the substrate.
 
@@ -77,7 +77,7 @@ Detects [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions r
 | Tool use | Pulsing yellow dot | Claude is executing tools or waiting for permission  |
 | Waiting  | Dim dot            | Claude finished responding, waiting for user input   |
 
-**How it works:** asks each terminal for its current foreground process pid via `tcgetpgrp(fd)` (exposed by node-pty's `foregroundPid` accessor), then checks whether `~/.claude/sessions/<fgpid>.json` exists. If it does, that terminal is running claude-code — we tail the session's JSONL transcript to derive state from the last message. Cross-platform (Linux + macOS) since `tcgetpgrp` is POSIX. Each card also surfaces the session's display title (custom title › auto-generated summary › first prompt) via the [Claude Agent SDK](https://platform.claude.com/docs/en/api/agent-sdk/typescript)'s `getSessionInfo()`, refreshed best-effort on each transcript change.
+**How it works:** asks each terminal for its current foreground process pid via `tcgetpgrp(fd)` (exposed by node-pty's `foregroundPid` accessor), then checks whether `~/.claude/sessions/<fgpid>.json` exists. If it does, that terminal is running claude-code — we tail the session's JSONL transcript to derive state from the last message. Cross-platform (Linux + macOS) since `tcgetpgrp` is POSIX. Each card also surfaces the session's display title (custom title › auto-generated summary › first prompt) via the [Claude Agent SDK](https://platform.claude.com/docs/en/api/agent-sdk/typescript)'s `getSessionInfo()`, refreshed best-effort on each transcript change. The tile chrome also shows a running token count (compact, e.g. `47K`) summed from the latest assistant entry's `message.usage` — `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`. Raw count only; window size isn't inferable from the JSONL (1M beta strips its suffix, so a `%` would lie), and the raw number is the useful signal anyway.
 
 **What we can't detect:**
 
@@ -88,11 +88,40 @@ Detects [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions r
 
 **Debugging detection:** the command palette has a `Debug → Show Claude transcript` entry (visible only when the active terminal has a Claude session) that opens a side-by-side view of the server's state-change log next to the raw JSONL events from disk since monitoring began. Use it when state seems stuck or transitions feel missed.
 
+### Codex Status
+
+Detects [Codex](https://github.com/openai/codex) TUI sessions and surfaces their state alongside Claude Code and OpenCode.
+
+**How it works:** when the foreground process is `codex`, the provider queries Codex's threads SQLite DB (highest-numbered `~/.codex/state_<N>.sqlite`, auto-discovered on startup) to find the most recently updated non-archived `cli` thread whose `cwd` matches the terminal's CWD. Thread metadata (title, model) comes straight from indexed columns. The running context-token count and the agent state (thinking / tool*use / waiting) both come from tailing the per-thread rollout JSONL at `threads.rollout_path`: `state` from pattern-matching `task_started` / `task_complete` / `function_call` / `function_call_output` events, and `contextTokens` from reading `info.last_token_usage.input_tokens` on the latest `token_count` event — the same number Codex's own `/status` command displays. Live updates come from `fs.watch` on the SQLite WAL file (`state*<N>.sqlite-wal`); Codex writes the WAL and appends the JSONL in the same cycle (verified: nanosecond-identical mtimes), so one signal covers both sources.
+
+**Why `last_token_usage.input_tokens` alone, not a sum?** Claude-code sums three input-side fields (`input_tokens + cache_creation + cache_read`) because Anthropic's schema makes them disjoint buckets. OpenAI's schema — which Codex emits — is different: `input_tokens` is _already_ the full prompt, and `cached_input_tokens` is a breakdown of what portion was a cache hit, not an additional count. Adding them double-counts every cache re-read. The field as-is is what `/status` reports and what gives users an accurate read on context pressure.
+
+**Why not `threads.tokens_used`?** That column holds the session-lifetime cumulative total (`total_token_usage.total_tokens` summed across every turn). For long-running sessions it climbs into tens of millions — misleading as "how close am I to exhausting the 258 K context window."
+
+**Why both SQLite and JSONL?** SQLite alone gives us title and model cheaply from indexed columns — no file read, no parsing. JSONL alone would force re-parsing the entire file on every update to recover title. Neither source alone carries both the event stream that drives state AND the per-turn token usage AND the columns that drive metadata — combining them specializes by purpose.
+
+**What we detect:**
+
+| State    | Indicator          | How                                                                                                                                        |
+| -------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Thinking | Pulsing accent dot | Latest lifecycle event is `task_started`, with no open `function_call` scoped to the current turn                                          |
+| Tool use | Spinning yellow    | Latest lifecycle event is `task_started`, with at least one `function_call` opened since that `task_started` and no matching `_output` yet |
+| Waiting  | Dim dot            | Latest lifecycle event is `task_complete`                                                                                                  |
+
+Open-call tracking is scoped per-turn: a `function_call` with no matching `_output` that straddles a `task_started` boundary (user aborted a prior tool-using turn) does not pin the next turn to `tool_use`.
+
+**What we can't detect (yet):**
+
+- **Task-progress checklist** — Codex has no TodoWrite equivalent (`task_started`/`task_complete` are per-turn lifecycle, not user-visible checklists), so the `taskProgress` field stays permanently null
+- **Column-level schema changes** — the filename version is auto-discovered, but if upstream renames or removes a depended-on column in the `threads` table (e.g. `rollout_path`, `cwd`, `source`, `archived`), session detection silently returns zero matches. Set `KOLU_CODEX_DB` to pin a known-good DB while a fix ships
+- **Same-directory disambiguation** — if multiple Codex threads share a cwd, we pick the most recently updated one (same heuristic as OpenCode)
+- **Sub-agent threads** — Codex's spawned sub-agents get `source = '{"subagent":…}'` rows in the same table; we filter them out (they have no foreground terminal to bind to)
+
 ### OpenCode Status
 
 Detects [OpenCode](https://github.com/anomalyco/opencode) sessions and shows their state alongside Claude Code on the tile chrome.
 
-**How it works:** when the foreground process is `opencode`, the provider queries OpenCode's SQLite database directly at `~/.local/share/opencode/opencode.db` to find the most recently updated session whose `directory` matches the terminal's CWD. State is derived from the latest message: a user message means the assistant is _thinking_; an assistant message with `time.completed` set and `finish: "stop"` means _waiting_; otherwise still _thinking_. Todo progress comes from a `COUNT(*)` over the `todo` table — much simpler than Claude Code's tool-call parsing since OpenCode stores todos as first-class rows with a `status` column. Live updates come from `fs.watch` on the SQLite WAL file (`opencode.db-wal`), which OpenCode writes to on every database mutation.
+**How it works:** when the foreground process is `opencode`, the provider queries OpenCode's SQLite database directly at `~/.local/share/opencode/opencode.db` to find the most recently updated session whose `directory` matches the terminal's CWD. State is derived from the latest message: a user message means the assistant is _thinking_; an assistant message with `time.completed` set and `finish: "stop"` means _waiting_; otherwise still _thinking_. Todo progress comes from a `COUNT(*)` over the `todo` table — much simpler than Claude Code's tool-call parsing since OpenCode stores todos as first-class rows with a `status` column. The tile chrome also shows the running token count from the latest assistant message's `tokens.total` (pre-summed by OpenCode — we pass it through). Live updates come from `fs.watch` on the SQLite WAL file (`opencode.db-wal`), which OpenCode writes to on every database mutation.
 
 **Why SQLite, not REST?** The OpenCode TUI doesn't expose an HTTP server by default — that's a separate `opencode serve` mode. Reading the SQLite DB directly works against the actual TUI users run, with no port discovery and no extra processes. SQLite WAL mode allows concurrent readers while OpenCode is writing, so we can open the DB read-only without blocking it.
 
@@ -118,7 +147,7 @@ Detects [OpenCode](https://github.com/anomalyco/opencode) sessions and shows the
 
 ### Clipboard
 
-- <kbd>Ctrl+V</kbd> pastes images into Claude Code via server-side clipboard shims
+- <kbd>Ctrl+V</kbd> pastes images into any agent that accepts paste-as-file-path (Claude Code, codex, …) — the server saves the browser's clipboard image and bracketed-pastes its path into the PTY
 
 ### Screen recording
 
@@ -131,20 +160,35 @@ Record the Kolu tab — whole canvas or a single maximized terminal — with mic
 - **Webcam PiP overlay** — when enabled, a circular mirrored `<video>` pins to the bottom-right above maximized tiles but below the chrome bar, and is baked into the recording by the tab-capture stream (no offscreen compositing)
 - **Browser picker collapses** — `getDisplayMedia({ preferCurrentTab: true, selfBrowserSurface: "include" })` turns the multi-surface picker into a single "Share this tab" confirmation
 
+### Transcript export
+
+Command-palette entry "Export agent session as HTML" (visible only when the active terminal has an agent session) saves the current Claude Code, OpenCode, or Codex transcript as a single self-contained `.html` file — no external assets, no server upload, opens in any browser offline.
+
+- **Vendor-neutral IR** — each integration loader normalizes its session storage (Claude's JSONL, OpenCode's SQLite, Codex's rollout) into the same `TranscriptEvent` union in `kolu-transcript-core`. The renderer dispatches on `event.kind`, never on the agent — adding a new vendor's quirky tool name is a loader-side change with zero renderer churn
+- **Typed `ToolInput` union** — every Claude Code built-in tool ([34 entries](https://code.claude.com/docs/en/tools-reference): Edit/Bash/Skill/TaskCreate/WebSearch/PowerShell/…) and every OpenCode built-in tool ([13 entries](https://opencode.ai/docs/tools/): edit/bash/todowrite/lsp/question/…) maps to a kind the renderer can specialise on. Anything we haven't modelled lands honestly in `kind: "unknown"` with the original `toolName` preserved — the document never lies about what a tool was
+- **Code surfaces through Pierre** — `Edit`, `Write`, fenced markdown code, and Codex `apply_patch` all flow through [`@pierre/diffs`](https://www.npmjs.com/package/@pierre/diffs)'s SSR. Each chunk hydrates into a `<diffs-container>` custom element; a tiny inlined bootstrap shares Pierre's ~43KB core stylesheet across every chunk via `adoptedStyleSheets` so the per-event payload stays small
+- **Warm-parchment editorial layout** — serif prose, mono code, role-tinted gutters, sticky dock for hide-tools / hide-reasoning / theme cycle, `j`/`k` to step between prompts, Reddit-style indent for nested subtask blocks
+- **Theme follows the toggle** — manual dark/light flip flows through to Pierre's shiki tokens via `color-scheme: inherit !important` on `<diffs-container>`, so the whole document (chrome + code) flips together instead of Pierre staying in the system-preferred mode
+
 ## Architecture
 
 pnpm monorepo:
 
-| Package                              | Stack                                                                                                                                            |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `packages/common/`                   | [oRPC](https://orpc.dev/) contract + [Zod](https://zod.dev/) schemas                                                                             |
-| `packages/server/`                   | [Hono](https://hono.dev/) + [node-pty](https://github.com/microsoft/node-pty) + [@xterm/headless](https://www.npmjs.com/package/@xterm/headless) |
-| `packages/client/`                   | [SolidJS](https://www.solidjs.com/) + [xterm.js](https://xtermjs.org/) + [Tailwind CSS v4](https://tailwindcss.com/)                             |
-| `packages/integrations/claude-code/` | Claude Code detection — JSONL transcript tailing + Claude Agent SDK; exports a `claudeCodeProvider` `AgentProvider`                              |
-| `packages/integrations/anyagent/`    | Agent-agnostic shared contract (`AgentProvider` interface, `agentInfoEqual`), types (Logger, TaskProgress), and agent CLI parsing                |
-| `packages/integrations/opencode/`    | OpenCode detection — reads OpenCode's SQLite database via Node's built-in `node:sqlite`; exports an `opencodeProvider` `AgentProvider`           |
-| `packages/terminal-themes/`          | Terminal color scheme catalog + perceptual-distance picker — themes checked-in as JSON                                                           |
-| `packages/memorable-names/`          | ADJ-NOUN random name generator — word lists checked-in as JSON                                                                                   |
+| Package                              | Stack                                                                                                                                                                 |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/common/`                   | [oRPC](https://orpc.dev/) contract + [Zod](https://zod.dev/) schemas                                                                                                  |
+| `packages/server/`                   | [Hono](https://hono.dev/) + [node-pty](https://github.com/microsoft/node-pty) + [@xterm/headless](https://www.npmjs.com/package/@xterm/headless)                      |
+| `packages/client/`                   | [SolidJS](https://www.solidjs.com/) + [xterm.js](https://xtermjs.org/) + [Tailwind CSS v4](https://tailwindcss.com/)                                                  |
+| `packages/integrations/claude-code/` | Claude Code detection — JSONL transcript tailing + Claude Agent SDK; exports a `claudeCodeProvider` `AgentProvider`                                                   |
+| `packages/integrations/anyagent/`    | Agent-agnostic shared contract (`AgentProvider` interface, `agentInfoEqual`), types (Logger, TaskProgress), and agent CLI parsing                                     |
+| `packages/integrations/codex/`       | Codex detection — reads the highest-numbered `~/.codex/state_<N>.sqlite` for thread metadata and tails the matched rollout JSONL for state; exports a `codexProvider` |
+| `packages/integrations/opencode/`    | OpenCode detection — reads OpenCode's SQLite database via Node's built-in `node:sqlite`; exports an `opencodeProvider` `AgentProvider`                                |
+| `packages/integrations/git/`         | Pure git operations — `simple-git` wrapper: repo resolution, worktree lifecycle, diff review, path security; schemas re-exported by `kolu-common`                     |
+| `packages/integrations/github/`      | GitHub PR schemas + pure helpers (`deriveCheckStatus`, `classifyGhError`, `prResultEqual`); server wraps with `gh pr view` spawn via `KOLU_GH_BIN`                    |
+| `packages/transcript-core/`          | Vendor-neutral transcript IR (`Transcript`, `TranscriptEvent`, typed `ToolInput` union) + structural transforms; per-agent loaders normalize into this shape          |
+| `packages/transcript-html/`          | Static-export renderer — `marked` for prose, [`@pierre/diffs`](https://www.npmjs.com/package/@pierre/diffs) SSR for shiki-tokenized code/diffs, [Preact](https://preactjs.com/) JSX for chrome; emits one self-contained `.html` |
+| `packages/terminal-themes/`          | Terminal color scheme catalog + perceptual-distance picker — themes checked-in as JSON                                                                                |
+| `packages/memorable-names/`          | ADJ-NOUN random name generator — word lists checked-in as JSON                                                                                                        |
 
 ### Communication
 
@@ -207,13 +251,13 @@ flowchart TB
 
 **Terminal I/O** (solid lines) — keystrokes go through `sendInput` RPC to node-pty; shell output flows back through the [publisher](packages/server/src/publisher.ts) as an `attach` stream to xterm.js. An @xterm/headless instance parses VT sequences server-side for screen-state snapshots[^lazy-attach].
 
-**Metadata** (dashed lines) — shell activity triggers a provider DAG: CWD changes (OSC 7) → git provider (.git/HEAD watcher) → GitHub provider (`gh pr view` polling). Agent detection uses a single generic orchestrator ([`meta/agent.ts`](packages/server/src/meta/agent.ts)) driven by per-agent `AgentProvider` instances from each integration package. Today two instances are registered: `claudeCodeProvider` (from `kolu-claude-code`) wakes on title events (OSC 2) and its own `fs.watch` on `~/.claude/sessions/`; `opencodeProvider` (from `kolu-opencode`) queries OpenCode's SQLite database directly and watches its WAL file for live state updates. Adding a new agent CLI is one new `AgentProvider` and one line in `startProviders` — no server-side adapter file. All providers feed a single metadata channel streamed to the client as a subscription[^providers]. Separately, kolu's preexec hook emits an `OSC 633;E` command mark before each user command; the pty handler parses it, matches the first token against a known-agents allowlist, and pushes normalized invocations to a bounded recent-agents MRU published via the server-state stream — powering the agent-aware command palette entries without any `/proc` lookups or argv scraping.
+**Metadata** (dashed lines) — shell activity triggers a provider DAG: CWD changes (OSC 7) → git provider (.git/HEAD watcher) → GitHub provider (`gh pr view` polling). Agent detection uses a single generic orchestrator ([`meta/agent.ts`](packages/server/src/meta/agent.ts)) driven by per-agent `AgentProvider` instances from each integration package. Today three instances are registered: `claudeCodeProvider` (from `kolu-claude-code`) wakes on title events (OSC 2) and its own `fs.watch` on `~/.claude/sessions/`; `codexProvider` (from `kolu-codex`) queries the highest-numbered `~/.codex/state_<N>.sqlite` for thread metadata and tails the matched rollout JSONL for state transitions; `opencodeProvider` (from `kolu-opencode`) queries OpenCode's SQLite database directly and watches its WAL file for live state updates. Adding a new agent CLI is one new `AgentProvider` and one line in `startProviders` — no server-side adapter file. All providers feed a single metadata channel streamed to the client as a subscription[^providers]. Separately, kolu's preexec hook emits an `OSC 633;E` command mark before each user command; the pty handler republishes the raw payload on a `commandRun` channel, and [`meta/agent-command.ts`](packages/server/src/meta/agent-command.ts) subscribes to match the first token against a known-agents allowlist and fan out to both (a) a bounded recent-agents MRU for the agent-aware command palette and (b) a per-terminal stash keyed by terminal id, so codex/opencode session detection still matches when the agent is an interpreter shim (e.g. npm-installed `codex`, whose kernel-level process name is `node`). No `/proc` lookups or argv scraping.
 
 **User actions** — command palette, pill tree, and tile chrome dispatch plain oRPC client calls ([`useTerminalCrud`](packages/client/src/terminal/useTerminalCrud.ts), [`useWorktreeOps`](packages/client/src/terminal/useWorktreeOps.ts)). The server's live subscriptions push updated state to the client automatically. [`useTerminalMetadata`](packages/client/src/terminal/useTerminalMetadata.ts) uses SolidJS's `mapArray` to create per-terminal subscriptions that automatically tear down when terminals are removed[^client-state].
 
 [^lazy-attach]: ~4 KB serialized snapshot instead of replaying the full scrollback buffer.
 
-[^providers]: Git provider uses [simple-git](https://github.com/steveukx/git-js); GitHub provider derives combined CI status from `CheckRun` + `StatusContext`. Agent providers implement the shared `AgentProvider` contract (`anyagent`): `resolveSession(terminalState)` → `sessionKey(session)` for dedup → `createWatcher(session, onChange)` for per-session state derivation, with an optional `subscribeExternalChanges` hook for out-of-band match triggers. `claudeCodeProvider` asks the pty for `tcgetpgrp(fd)` and stats `~/.claude/sessions/<fgpid>.json`, opts into `fs.watch` on `~/.claude/sessions/` as its external-change signal, then tails the matched session's JSONL transcript via another `fs.watch` for state updates; the session display title comes from a fire-and-forget [`getSessionInfo()`](https://platform.claude.com/docs/en/api/agent-sdk/typescript) call piggybacking on the same transcript watcher. `opencodeProvider` matches when `opencode` is the foreground process, queries `~/.local/share/opencode/opencode.db` (SQLite) for sessions in the terminal's CWD, and watches the WAL file (`opencode.db-wal`) for live state updates via Node's built-in `node:sqlite` module — it has no external-change subscription because title events cover every match transition.
+[^providers]: Git provider uses [simple-git](https://github.com/steveukx/git-js); GitHub provider derives combined CI status from `CheckRun` + `StatusContext`. Agent providers implement the shared `AgentProvider` contract (`anyagent`): `resolveSession(terminalState)` → `sessionKey(session)` for dedup → `createWatcher(session, onChange)` for per-session state derivation, with an optional `externalChanges: { isPresent, install }` pair for out-of-band match triggers — `install` fires at most once per process, lazily, the first time any terminal's state reports `isPresent` true, so a user who has never run the agent pays zero watcher cost. `claudeCodeProvider` asks the pty for `tcgetpgrp(fd)` and stats `~/.claude/sessions/<fgpid>.json`, opts into `fs.watch` on `~/.claude/sessions/` as its external-change signal, then tails the matched session's JSONL transcript via another `fs.watch` for state updates; the session display title comes from a fire-and-forget [`getSessionInfo()`](https://platform.claude.com/docs/en/api/agent-sdk/typescript) call piggybacking on the same transcript watcher. `codexProvider` matches when either the foreground process basename is `codex` or the preexec stash names `codex` (interpreter-shim fallback), queries Codex's threads SQLite DB (highest-numbered `~/.codex/state_<N>.sqlite`) filtered to `source = 'cli'` for the cwd's latest thread, reads mutable metadata (title, model) from indexed columns, and tails the thread's rollout JSONL (`threads.rollout_path`) to derive state from `task_started` / `task_complete` boundaries and open `function_call` call_ids — one shared `fs.watch` on the SQLite WAL file doubles as both the external-change signal and the per-session refresh trigger, since Codex writes the WAL and appends the JSONL atomically. `opencodeProvider` matches via the same dual signal (foreground basename or preexec stash), queries `~/.local/share/opencode/opencode.db` (SQLite) for sessions in the terminal's CWD, and watches the WAL file (`opencode.db-wal`) for live state updates via Node's built-in `node:sqlite` module — it has no external-change subscription because title events cover every match transition.
 
 [^client-state]: Local-only view state (active terminal, MRU order, attention flags) lives in SolidJS [signals and stores](https://docs.solidjs.com/reference/store-utilities/create-store) inside singleton `useXxx.ts` modules — separate from server-derived subscription state.
 
@@ -227,7 +271,7 @@ flowchart TB
 
 Packaged with [Nix](https://nixos.asia/en/install). The flake has **zero inputs** — nixpkgs and other sources are pinned via [npins](https://github.com/andir/npins) and imported with `fetchTarball` to keep `nix develop` fast (~2.6 s cold). Shared env vars are defined once in `koluEnv` and consumed by both the build and the devShell[^build].
 
-[^build]: `koluEnv` includes font paths and clipboard shims. Terminal themes and word lists ship checked-in as JSON (see `packages/terminal-themes/` and `packages/memorable-names/`). The final derivation is a wrapper script that sets the environment and execs [`tsx`](https://tsx.is/).
+[^build]: `koluEnv` includes font paths and the pinned `gh` binary. Terminal themes and word lists ship checked-in as JSON (see `packages/terminal-themes/` and `packages/memorable-names/`). The final derivation is a wrapper script that sets the environment and execs [`tsx`](https://tsx.is/).
 
 ## Development
 
@@ -239,9 +283,13 @@ just dev        # run server + client with hot reload
 just test       # e2e tests (full nix build)
 ```
 
+## Contributing
+
+Bug fixes, build/CI fixes, doc tweaks, and behavior-preserving refactors are welcome as direct PRs. **New user-facing features need a merged proposal under [`docs/proposals/`](docs/proposals/) first** — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full split and the proposal template.
+
 ## CI
 
-`just ci` builds all flake outputs on x86_64-linux and aarch64-darwin in parallel, runs e2e tests, and posts GitHub commit statuses. See [`ci/`](ci/) for details and reuse instructions.
+`just ci` builds all flake outputs on x86_64-linux and aarch64-darwin in parallel, runs e2e tests, boots the packaged binary against `/api/health` as a runtime smoke, and posts GitHub commit statuses. See [`ci/`](ci/) for details and reuse instructions.
 
 ```sh
 just ci              # full CI run

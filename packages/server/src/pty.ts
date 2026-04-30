@@ -5,15 +5,16 @@
  * Maintains a headless xterm instance for screen state serialization
  * on late-joining clients (~4KB vs raw scrollback replay).
  */
-import * as pty from "node-pty";
+
 import { createRequire } from "node:module";
 import {
   DEFAULT_COLS,
   DEFAULT_ROWS,
   DEFAULT_SCROLLBACK,
 } from "kolu-common/config";
-import { cleanEnv, osc7Init } from "./shell.ts";
+import * as pty from "node-pty";
 import type { Logger } from "./log.ts";
+import { cleanEnv, osc7Init } from "./shell.ts";
 
 // @xterm packages ship CJS only — use createRequire for clean ESM interop
 const require = createRequire(import.meta.url);
@@ -82,23 +83,18 @@ export function spawnPty(
      *  global recent-agents MRU. */
     onCommandRun?: (command: string) => void;
   },
-  clipboard: { shimBinDir: string; clipboardDir: string },
   spawnCwd?: string,
 ): PtyHandle {
   const env = cleanEnv();
   const shell = env.SHELL ?? "/bin/sh";
   const cwd = spawnCwd || env.HOME || "/";
 
-  // Inject clipboard shim dir into shell rc AFTER the user's rc —
-  // NixOS rebuilds PATH during shell init, so env-level PATH gets lost.
   const osc7 = osc7Init({
     shell,
     home: env.HOME,
     terminalId,
-    extraPath: clipboard.shimBinDir,
   });
   Object.assign(env, osc7.env);
-  env.KOLU_CLIPBOARD_DIR = clipboard.clipboardDir;
 
   tlog.debug({ shell, cwd }, "spawning pty");
   const proc = pty.spawn(shell, osc7.args, {

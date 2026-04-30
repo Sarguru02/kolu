@@ -11,16 +11,16 @@
  * `createOpenCodeWatcher`, not session-identity changes.
  */
 
-import type { AgentProvider } from "anyagent";
-import { findSessionByDirectory } from "./index.ts";
+import { type AgentProvider, matchesAgent } from "anyagent";
+import { findSessionByDirectory, type OpenCodeSession } from "./core.ts";
+import type { OpenCodeInfo } from "./schemas.ts";
 import { createOpenCodeWatcher } from "./session-watcher.ts";
-import type { OpenCodeSession, OpenCodeInfo } from "./index.ts";
 
 export const opencodeProvider: AgentProvider<OpenCodeSession, OpenCodeInfo> = {
   kind: "opencode",
 
   resolveSession(state, log) {
-    if (state.readForegroundBasename() !== "opencode") return null;
+    if (!matchesAgent(state, "opencode")) return null;
     return findSessionByDirectory(state.cwd, log);
   },
 

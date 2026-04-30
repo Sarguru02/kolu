@@ -2,13 +2,15 @@
  *  Routes between Inspector and Code tabs via a discriminated union so
  *  illegal pairings (e.g. Inspector-with-a-code-mode) can't be represented. */
 
+import type { RightPanelTabKind, TerminalMetadata } from "kolu-common";
 import { type Component, For } from "solid-js";
 import { match } from "ts-pattern";
-import type { TerminalMetadata, RightPanelTabKind } from "kolu-common";
-import MetadataInspector from "./MetadataInspector";
+import { CHROME_ICON_BUTTON_CLASS } from "../ui/chromeSpacing";
+import { ChevronRightIcon } from "../ui/Icons";
+import { ACTIVE_TERMINAL_ACCENT } from "./activeTerminalAccent";
 import CodeTab from "./CodeTab";
+import MetadataInspector from "./MetadataInspector";
 import { useRightPanel } from "./useRightPanel";
-import { ChevronRightIcon, PinIcon } from "../ui/Icons";
 
 /** Ordered tab kinds shown in the tab bar. Adding a new kind to the
  *  discriminated union requires a corresponding entry here AND a branch
@@ -39,41 +41,41 @@ const RightPanel: Component<{
       {/* Tab bar */}
       <div class="flex items-center h-8 shrink-0 bg-surface-1 border-b border-edge">
         <For each={TAB_KINDS}>
-          {(kind) => (
-            <button
-              data-testid={`right-panel-tab-${kind}`}
-              data-active={rightPanel.activeTab().kind === kind}
-              class={`h-full px-3 text-xs cursor-pointer transition-colors ${
-                rightPanel.activeTab().kind === kind
-                  ? "font-medium text-fg-2 bg-surface-0 border-b-2 border-accent"
-                  : "text-fg-3/50 hover:text-fg-2 hover:bg-surface-0/50"
-              }`}
-              onClick={() => showKind(kind)}
-            >
-              {TAB_LABEL[kind]}
-            </button>
-          )}
+          {(kind) => {
+            const isActive = () => rightPanel.activeTab().kind === kind;
+            return (
+              <button
+                type="button"
+                data-testid={`right-panel-tab-${kind}`}
+                data-active={isActive()}
+                class={`h-full px-3 text-xs cursor-pointer transition-colors ${
+                  isActive()
+                    ? "font-medium text-fg-2 bg-surface-0 border-b-2"
+                    : "text-fg-3/50 hover:text-fg-2 hover:bg-surface-0/50 border-b-2 border-transparent"
+                }`}
+                style={{
+                  "border-bottom-color": isActive()
+                    ? ACTIVE_TERMINAL_ACCENT
+                    : undefined,
+                }}
+                onClick={() => showKind(kind)}
+              >
+                {TAB_LABEL[kind]}
+              </button>
+            );
+          }}
         </For>
         <div class="flex-1" />
-        <button
-          class="px-1.5 h-full transition-colors cursor-pointer"
-          classList={{
-            "text-accent": rightPanel.pinned(),
-            "text-fg-3/40 hover:text-fg-2": !rightPanel.pinned(),
-          }}
-          onClick={() => rightPanel.togglePinned()}
-          aria-label={rightPanel.pinned() ? "Unpin panel" : "Pin panel"}
-          title={rightPanel.pinned() ? "Unpin (overlay)" : "Pin (dock)"}
-        >
-          <PinIcon />
-        </button>
-        <button
-          class="px-2 h-full text-fg-3/40 hover:text-fg-2 transition-colors cursor-pointer"
-          onClick={props.onToggle}
-          aria-label="Collapse panel"
-        >
-          <ChevronRightIcon class="w-3.5 h-3.5" />
-        </button>
+        <div class="flex items-center gap-0.5 pr-1">
+          <button
+            type="button"
+            class={`${CHROME_ICON_BUTTON_CLASS} text-fg-3/70 hover:text-fg-2 hover:bg-surface-0/50`}
+            onClick={props.onToggle}
+            aria-label="Collapse panel"
+          >
+            <ChevronRightIcon class="w-3.5 h-3.5" />
+          </button>
+        </div>
       </div>
       <div class="flex-1 min-h-0 overflow-hidden">
         {match(rightPanel.activeTab())

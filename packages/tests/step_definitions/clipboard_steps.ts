@@ -1,11 +1,12 @@
 import { When } from "@cucumber/cucumber";
-import { KoluWorld, MOD_KEY } from "../support/world.ts";
+import { type KoluWorld, MOD_KEY } from "../support/world.ts";
 
 /**
  * Simulate the full image paste flow: write a valid PNG to the browser
  * clipboard, then press Ctrl+V so the browser fires a real paste event
  * with the image in clipboardData. The terminal's capture-phase paste
- * listener reads it and uploads to the server shim.
+ * listener reads it and uploads to the server, which saves the image
+ * and bracketed-pastes the file path into the PTY.
  *
  * Only clipboard-write permission is needed (for test setup). The paste
  * event provides clipboard data without clipboard-read permission —
@@ -15,7 +16,8 @@ When("I paste an image into the terminal", async function (this: KoluWorld) {
   // Write a 1×1 PNG to the system clipboard
   await this.page.evaluate(async () => {
     const canvas = new OffscreenCanvas(1, 1);
-    const ctx = canvas.getContext("2d")!;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("OffscreenCanvas getContext('2d') unavailable");
     ctx.fillStyle = "red";
     ctx.fillRect(0, 0, 1, 1);
     const blob = await canvas.convertToBlob({ type: "image/png" });

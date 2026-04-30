@@ -1,14 +1,14 @@
-import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
 import fs from "node:fs";
-import path from "node:path";
 import os from "node:os";
+import path from "node:path";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   deriveState,
   deriveTaskProgress,
   encodeProjectPath,
   extractTasks,
   tailJsonlLines,
-} from "./index.ts";
+} from "./core.ts";
 
 describe("deriveState", () => {
   it("returns null for empty lines", () => {
@@ -19,19 +19,20 @@ describe("deriveState", () => {
     { stop_reason: "end_turn", expected: "waiting" },
     { stop_reason: "tool_use", expected: "tool_use" },
     { stop_reason: null, expected: "thinking" },
-  ])(
-    "assistant with stop_reason=$stop_reason → $expected",
-    ({ stop_reason, expected }) => {
-      const line = JSON.stringify({
-        type: "assistant",
-        message: { stop_reason, model: "claude-opus-4-6" },
-      });
-      expect(deriveState([line])).toEqual({
-        state: expected,
-        model: "claude-opus-4-6",
-      });
-    },
-  );
+  ])("assistant with stop_reason=$stop_reason → $expected", ({
+    stop_reason,
+    expected,
+  }) => {
+    const line = JSON.stringify({
+      type: "assistant",
+      message: { stop_reason, model: "claude-opus-4-6" },
+    });
+    expect(deriveState([line])).toEqual({
+      state: expected,
+      model: "claude-opus-4-6",
+      contextTokens: null,
+    });
+  });
 
   it("returns thinking for assistant with missing stop_reason", () => {
     const line = JSON.stringify({
@@ -41,12 +42,17 @@ describe("deriveState", () => {
     expect(deriveState([line])).toEqual({
       state: "thinking",
       model: "claude-opus-4-6",
+      contextTokens: null,
     });
   });
 
   it("returns thinking for user message", () => {
     const line = JSON.stringify({ type: "user" });
-    expect(deriveState([line])).toEqual({ state: "thinking", model: null });
+    expect(deriveState([line])).toEqual({
+      state: "thinking",
+      model: null,
+      contextTokens: null,
+    });
   });
 
   it("uses last relevant message (walks backwards)", () => {
@@ -58,6 +64,7 @@ describe("deriveState", () => {
     expect(deriveState([user, assistant])).toEqual({
       state: "waiting",
       model: "claude-opus-4-6",
+      contextTokens: null,
     });
   });
 
@@ -67,6 +74,89 @@ describe("deriveState", () => {
     expect(deriveState([user, system])).toEqual({
       state: "thinking",
       model: null,
+      contextTokens: null,
+    });
+  });
+
+  it("sums input + cache_creation + cache_read from assistant usage", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        stop_reason: "end_turn",
+        model: "claude-opus-4-7",
+        usage: {
+          input_tokens: 6,
+          cache_creation_input_tokens: 810,
+          cache_read_input_tokens: 28663,
+          output_tokens: 380,
+        },
+      },
+    });
+    expect(deriveState([line])).toEqual({
+      state: "waiting",
+      model: "claude-opus-4-7",
+      contextTokens: 29479,
+    });
+  });
+
+  it("keeps last-assistant contextTokens sticky when user entry is newest", () => {
+    // Thinking state: user just submitted a prompt, so `user` is newer than
+    // the previous assistant's reply. State should come from the user entry
+    // (thinking), but contextTokens must be preserved from the prior turn's
+    // usage — otherwise the token count blanks out mid-conversation.
+    const assistant = JSON.stringify({
+      type: "assistant",
+      message: {
+        stop_reason: "end_turn",
+        model: "claude-opus-4-7",
+        usage: {
+          input_tokens: 5,
+          cache_creation_input_tokens: 100,
+          cache_read_input_tokens: 29_000,
+        },
+      },
+    });
+    const user = JSON.stringify({ type: "user" });
+    expect(deriveState([assistant, user])).toEqual({
+      state: "thinking",
+      model: null,
+      contextTokens: 29_105,
+    });
+  });
+
+  it("returns null contextTokens when usage has no input-side fields", () => {
+    // `claude -c` session restore can write synthetic assistant entries
+    // whose `usage` block lacks all three input-side counters (only
+    // `output_tokens`, or fully empty). Treat that as absent telemetry so
+    // the UI hides the badge — rendering 0K would flash during restore
+    // before the first real API reply lands.
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        stop_reason: "end_turn",
+        model: "claude-opus-4-7",
+        usage: { output_tokens: 0 },
+      },
+    });
+    expect(deriveState([line])).toEqual({
+      state: "waiting",
+      model: "claude-opus-4-7",
+      contextTokens: null,
+    });
+  });
+
+  it("tolerates missing usage fields (treats absent as zero)", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      message: {
+        model: "claude-opus-4-7",
+        usage: { cache_read_input_tokens: 27871 },
+      },
+    });
+    expect(deriveState([line])).toEqual({
+      state: "thinking",
+      model: "claude-opus-4-7",
+      contextTokens: 27871,
     });
   });
 
@@ -78,6 +168,7 @@ describe("deriveState", () => {
     expect(deriveState(["not json", valid])).toEqual({
       state: "waiting",
       model: "claude-opus-4-6",
+      contextTokens: null,
     });
   });
 
@@ -90,7 +181,11 @@ describe("deriveState", () => {
       type: "assistant",
       message: { stop_reason: "end_turn" },
     });
-    expect(deriveState([line])).toEqual({ state: "waiting", model: null });
+    expect(deriveState([line])).toEqual({
+      state: "waiting",
+      model: null,
+      contextTokens: null,
+    });
   });
 });
 
@@ -124,7 +219,7 @@ describe("tailJsonlLines", () => {
         message: { stop_reason: "end_turn" },
       }),
     ];
-    fs.writeFileSync(filePath, lines.join("\n") + "\n");
+    fs.writeFileSync(filePath, `${lines.join("\n")}\n`);
     const result = tailJsonlLines(filePath, 16_384);
     expect(result).toEqual(lines);
   });
@@ -133,7 +228,7 @@ describe("tailJsonlLines", () => {
     const filePath = path.join(tmpDir, "large.jsonl");
     const longLine = JSON.stringify({ type: "system", data: "x".repeat(200) });
     const lastLine = JSON.stringify({ type: "user" });
-    fs.writeFileSync(filePath, longLine + "\n" + lastLine + "\n");
+    fs.writeFileSync(filePath, `${longLine}\n${lastLine}\n`);
     const result = tailJsonlLines(filePath, 50);
     expect(result).toEqual([lastLine]);
   });
@@ -180,7 +275,7 @@ describe("findTranscriptPath", () => {
     const projectDir = path.join(tmpDir, encodeProjectPath(cwd));
     fs.mkdirSync(projectDir, { recursive: true });
     const transcriptPath = path.join(projectDir, `${sessionId}.jsonl`);
-    fs.writeFileSync(transcriptPath, JSON.stringify({ type: "user" }) + "\n");
+    fs.writeFileSync(transcriptPath, `${JSON.stringify({ type: "user" })}\n`);
 
     const result = findTranscriptPathFn({ pid: 1, sessionId, cwd });
     expect(result).toBe(transcriptPath);
@@ -192,7 +287,7 @@ describe("findTranscriptPath", () => {
     fs.mkdirSync(projectDir, { recursive: true });
 
     const otherPath = path.join(projectDir, "other-session.jsonl");
-    fs.writeFileSync(otherPath, JSON.stringify({ type: "user" }) + "\n");
+    fs.writeFileSync(otherPath, `${JSON.stringify({ type: "user" })}\n`);
 
     const result = findTranscriptPathFn({
       pid: 1,

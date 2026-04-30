@@ -1,8 +1,9 @@
 /** Terminal alerts — reactively detect agent state transitions and fire notifications.
  *  Watches metadata subscriptions for agent state changes (any AI coding agent). */
 
-import { type Accessor, createEffect, on } from "solid-js";
+import { makeEventListener } from "@solid-primitives/event-listener";
 import type { TerminalId, TerminalMetadata } from "kolu-common";
+import { type Accessor, createEffect, on } from "solid-js";
 import { usePreferences } from "../settings/usePreferences";
 import {
   fireActivityAlert,
@@ -12,8 +13,10 @@ import {
 export function useTerminalAlerts(deps: {
   activeId: Accessor<TerminalId | null>;
   getMetadata: (id: TerminalId) => TerminalMetadata | undefined;
-  isUnread: (id: TerminalId) => boolean;
+  hasBadgeAttention: (id: TerminalId) => boolean;
+  clearBadgeAttention: () => void;
   markUnread: (id: TerminalId) => void;
+  markBadgeAttention: (id: TerminalId) => void;
   terminalIds: Accessor<TerminalId[]>;
   terminalLabel: (id: TerminalId) => string;
 }) {
@@ -23,16 +26,19 @@ export function useTerminalAlerts(deps: {
   // Request browser notification permission eagerly when alerts are enabled
   if (activityAlerts()) requestNotificationPermission();
 
-  // Badge the PWA dock icon with the unread agent count (Badging API).
-  // Clears automatically when the user visits all unread terminals.
+  // Badge the PWA dock icon with terminals that need attention.
   createEffect(() => {
     if (!("setAppBadge" in navigator)) return;
-    const count = deps.terminalIds().filter((id) => deps.isUnread(id)).length;
+    const count = deps.terminalIds().filter(deps.hasBadgeAttention).length;
     if (count > 0) {
       void navigator.setAppBadge(count);
     } else {
       void navigator.clearAppBadge();
     }
+  });
+
+  makeEventListener(document, "visibilitychange", () => {
+    if (!document.hidden) deps.clearBadgeAttention();
   });
 
   // Reactively watch agent state for all terminals.
@@ -42,10 +48,10 @@ export function useTerminalAlerts(deps: {
       () => deps.terminalIds().map((id) => deps.getMetadata(id)?.agent?.state),
       (states, prevStates) => {
         const ids = deps.terminalIds();
-        for (let i = 0; i < ids.length; i++) {
-          if (prevStates && prevStates[i] !== undefined) {
-            checkAgentFinished(ids[i]!, prevStates[i], states[i]);
-          }
+        if (!prevStates) return;
+        for (const [i, id] of ids.entries()) {
+          const prev = prevStates[i];
+          if (prev !== undefined) checkAgentFinished(id, prev, states[i]);
         }
       },
     ),
@@ -57,19 +63,29 @@ export function useTerminalAlerts(deps: {
     next: string | undefined,
   ) {
     if (!activityAlerts() || next !== "waiting" || prev === "waiting") return;
+    alertForTerminal(id);
+  }
+
+  function alertForTerminal(id: TerminalId) {
     const isBackground = id !== deps.activeId();
-    if (isBackground) deps.markUnread(id);
+    if (isBackground) {
+      deps.markUnread(id);
+    } else if (document.hidden) {
+      deps.markBadgeAttention(id);
+    }
     if (isBackground || document.hidden)
       fireActivityAlert(deps.terminalLabel(id));
   }
 
-  function simulateAlert() {
+  function simulateAlert(options?: { target?: "active" | "inactive" }) {
     if (!activityAlerts()) return;
-    const inactive = deps.terminalIds().filter((id) => id !== deps.activeId());
-    if (inactive.length === 0) return;
-    const id = inactive[Math.floor(Math.random() * inactive.length)]!;
-    deps.markUnread(id);
-    fireActivityAlert(deps.terminalLabel(id));
+    const ids =
+      options?.target === "active"
+        ? deps.terminalIds().filter((id) => id === deps.activeId())
+        : deps.terminalIds().filter((id) => id !== deps.activeId());
+    const pick = ids[Math.floor(Math.random() * ids.length)];
+    if (pick === undefined) return;
+    alertForTerminal(pick);
   }
 
   return { simulateAlert };

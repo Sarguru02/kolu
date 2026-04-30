@@ -10,17 +10,18 @@
  *  one row per group of 3. Each grid row carries a leading ├─/└─ glyph
  *  so the parent→child relationship reads as a tree, not a soup. */
 
-import { type Component, For, Show, createMemo } from "solid-js";
-import { match, P } from "ts-pattern";
 import type { TerminalId } from "kolu-common";
+import { type Component, createMemo, For, Show } from "solid-js";
+import { match, P } from "ts-pattern";
 import { useTerminalStore } from "../terminal/useTerminalStore";
+import { PlusIcon } from "../ui/Icons";
 import {
-  type PillRepoGroup,
   type PillBranch,
+  type PillRepoGroup,
   repoColor,
 } from "./pillTreeOrder";
 import { useTileTheme } from "./useTileTheme";
-import { MinimapIcon, PlusIcon } from "../ui/Icons";
+import { useViewPosture } from "./useViewPosture";
 
 const BRANCHES_PER_ROW = 3;
 
@@ -49,11 +50,12 @@ const PillTree: Component<{
 }> = (props) => {
   const store = useTerminalStore();
   const tileTheme = useTileTheme();
+  const posture = useViewPosture();
 
   return (
     <div
       data-testid="pill-tree"
-      data-maximized={store.canvasMaximized() ? "" : undefined}
+      data-maximized={posture.maximized() ? "" : undefined}
       // Positioning is the caller's job (ChromeBar embeds this as a
       // flex child, mobile sheet renders its own vertical list).
       // The outer fills its slot; `justify-center` on the inner
@@ -78,26 +80,17 @@ const PillTree: Component<{
           // one tile, the tree is a peripheral nav affordance; but it
           // stays readable at a glance so "there's a canvas behind
           // this" remains legible without a hover.
-          "opacity-80": !store.canvasMaximized(),
-          "opacity-50": store.canvasMaximized(),
+          "opacity-80": !posture.maximized(),
+          "opacity-50": posture.maximized(),
         }}
       >
-        <Show when={store.canvasMaximized()}>
-          <button
-            data-testid="pill-tree-exit-maximize"
-            class="pointer-events-auto flex items-center justify-center w-6 h-6 rounded-lg shrink-0 cursor-pointer text-fg-2 hover:text-fg hover:bg-surface-2/80 transition-colors"
-            onClick={store.toggleCanvasMaximized}
-            title="Show all on canvas"
-          >
-            <MinimapIcon class="w-3.5 h-3.5" />
-          </button>
-        </Show>
         {/* "+" button — opens the new-terminal palette group (recent
          *  cwds + worktree create flow). Sits before the repo groups
          *  so it stays in a stable position regardless of how many
          *  repos are open. Same h-6 as a branch pill so the row
          *  baselines align. */}
         <button
+          type="button"
           data-testid="pill-tree-new"
           class="pointer-events-auto flex items-center justify-center w-6 h-6 mt-3 rounded-full shrink-0 cursor-pointer text-fg-3 hover:text-fg hover:bg-surface-2/80 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
           onClick={props.onCreate}
@@ -110,7 +103,18 @@ const PillTree: Component<{
           {(group) => {
             const rows = createMemo(() => chunkBranches(group.branches));
             return (
-              <div class="flex flex-col items-start gap-1 min-w-0">
+              // pointer-events-auto on the column so the 4 px row-gap
+              // (and the between-pill gaps inside a row) stay part of
+              // the hover target. Without this, a cursor travelling
+              // from a row-1 pill toward a hover-revealed row-2 pill
+              // crosses a transparent band that inherits `none` from
+              // the outer wrapper — `:hover` on `group/pill-tree`
+              // drops, the revealed row collapses before it can be
+              // clicked. Also promotes the `▾ +N` hint below to a
+              // real hover target. The outer wrapper stays
+              // `pointer-events-none` so the empty chrome between
+              // repo groups still passes clicks through to the canvas.
+              <div class="pointer-events-auto flex flex-col items-start gap-1 min-w-0">
                 <div
                   data-testid="pill-tree-repo"
                   class="text-[0.65rem] font-semibold uppercase tracking-wide truncate max-w-[16ch]"
@@ -181,6 +185,7 @@ const PillTree: Component<{
                                     .exhaustive();
                                 return (
                                   <button
+                                    type="button"
                                     data-testid="pill-tree-branch"
                                     data-terminal-id={b.id}
                                     data-active={active() ? "" : undefined}

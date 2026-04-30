@@ -10,22 +10,22 @@
  * internally with capture-phase listener to intercept before terminal.
  */
 
+import Dialog from "@corvu/dialog";
+import { makeEventListener } from "@solid-primitives/event-listener";
 import {
-  type Component,
   type Accessor,
-  createSignal,
-  createMemo,
+  type Component,
   createEffect,
-  on,
+  createMemo,
+  createSignal,
   For,
+  on,
   Show,
 } from "solid-js";
-import { makeEventListener } from "@solid-primitives/event-listener";
-import Dialog from "@corvu/dialog";
-import ModalDialog from "./ui/ModalDialog";
-import { type Keybind, formatKeybind } from "./input/keyboard";
+import { formatKeybind, type Keybind } from "./input/keyboard";
 import { useTips } from "./settings/useTips";
 import Kbd from "./ui/Kbd";
+import ModalDialog from "./ui/ModalDialog";
 
 /** A command that can be executed from the palette, or a group containing sub-commands. */
 export interface PaletteCommand {
@@ -112,7 +112,8 @@ const CommandPalette: Component<{
    *  palette doesn't render an empty level mid-navigation. */
   const currentItems = createMemo((): PaletteItem[] => {
     const p = path();
-    if (p.length === 0) return props.commands();
+    const last = p.at(-1);
+    if (last === undefined) return props.commands();
     let level: PaletteItem[] = props.commands();
     for (const segment of p) {
       const match = level.find(
@@ -124,7 +125,7 @@ const CommandPalette: Component<{
         // the stale reference to keep the level rendered. Happens e.g.
         // when a visibility guard hides a parent group while the user
         // is still drilled into it.
-        return resolveChildren(p[p.length - 1]!);
+        return resolveChildren(last);
       }
       level = resolveChildren(match);
     }
@@ -307,6 +308,7 @@ const CommandPalette: Component<{
         <Show when={path().length > 0}>
           <nav class="flex items-center gap-1 px-4 pt-2 text-xs text-fg-3">
             <button
+              type="button"
               class="hover:text-fg transition-colors"
               onClick={() => navigateTo(0)}
             >
@@ -317,6 +319,7 @@ const CommandPalette: Component<{
                 <>
                   <span class="text-fg-3">›</span>
                   <button
+                    type="button"
                     class="hover:text-fg transition-colors"
                     onClick={() => navigateTo(i() + 1)}
                   >
@@ -336,8 +339,19 @@ const CommandPalette: Component<{
           onInput={(e) => setQuery(e.currentTarget.value)}
         />
         <div
+          ref={(el) => {
+            // Mouse activity tracker is incidental UI state, not a real
+            // interactive event on this scroll container — attach via
+            // addEventListener so the div stays a plain layout element.
+            el.addEventListener(
+              "mousemove",
+              () => {
+                mouseActive = true;
+              },
+              { passive: true },
+            );
+          }}
           class="flex-1 min-h-0 overflow-y-auto"
-          onMouseMove={() => (mouseActive = true)}
         >
           <Show
             when={filtered().length > 0}
@@ -347,10 +361,10 @@ const CommandPalette: Component<{
               </div>
             }
           >
-            <ul class="py-1">
+            <div class="py-1" role="listbox">
               <For each={filtered()}>
                 {(cmd, i) => (
-                  <li
+                  <div
                     ref={(el) => {
                       // Auto-scroll selected item into view during keyboard navigation
                       createEffect(() => {
@@ -358,6 +372,9 @@ const CommandPalette: Component<{
                           el.scrollIntoView({ block: "nearest" });
                       });
                     }}
+                    role="option"
+                    tabIndex={-1}
+                    aria-selected={selectedIndex() === i()}
                     class="flex items-center px-4 py-2 text-sm cursor-pointer transition-colors duration-150 border-l-2"
                     classList={{
                       "bg-surface-3 text-fg border-accent":
@@ -368,6 +385,12 @@ const CommandPalette: Component<{
                     data-selected={selectedIndex() === i() || undefined}
                     onMouseEnter={() => mouseActive && setSelectedIndex(i())}
                     onClick={() => execute(cmd)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        execute(cmd);
+                      }
+                    }}
                   >
                     <span class="truncate">
                       {cmd.name}
@@ -383,22 +406,21 @@ const CommandPalette: Component<{
                       </span>
                     </Show>
                     <Show when={!isGroup(cmd) && cmd.keybind}>
-                      <span class="ml-auto shrink-0 pl-4 flex items-center gap-1.5">
-                        <For
-                          each={
-                            Array.isArray(cmd.keybind)
-                              ? cmd.keybind
-                              : [cmd.keybind!]
-                          }
-                        >
-                          {(kb) => <Kbd>{formatKeybind(kb)}</Kbd>}
-                        </For>
-                      </span>
+                      {(keybind) => {
+                        const kb = keybind();
+                        return (
+                          <span class="ml-auto shrink-0 pl-4 flex items-center gap-1.5">
+                            <For each={Array.isArray(kb) ? kb : [kb]}>
+                              {(k) => <Kbd>{formatKeybind(k)}</Kbd>}
+                            </For>
+                          </span>
+                        );
+                      }}
                     </Show>
-                  </li>
+                  </div>
                 )}
               </For>
-            </ul>
+            </div>
           </Show>
           <Show when={hintsAtLevel().length > 0}>
             <ul class="py-1">

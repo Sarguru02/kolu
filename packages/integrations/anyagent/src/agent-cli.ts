@@ -29,6 +29,7 @@
  * drops real positionals.
  */
 
+import { type NonEmpty, nonEmpty } from "nonempty";
 import { parseArgsStringToArgv } from "string-argv";
 
 /** Flags that cause the CLI to print info and exit immediately.
@@ -50,11 +51,49 @@ const EXIT_FLAGS: ReadonlySet<string> = new Set([
 const STABLE_FLAGS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   [
     "claude",
-    new Set(["--model", "--dangerously-skip-permissions", "--allowedTools"]),
+    new Set([
+      "--model",
+      "--dangerously-skip-permissions",
+      "--allowedTools",
+      "--disallowedTools",
+      "--permission-mode",
+      "--add-dir",
+      "--agent",
+      "--mcp-config",
+      "--strict-mcp-config",
+      "--append-system-prompt",
+      "--settings",
+      "--bare",
+    ]),
   ],
-  ["opencode", new Set(["--model", "--dangerously-skip-permissions"])],
+  [
+    "opencode",
+    new Set([
+      "--model",
+      "--dangerously-skip-permissions",
+      "--yolo",
+      "--agent",
+      "--pure",
+    ]),
+  ],
   ["aider", new Set(["--model"])],
-  ["codex", new Set(["--model"])],
+  [
+    "codex",
+    new Set([
+      "--model",
+      "--yolo",
+      "--config",
+      "-c",
+      "--profile",
+      "-p",
+      "--sandbox",
+      "-s",
+      "--ask-for-approval",
+      "-a",
+      "--full-auto",
+      "--oss",
+    ]),
+  ],
   ["goose", new Set([])],
   ["gemini", new Set([])],
   ["cursor-agent", new Set([])],
@@ -67,43 +106,95 @@ function basename(s: string): string {
 }
 
 /**
+ * Resume-form transforms for agents that support conversation continuity.
+ * Shape: `Record<AgentName, (argv) => argv>` — the Record key union is the
+ * exact set of resume-capable agents, so adding an agent forces adding a
+ * transform (type error if omitted). This is a narrower table than
+ * `STABLE_FLAGS`: detection-only agents (`aider`, `goose`, `gemini`,
+ * `cursor-agent`) are absent here and `resumeAgentCommand` returns `null`
+ * for them.
+ *
+ * The transforms splice a resume marker into the normalized argv:
+ *   claude `-c`              → continue most-recent conversation in cwd
+ *   codex `resume --last`    → subcommand form; last session in cwd
+ *                              (`--last` skips the interactive picker)
+ *   opencode `--continue`    → continue most-recent session in cwd
+ *
+ * `parseAgentCommand` strips `-c`/`--continue`/`--resume`/`-r` during
+ * normalization (per juspay/kolu#467), so the input to these transforms is
+ * always resume-free — no idempotency special-case needed.
+ */
+type ResumableAgent = "claude" | "codex" | "opencode";
+
+/** Insert one or more "resume" tokens after the agent binary in a
+ *  normalized argv. Non-emptiness is in the parameter type — the
+ *  positional read `argv[0]` is total. */
+function withResumeFlags(argv: NonEmpty<string>, ...flags: string[]): string[] {
+  const [head, ...rest] = argv;
+  return [head, ...flags, ...rest];
+}
+
+const AGENT_RESUME: Record<
+  ResumableAgent,
+  (argv: NonEmpty<string>) => string[]
+> = {
+  claude: (argv) => withResumeFlags(argv, "-c"),
+  codex: (argv) => withResumeFlags(argv, "resume", "--last"),
+  opencode: (argv) => withResumeFlags(argv, "--continue"),
+};
+
+/**
  * Parse a raw command line. Returns the normalized agent invocation
  * string (e.g. `"claude --model sonnet"`) if the first token resolves
  * to a known agent binary, or `null` otherwise.
  */
 export function parseAgentCommand(raw: string): string | null {
-  const tokens = parseArgsStringToArgv(raw.trim());
-  if (tokens.length === 0) return null;
+  const [head, ...args] = parseArgsStringToArgv(raw.trim());
+  if (head === undefined) return null;
 
-  const agent = basename(tokens[0]!);
-  if (!STABLE_FLAGS.has(agent)) return null;
-
-  const args = tokens.slice(1);
+  const agent = basename(head);
+  const allowed = STABLE_FLAGS.get(agent);
+  if (allowed === undefined) return null;
 
   // Exit-immediately flags → not an agent session.
   if (args.some((t) => EXIT_FLAGS.has(t))) return null;
-
-  const allowed = STABLE_FLAGS.get(agent)!;
 
   // Keep only allowlisted flags + their values.
   // Anything else (unknown flags, positional args) is dropped.
   const kept: string[] = [agent];
   for (let i = 0; i < args.length; i++) {
-    const t = args[i]!;
+    const t = args[i];
+    if (t === undefined) break;
     if (t === "--") break; // stop at explicit end-of-flags
     if (!t.startsWith("-")) continue; // drop positional
+    const next = args[i + 1];
     if (!allowed.has(t)) {
       // Unknown flag — skip it and its value (if present)
-      if (i + 1 < args.length && !args[i + 1]!.startsWith("-")) i++;
+      if (next !== undefined && !next.startsWith("-")) i++;
       continue;
     }
     // Stable flag — keep verbatim
     kept.push(t);
     // If the next token is a non-flag value (e.g. `--model sonnet`),
     // attach it to the flag as-is.
-    if (i + 1 < args.length && !args[i + 1]!.startsWith("-")) {
-      kept.push(args[++i]!);
+    if (next !== undefined && !next.startsWith("-")) {
+      kept.push(next);
+      i++;
     }
   }
   return kept.join(" ");
+}
+
+/**
+ * Given a normalized agent invocation (the output of `parseAgentCommand`),
+ * return the resume-mode invocation for agents that support it, or `null`
+ * if the agent is in the allowlist but not the resume table. Input is
+ * assumed already normalized — callers should not pass raw user input.
+ */
+export function resumeAgentCommand(normalized: string): string | null {
+  const argv = nonEmpty(parseArgsStringToArgv(normalized.trim()));
+  if (!argv) return null;
+  const agent = argv[0];
+  if (!(agent in AGENT_RESUME)) return null;
+  return AGENT_RESUME[agent as ResumableAgent](argv).join(" ");
 }

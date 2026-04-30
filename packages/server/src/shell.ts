@@ -8,8 +8,8 @@
  * `just test`).
  */
 
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
-import { writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { koluShellDir } from "./koluRoot.ts";
 
@@ -58,7 +58,8 @@ export function cleanEnv(): Record<string, string> {
   if (envWhitelist) {
     env = {};
     for (const key of envWhitelist) {
-      if (process.env[key] != null) env[key] = process.env[key]!;
+      const value = process.env[key];
+      if (value != null) env[key] = value;
     }
     // Nix sets SHELL to /nix/store/.../bash which lacks features like progcomp
     // that user bashrc files expect. Use the real login shell from /etc/passwd.
@@ -87,11 +88,20 @@ export const OSC7_FN = `__kolu_osc7() { printf '\\033]7;file://%s%s\\033\\\\' "$
  *     foreground process detection.
  *
  *  2. **OSC 633 ; E ; <cmd>** — VS Code's semantic "exact command line"
- *     mark. Consumed by the OSC 633 handler in pty.ts to build the
- *     global "recent agents" MRU without any PID/argv lookups. The
- *     shell hands us the command string verbatim, so kolu never needs
- *     `/proc` (Linux-only) or `ps` spawning (slow). Works identically
- *     on Linux and macOS. */
+ *     mark. The OSC 633 handler in pty.ts republishes the raw payload on
+ *     the `commandRun` channel; `meta/agent-command.ts` subscribes and
+ *     derives both the global "recent agents" MRU and a per-terminal
+ *     agent-command stash (used to detect interpreter-shimmed agents like
+ *     npm-installed codex, where the kernel-level process name is `node`).
+ *     The shell hands us the command string verbatim, so kolu never needs
+ *     `/proc` (Linux-only) or `ps` spawning (slow). Works identically on
+ *     Linux and macOS.
+ *
+ *  Emission order is not load-bearing. Preexec fires while the shell is
+ *  still at its prompt, so any reconcile triggered here would be gated
+ *  out by `shellIdle` in `snapshotTerminalState` anyway — the agent
+ *  match actually fires once the agent has taken over the foreground
+ *  and emits a later signal (WAL write for codex, TUI OSC 2 title). */
 export const OSC2_PREEXEC_FN = `__kolu_preexec() { printf '\\033]2;%s\\033\\\\' "$1"; printf '\\033]633;E;%s\\033\\\\' "$1"; }`;
 
 /** Bash-specific preexec dispatch — uses a ready flag armed at the end of
@@ -152,17 +162,13 @@ export function osc7Init(opts: {
   shell: string;
   home: string | undefined;
   terminalId: string;
-  extraPath?: string;
 }): { args: string[]; env: Record<string, string>; cleanup: () => void } {
-  const { shell, home, terminalId, extraPath } = opts;
+  const { shell, home, terminalId } = opts;
   const noop = { args: [], env: {}, cleanup: () => {} };
   if (!home) return noop;
 
   const isBash = shell.endsWith("/bash") || shell.endsWith("/bash5");
   const isZsh = shell.endsWith("/zsh");
-
-  // Prepend extra dirs to PATH after the user's rc (which may rebuild PATH from scratch on NixOS).
-  const pathLine = extraPath ? `export PATH="${extraPath}:$PATH"` : "";
 
   if (isBash) {
     const rcFile = join(koluShellDir, `bashrc-${terminalId}`);
@@ -178,7 +184,6 @@ export function osc7Init(opts: {
         `__kolu_login=0; for __f in "${home}/.bash_profile" "${home}/.bash_login" "${home}/.profile"; do [ -f "$__f" ] && { . "$__f"; __kolu_login=1; break; }; done`,
         `[ "$__kolu_login" = 0 ] && [ -f "${home}/.bashrc" ] && . "${home}/.bashrc"`,
         `unset __kolu_login __f`,
-        pathLine,
         OSC7_FN,
         OSC2_PREEXEC_FN,
         OSC2_PREEXEC_BASH_GUARD,
@@ -190,15 +195,13 @@ export function osc7Init(opts: {
         //      "on" between the end of prompt setup and the next user command.
         //      Any DEBUG firing before arm (hooks, aliases, etc.) sees flag=""
         //      and skips emitting OSC 2.
-        `PROMPT_COMMAND="__kolu_osc7;__kolu_title_precmd\${PROMPT_COMMAND:+;\$PROMPT_COMMAND};__kolu_preexec_arm"`,
+        `PROMPT_COMMAND="__kolu_osc7;__kolu_title_precmd\${PROMPT_COMMAND:+;$PROMPT_COMMAND};__kolu_preexec_arm"`,
         // Install the DEBUG trap at source time — reinstalling inside
         // PROMPT_COMMAND is unnecessary since the trap persists across
         // commands. If a user's .bashrc clears it, bash-preexec-compatible
         // setups will still work if we're loaded first.
         `trap '__kolu_preexec_dispatch' DEBUG`,
-      ]
-        .filter(Boolean)
-        .join("\n"),
+      ].join("\n"),
     );
     return {
       args: ["--rcfile", rcFile],
@@ -218,7 +221,6 @@ export function osc7Init(opts: {
         `[ -f /etc/zprofile ] && source /etc/zprofile`,
         `[ -f "${home}/.zprofile" ] && source "${home}/.zprofile"`,
         `[ -f "${home}/.zshrc" ] && ZDOTDIR="${home}" source "${home}/.zshrc"`,
-        pathLine,
         OSC7_FN,
         OSC2_PREEXEC_FN,
         OSC2_PRECMD_ZSH,
@@ -226,9 +228,7 @@ export function osc7Init(opts: {
         `add-zsh-hook precmd __kolu_osc7`,
         `add-zsh-hook precmd __kolu_title_precmd`,
         `add-zsh-hook preexec __kolu_preexec`,
-      ]
-        .filter(Boolean)
-        .join("\n"),
+      ].join("\n"),
     );
     return {
       args: [],

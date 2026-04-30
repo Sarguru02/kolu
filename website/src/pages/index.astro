@@ -17,7 +17,7 @@ const features = [
     num: '01',
     key: 'agent-agnostic',
     title: 'Agent-agnostic, by design',
-    body: "The terminal is the universal interface. claude, opencode, or whatever ships next week all work the same way — because they're just programs you run in a shell. No adapters, no registry, no vendor lock-in.",
+    body: "The terminal is the universal interface. claude, codex, opencode, or whatever ships next week all work the same way — because they're just programs you run in a shell. No adapters, no registry, no vendor lock-in.",
     wide: true,
   },
   {
@@ -36,7 +36,7 @@ const features = [
     num: '04',
     key: 'agent-status',
     title: 'Live agent status',
-    body: "Detects Claude Code and OpenCode sessions: thinking, tool use, waiting. Each terminal's pill in the navigation tree spins a repo-colored border while the agent is working and breathes when it's waiting on you, so a glance tells you which agent needs attention.",
+    body: "Detects Claude Code, Codex, and OpenCode sessions: thinking, tool use, waiting. Each terminal's pill in the navigation tree spins a repo-colored border while the agent is working and breathes when it's waiting on you, so a glance tells you which agent needs attention.",
   },
   {
     num: '05',
@@ -55,6 +55,12 @@ const features = [
     key: 'recording',
     title: 'Record your workspace',
     body: 'One click in the chrome bar captures the whole Kolu tab with microphone and optional webcam PiP, streamed straight to a local .webm. Pause/resume with ⌘⇧., mic picker with live level meter, circular webcam overlay baked into the recording.',
+  },
+  {
+    num: '08',
+    key: 'transcript-export',
+    title: 'Share what your agent did',
+    body: 'Export any Claude Code, Codex, or OpenCode session as a single self-contained .html — warm-parchment editorial layout, shiki-tokenized code, real diff views for every Edit/Write/apply_patch, j/k prompt navigation, dark/light toggle. No external assets, no upload — opens offline in any browser.',
   },
 ];
 ---
@@ -81,7 +87,7 @@ const features = [
     <h1
       class="display reveal reveal-2 mt-5 text-[3.4rem] sm:text-[4.6rem] md:text-[6rem] max-w-4xl"
     >
-      A browser cockpit <span class="text-amber">for</span>
+      A terminal-native cockpit <span class="text-amber">for</span>
       <br class="hidden sm:block" />coding agents<span class="cursor" aria-hidden="true"></span>
     </h1>
 
@@ -89,9 +95,9 @@ const features = [
       class="reveal reveal-3 mt-10 max-w-xl text-lg leading-relaxed text-ink-dim"
       style="font-variation-settings: 'opsz' 14, 'SOFT' 60;"
     >
-      Bring your own CLI, run it anywhere. Kolu treats the terminal as the
-      universal interface — so <span class="mono text-ink">claude</span>, <span
-        class="mono text-ink">opencode</span
+      Open source. Bring your own CLI, run it anywhere. Kolu treats the
+      terminal as the universal interface — so <span class="mono text-ink">claude</span>, <span
+        class="mono text-ink">codex</span>, <span class="mono text-ink">opencode</span
       >, or whatever ships next week all work the same way.
     </p>
 
@@ -128,7 +134,7 @@ const features = [
   <section class="mx-auto max-w-[68rem] px-6 py-20">
     <div class="mb-14 flex items-baseline justify-between">
       <p class="eyebrow">what you get</p>
-      <p class="mono text-[0.72rem] text-ink-faint">07 features</p>
+      <p class="mono text-[0.72rem] text-ink-faint">08 features</p>
     </div>
 
     <ul class="grid md:grid-cols-2 gap-px bg-rule">

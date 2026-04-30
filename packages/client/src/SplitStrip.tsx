@@ -2,7 +2,8 @@
  *  "prompt" when no splits exist yet, "collapsed" when splits are hidden. */
 
 import type { Component } from "solid-js";
-import { SHORTCUTS, formatKeybind } from "./input/keyboard";
+import { ACTIONS } from "./input/actions";
+import { formatKeybind } from "./input/keyboard";
 import Kbd from "./ui/Kbd";
 
 type SplitStripProps =
@@ -15,6 +16,7 @@ const SplitStrip: Component<SplitStripProps> = (props) => {
 
   return (
     <button
+      type="button"
       data-testid={isCollapsed() ? "collapsed-indicator" : "split-prompt"}
       class="flex items-center justify-center gap-3 w-full h-6 shrink-0
              text-[11px] font-mono transition-all cursor-pointer"
@@ -34,7 +36,7 @@ const SplitStrip: Component<SplitStripProps> = (props) => {
       <span class="text-fg-3">
         {isCollapsed() ? `${count()} split${count() > 1 ? "s" : ""}` : "Split"}
       </span>
-      <Kbd>{formatKeybind(SHORTCUTS.toggleSubPanel.keybind)}</Kbd>
+      <Kbd>{formatKeybind(ACTIONS.toggleSubPanel.keybind)}</Kbd>
     </button>
   );
 };

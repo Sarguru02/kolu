@@ -1,16 +1,17 @@
 /** Canvas minimap — spatial overview of all tiles + integrated zoom controls.
- *  Two states: expanded (minimap visualization + zoom bar) and minimized
- *  (zoom bar only). Auto-hides the map when ≤2 tiles. */
+ *  Auto-hides the map when ≤2 tiles. */
 
-import { type Component, For, Show, createMemo, createSignal } from "solid-js";
-import { makePersisted } from "@solid-primitives/storage";
-import { MinimapIcon } from "../ui/Icons";
-import { useCanvasViewport } from "./viewport/useCanvasViewport";
-import { startViewportDrag, handleMinimapClick } from "./minimapGestures";
+import { type Component, createMemo, createSignal, For, Show } from "solid-js";
+import { useTerminalStore } from "../terminal/useTerminalStore";
+import {
+  handleMinimapClick,
+  startTileDrag,
+  startViewportDrag,
+} from "./minimapGestures";
 import type { TileLayout } from "./TileLayout";
 import { tileMinimapBorder } from "./tileChrome";
-import { useTerminalStore } from "../terminal/useTerminalStore";
 import { useTileTheme } from "./useTileTheme";
+import { useCanvasViewport } from "./viewport/useCanvasViewport";
 
 /** Minimap target dimensions in pixels. */
 const MAP_W = 180;
@@ -20,24 +21,21 @@ const MAP_PAD = 100;
 /** Show full minimap only when tile count exceeds this. */
 const AUTO_SHOW_THRESHOLD = 2;
 
-/** Singleton expanded state — persisted across reloads. */
-const [expanded, setExpanded] = makePersisted(createSignal(true), {
-  name: "kolu-minimap-expanded",
-});
-
-export function toggleMinimap() {
-  setExpanded((v) => !v);
-}
-
 const CanvasMinimap: Component<{
   tileIds: string[];
   layouts: Record<string, TileLayout>;
   /** Activate a tile (make it the focused terminal). */
   onSelect: (id: string) => void;
+  onStartTileDrag: (id: string) => {
+    preview: (dx: number, dy: number) => void;
+    commit: (dx: number, dy: number) => void;
+  } | null;
 }> = (props) => {
   const viewport = useCanvasViewport();
   const store = useTerminalStore();
   const tileTheme = useTileTheme();
+  const [hoveringViewport, setHoveringViewport] = createSignal(false);
+  const [draggingViewport, setDraggingViewport] = createSignal(false);
 
   // ── Bounding box of all tiles ──
   const bounds = createMemo(() => {
@@ -53,7 +51,7 @@ const CanvasMinimap: Component<{
       maxX = Math.max(maxX, l.x + l.w);
       maxY = Math.max(maxY, l.y + l.h);
     }
-    if (!isFinite(minX))
+    if (!Number.isFinite(minX))
       return { minX: 0, minY: 0, maxX: 1, maxY: 1, w: 1, h: 1 };
     const padMinX = minX - MAP_PAD;
     const padMinY = minY - MAP_PAD;
@@ -104,11 +102,12 @@ const CanvasMinimap: Component<{
 
   // ── Whether to show the full minimap or just the zoom bar ──
   const shouldShowMap = createMemo(
-    () => expanded() && props.tileIds.length > AUTO_SHOW_THRESHOLD,
+    () => props.tileIds.length > AUTO_SHOW_THRESHOLD,
   );
 
   // ── Viewport rect drag ──
   let abortDrag: AbortController | null = null;
+  let abortTileDrag: AbortController | null = null;
   // Suppress map click immediately after a drag ends
   let suppressNextClick = false;
   function handleViewportDrag(e: PointerEvent) {
@@ -118,8 +117,39 @@ const CanvasMinimap: Component<{
       minimapScale(),
       abortDrag,
       (dragging) => {
+        setDraggingViewport(dragging);
         if (!dragging) suppressNextClick = true;
       },
+    );
+  }
+
+  function handleMapPointerDown(e: PointerEvent) {
+    const map = e.currentTarget as HTMLDivElement;
+    const rect = map.getBoundingClientRect();
+    const localX = e.clientX - rect.left;
+    const localY = e.clientY - rect.top;
+    const view = viewportRect();
+    const insideViewport =
+      localX >= view.x &&
+      localX <= view.x + view.w &&
+      localY >= view.y &&
+      localY <= view.y + view.h;
+    if (!insideViewport) return;
+    handleViewportDrag(e);
+  }
+
+  function handleMapPointerMove(e: PointerEvent) {
+    const map = e.currentTarget as HTMLDivElement;
+    const rect = map.getBoundingClientRect();
+    const localX = e.clientX - rect.left;
+    const localY = e.clientY - rect.top;
+    const view = viewportRect();
+    setHoveringViewport(
+      e.target === map &&
+        localX >= view.x &&
+        localX <= view.x + view.w &&
+        localY >= view.y &&
+        localY <= view.y + view.h,
     );
   }
 
@@ -135,15 +165,22 @@ const CanvasMinimap: Component<{
   return (
     <div
       data-testid="canvas-minimap"
-      data-expanded={shouldShowMap() ? "" : undefined}
       class="absolute bottom-4 left-4 z-20 flex flex-col items-start gap-px"
     >
       {/* Minimap visualization */}
       <Show when={shouldShowMap()}>
         <div
           data-testid="minimap-map"
-          class="rounded-t-lg bg-surface-2/80 backdrop-blur-sm border border-b-0 border-edge/40 overflow-hidden cursor-default"
+          class="rounded-t-lg bg-surface-2/80 backdrop-blur-sm border border-b-0 border-edge/40 overflow-hidden"
           style={{ width: `${mapDims().w}px`, height: `${mapDims().h}px` }}
+          classList={{
+            "cursor-default": !hoveringViewport() && !draggingViewport(),
+            "cursor-grab": hoveringViewport() && !draggingViewport(),
+            "cursor-grabbing": draggingViewport(),
+          }}
+          onPointerDown={handleMapPointerDown}
+          onPointerMove={handleMapPointerMove}
+          onPointerLeave={() => setHoveringViewport(false)}
           onClick={handleMapClick}
         >
           {/* Tile rectangles */}
@@ -161,10 +198,32 @@ const CanvasMinimap: Component<{
               const handleTileClick = (e: MouseEvent) => {
                 // Don't let this also trigger the background pan-to-point.
                 e.stopPropagation();
+                if (suppressNextClick) {
+                  suppressNextClick = false;
+                  return;
+                }
                 const l = layout();
                 if (!l) return;
                 props.onSelect(id);
                 viewport.centerOnTile(l);
+              };
+              const handleTilePointerDown = (e: PointerEvent) => {
+                e.stopPropagation();
+                const drag = props.onStartTileDrag(id);
+                if (!drag) return;
+                abortTileDrag = startTileDrag(
+                  e,
+                  minimapScale(),
+                  abortTileDrag,
+                  {
+                    onDragStart: () => props.onSelect(id),
+                    onPreview: drag.preview,
+                    onCommit: (dx, dy) => {
+                      drag.commit(dx, dy);
+                      suppressNextClick = true;
+                    },
+                  },
+                );
               };
               return (
                 <Show when={pos()}>
@@ -187,6 +246,7 @@ const CanvasMinimap: Component<{
                         border: `1px solid ${tileMinimapBorder(theme())}`,
                       }}
                       title={id}
+                      onPointerDown={handleTilePointerDown}
                       onClick={handleTileClick}
                     />
                   )}
@@ -198,7 +258,7 @@ const CanvasMinimap: Component<{
           {/* Viewport rectangle */}
           <div
             data-testid="minimap-viewport-rect"
-            class="absolute border-2 border-accent/50 rounded-sm cursor-grab active:cursor-grabbing"
+            class="absolute pointer-events-none border-2 border-accent/50 rounded-sm"
             style={{
               left: `${viewportRect().x}px`,
               top: `${viewportRect().y}px`,
@@ -207,7 +267,6 @@ const CanvasMinimap: Component<{
               "background-color":
                 "var(--color-accent-alpha, rgba(99, 102, 241, 0.08))",
             }}
-            onPointerDown={handleViewportDrag}
           />
         </div>
       </Show>
@@ -221,18 +280,8 @@ const CanvasMinimap: Component<{
         }}
         style={shouldShowMap() ? { width: `${mapDims().w}px` } : undefined}
       >
-        {/* Minimap toggle */}
         <button
-          data-testid="minimap-toggle"
-          class="flex items-center justify-center w-8 h-8 text-fg-3 hover:text-fg hover:bg-surface-3/60 transition-colors cursor-pointer"
-          classList={{ "text-accent": expanded() }}
-          title="Toggle minimap"
-          onClick={() => toggleMinimap()}
-        >
-          <MinimapIcon class="w-3.5 h-3.5" />
-        </button>
-        <div class="w-px h-5 bg-edge/30" />
-        <button
+          type="button"
           class="flex items-center justify-center w-7 h-8 text-fg-3 hover:text-fg hover:bg-surface-3/60 transition-colors cursor-pointer text-sm font-medium"
           title="Zoom out"
           onClick={() => viewport.zoomOut()}
@@ -240,6 +289,7 @@ const CanvasMinimap: Component<{
           −
         </button>
         <button
+          type="button"
           class="flex items-center justify-center min-w-[3rem] h-8 px-1 text-fg-2 hover:text-fg hover:bg-surface-3/60 transition-colors cursor-pointer text-xs tabular-nums"
           title="Reset to 100%"
           onClick={() => viewport.resetZoom()}
@@ -247,6 +297,7 @@ const CanvasMinimap: Component<{
           {Math.round(viewport.zoom() * 100)}%
         </button>
         <button
+          type="button"
           class="flex items-center justify-center w-7 h-8 text-fg-3 hover:text-fg hover:bg-surface-3/60 transition-colors cursor-pointer text-sm font-medium"
           title="Zoom in"
           onClick={() => viewport.zoomIn()}

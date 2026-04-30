@@ -1,6 +1,6 @@
-import { When, Then } from "@cucumber/cucumber";
-import { KoluWorld, POLL_TIMEOUT } from "../support/world.ts";
+import { Then, When } from "@cucumber/cucumber";
 import { ACTIVE_TERMINAL } from "../support/buffer.ts";
+import { type KoluWorld, POLL_TIMEOUT } from "../support/world.ts";
 
 const KEY_BAR = '[data-testid="mobile-key-bar"]';
 const KEY = (testId: string) => `[data-testid="mobile-key-${testId}"]`;
@@ -34,11 +34,7 @@ Then(
     // from 2 to 4. Asserting >= N tolerates extra renders.
     await this.page.waitForFunction(
       ([sel, exp, n]) => {
-        const buf: string = (
-          window as Window & {
-            __readXtermBuffer?: (s: string, i: number) => string;
-          }
-        ).__readXtermBuffer!(sel, 0);
+        const buf = window.__readXtermBuffer?.(sel, 0) ?? "";
         let occurrences = 0;
         let idx = 0;
         while ((idx = buf.indexOf(exp, idx)) !== -1) {

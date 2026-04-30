@@ -9,7 +9,14 @@ local_system := `nix eval --raw --impure --expr builtins.currentSystem`
 root := `git rev-parse --show-toplevel`
 systems := "x86_64-linux aarch64-darwin"
 
-default: _preflight _run-all
+# Re-enter nix devShell if the caller isn't already in one, so recipes
+# have jq/gh/etc. on PATH even when invoked outside direnv.
+nix_shell := if env('IN_NIX_SHELL', '') != '' { '' } else { 'nix develop ' + justfile_directory() + ' --accept-flake-config -c' }
+
+default:
+    {{ nix_shell }} just ci::_default
+
+_default: _preflight _run-all
     just ci::_summary
 
 [parallel]
@@ -19,7 +26,7 @@ _run-all: _local _linux _darwin
 # their own GitHub status — _summary reads those statuses to decide
 # the final pass/fail.
 _local:
-    just ci::fmt ci::typecheck ci::unit ci::apm-sync || true
+    just ci::fmt ci::typecheck ci::biome ci::unit ci::apm-sync || true
 
 _linux:
     CI_SYSTEM=x86_64-linux just ci::pnpm-hash-fresh ci::nix ci::_linux-fanout || true
@@ -27,10 +34,10 @@ _linux:
 # Runs post-nix steps in parallel. Within the same just process, their
 # `: nix` deps are already satisfied, so nix is not rebuilt.
 [parallel]
-_linux-fanout: home-manager e2e
+_linux-fanout: home-manager e2e smoke
 
 [parallel]
-_darwin-fanout: e2e
+_darwin-fanout: e2e smoke
 
 _darwin:
     CI_SYSTEM=aarch64-darwin just ci::nix ci::_darwin-fanout || true
@@ -65,6 +72,12 @@ typecheck:
 e2e: nix
     just ci::_run e2e just test
 
+# Boot the packaged Kolu and verify /api/health — runtime smoke that catches
+# packaging regressions where `nix build` passes but the binary crashes at
+# boot (e.g. missing workspace dep — see #761).
+smoke: nix
+    just ci::_run smoke just smoke
+
 # Run vitest unit tests (server + client)
 unit:
     just ci::_run unit just test-unit
@@ -75,3 +88,8 @@ apm-sync:
 
 fmt:
     just ci::_run fmt just fmt-check
+
+# Biome lint — recommended preset with each currently-noisy rule explicitly
+# off in biome.jsonc. Each disabled rule has a follow-up PR slot (#710).
+biome:
+    just ci::_run biome "pnpm exec biome lint ."

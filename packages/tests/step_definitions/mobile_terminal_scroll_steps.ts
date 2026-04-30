@@ -1,7 +1,7 @@
-import { When, Then } from "@cucumber/cucumber";
-import { KoluWorld, POLL_TIMEOUT } from "../support/world.ts";
-import { waitForBufferContains } from "../support/buffer.ts";
 import * as assert from "node:assert";
+import { Then, When } from "@cucumber/cucumber";
+import { waitForBufferContains } from "../support/buffer.ts";
+import { type KoluWorld, POLL_TIMEOUT } from "../support/world.ts";
 
 /** Read xterm's current viewportY (top row of the visible window). When the
  *  user is scrolled to the bottom, viewportY === baseY. Scrolling up
@@ -68,7 +68,7 @@ When(
     await this.page.evaluate(
       ({ sel, x, startY, endY, ys }) => {
         const target = document.querySelector(sel) as HTMLElement | null;
-        if (!target) throw new Error("No element matches " + sel);
+        if (!target) throw new Error(`No element matches ${sel}`);
         const startTouch = new Touch({
           identifier: 0,
           target,

@@ -5,14 +5,14 @@
  * and asserting on the escape sequences they emit.
  */
 
-import { describe, it, expect } from "vitest";
 import { execFileSync } from "node:child_process";
+import { describe, expect, it } from "vitest";
 import {
-  OSC7_FN,
-  OSC2_PREEXEC_FN,
-  OSC2_PREEXEC_BASH_GUARD,
   OSC2_PRECMD_BASH,
   OSC2_PRECMD_ZSH,
+  OSC2_PREEXEC_BASH_GUARD,
+  OSC2_PREEXEC_FN,
+  OSC7_FN,
 } from "./shell.ts";
 
 /** Run a script in a clean bash subshell and return stdout. */
@@ -49,16 +49,18 @@ describe("OSC7_FN", () => {
     // First emission ends with /, second ends with /tmp
     const matches = [...out.matchAll(/file:\/\/[^/]+([^\x1b]*)/g)];
     expect(matches).toHaveLength(2);
-    expect(matches[0]![1]).toBe("/");
-    expect(matches[1]![1]).toBe("/tmp");
+    expect(matches[0]?.[1]).toBe("/");
+    expect(matches[1]?.[1]).toBe("/tmp");
   });
 });
 
 describe("OSC2_PREEXEC_FN", () => {
   // __kolu_preexec emits TWO sequences per invocation:
-  //   1. OSC 2 title change (for terminal title + event-driven process detection)
-  //   2. OSC 633 ; E ; <command>  (VS Code semantic command mark, for recent-agents MRU)
-  // See shell.ts OSC2_PREEXEC_FN docstring for why.
+  //   1. OSC 2 title change (for terminal title + event-driven reconcile)
+  //   2. OSC 633 ; E ; <command>  (VS Code semantic command mark, for
+  //      recent-agents MRU + per-terminal agent-command stash)
+  // Order is NOT load-bearing — onCommandRun in terminals.ts publishes
+  // its own reconcile trigger after stashing. See shell.ts docstring.
 
   it("emits OSC 2 with the passed command string", () => {
     const out = runBash(`${OSC2_PREEXEC_FN}; __kolu_preexec "vim foo.ts"`);

@@ -14,14 +14,19 @@ export interface NamedTheme {
 
 export const FONT_FAMILY = '"FiraCode Nerd Font", monospace';
 
-/** All available themes from the checked-in JSON. */
-export const availableThemes: NamedTheme[] =
-  availableThemesJson as NamedTheme[];
+/** All available themes from the checked-in JSON. The cast asserts
+ *  non-empty at the import boundary — the JSON is regenerated from
+ *  iTerm2-Color-Schemes by a build script, so empty is a build-time
+ *  failure, not a runtime one. */
+export const availableThemes = availableThemesJson as [
+  NamedTheme,
+  ...NamedTheme[],
+];
 
 export const DEFAULT_THEME_NAME = "Tomorrow Night";
 export const DEFAULT_THEME: ITheme =
   availableThemes.find((t) => t.name === DEFAULT_THEME_NAME)?.theme ??
-  availableThemes[0]!.theme;
+  availableThemes[0].theme;
 
 // O(1) lookup by name, built once at module load
 const themesByName = new Map(availableThemes.map((t) => [t.name, t.theme]));

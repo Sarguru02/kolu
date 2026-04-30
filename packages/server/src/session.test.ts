@@ -1,11 +1,12 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import * as assert from "node:assert";
+import type { SavedTerminal } from "kolu-common";
+import { afterAll, describe, expect, it } from "vitest";
 import {
-  saveSession,
-  getSavedSession,
   clearSavedSession,
+  getSavedSession,
+  saveSession,
   setSavedSession,
 } from "./session.ts";
-import type { SavedTerminal } from "kolu-common";
 
 // KOLU_STATE_DIR is set by the `test:unit` script in package.json to route
 // conf state into $TMPDIR, keeping ~/.config clean. state.ts reads it at
@@ -14,9 +15,14 @@ import type { SavedTerminal } from "kolu-common";
 const terminal: SavedTerminal = {
   id: "term-1",
   cwd: "/home/user/project",
-  repoName: "project",
-  branch: "main",
-  sortOrder: 0,
+  git: {
+    repoRoot: "/home/user/project",
+    repoName: "project",
+    worktreePath: "/home/user/project",
+    branch: "main",
+    isWorktree: false,
+    mainRepoRoot: "/home/user/project",
+  },
 };
 
 describe("session persistence", () => {
@@ -35,15 +41,14 @@ describe("session persistence", () => {
       activeTerminalId: null,
     });
     const session = getSavedSession();
-    expect(session).not.toBeNull();
-    expect(session!.terminals).toHaveLength(1);
-    expect(session!.terminals[0]).toMatchObject({
+    assert.ok(session !== null, "session round-trip lost the saved value");
+    expect(session.terminals).toHaveLength(1);
+    expect(session.terminals[0]).toMatchObject({
       id: "term-1",
       cwd: "/home/user/project",
-      repoName: "project",
-      branch: "main",
+      git: { repoName: "project", branch: "main" },
     });
-    expect(session!.savedAt).toBeTypeOf("number");
+    expect(session.savedAt).toBeTypeOf("number");
   });
 
   it("clears session when saving empty terminals", () => {
@@ -65,28 +70,30 @@ describe("session persistence", () => {
     expect(getSavedSession()).toBeNull();
   });
 
-  it("preserves multiple terminals with ordering", () => {
+  it("preserves multiple terminals with array order", () => {
     const terminals: SavedTerminal[] = [
-      { id: "a", cwd: "/a", sortOrder: 0 },
-      { id: "b", cwd: "/b", sortOrder: 1 },
-      { id: "c", cwd: "/c", parentId: "a", sortOrder: 2 },
+      { id: "a", cwd: "/a", git: null },
+      { id: "b", cwd: "/b", git: null },
+      { id: "c", cwd: "/c", git: null, parentId: "a" },
     ];
     saveSession({ terminals, activeTerminalId: null });
     const session = getSavedSession();
-    expect(session!.terminals).toHaveLength(3);
-    expect(session!.terminals.map((t) => t.id)).toEqual(["a", "b", "c"]);
-    expect(session!.terminals[2]!.parentId).toBe("a");
+    assert.ok(session !== null, "session round-trip lost the saved value");
+    expect(session.terminals).toHaveLength(3);
+    expect(session.terminals.map((t) => t.id)).toEqual(["a", "b", "c"]);
+    expect(session.terminals[2]?.parentId).toBe("a");
   });
 
   it("preserves themeName on round-trip", () => {
     const terminals: SavedTerminal[] = [
-      { id: "a", cwd: "/a", sortOrder: 0, themeName: "Dracula" },
-      { id: "b", cwd: "/b", sortOrder: 1 },
+      { id: "a", cwd: "/a", git: null, themeName: "Dracula" },
+      { id: "b", cwd: "/b", git: null },
     ];
     saveSession({ terminals, activeTerminalId: null });
     const session = getSavedSession();
-    expect(session!.terminals[0]!.themeName).toBe("Dracula");
-    expect(session!.terminals[1]!.themeName).toBeUndefined();
+    assert.ok(session !== null, "session round-trip lost the saved value");
+    expect(session.terminals[0]?.themeName).toBe("Dracula");
+    expect(session.terminals[1]?.themeName).toBeUndefined();
   });
 
   it("clearSavedSession removes the session", () => {

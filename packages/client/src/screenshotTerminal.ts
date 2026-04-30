@@ -1,10 +1,12 @@
-/** Copy a terminal's contents to the clipboard as a polished PNG.
+/** Copy the active terminal viewport to the clipboard as a polished PNG.
  *
- *  Reads `xterm.buffer.active` directly (scrollback + viewport), paints each
- *  cell onto an offscreen canvas with the theme's colors, and wraps the whole
- *  thing in a rounded-corner window chrome (border + title bar with traffic-
- *  light dots and the terminal's repo/branch label). Writes the PNG blob to
- *  the clipboard.
+ *  Reads the currently-visible slice of `xterm.buffer.active` — `xterm.rows`
+ *  lines starting at `buffer.viewportY` — and paints each cell onto an
+ *  offscreen canvas with the theme's colors, then wraps the whole thing in a
+ *  rounded-corner window chrome (border + title bar with traffic-light dots
+ *  and the terminal's repo/branch label). Writes the PNG blob to the
+ *  clipboard. Scrollback above the viewport is not captured; if the user has
+ *  scrolled up, the capture is WYSIWYG with what they're looking at.
  *
  *  Renderer-independent by construction — we never touch xterm's live canvas
  *  or DOM. An earlier attempt routed `SerializeAddon.serializeAsHTML` through
@@ -13,15 +15,21 @@
  *  Chrome, "black image" reports in real Chrome). Painting cells directly
  *  sidesteps that entire surface. */
 
+import {
+  type TerminalId,
+  type TerminalMetadata,
+  terminalKey,
+} from "kolu-common";
 import { toast } from "solid-sonner";
-import type { TerminalId, TerminalMetadata } from "kolu-common";
 import { FONT_FAMILY } from "terminal-themes";
+import { parseColor, type RGB } from "terminal-themes/color";
 import { getTerminalRefs } from "./terminal/terminalRefs";
-import { terminalName } from "./terminal/terminalDisplay";
 
 /** Standard xterm 256-color palette. First 16 come from the theme; 16-231
  *  form a 6×6×6 RGB cube; 232-255 are grayscale. */
-const CUBE_STEPS = [0, 95, 135, 175, 215, 255];
+const CUBE_STEPS: readonly [number, number, number, number, number, number] = [
+  0, 95, 135, 175, 215, 255,
+];
 
 /** Window chrome geometry (logical pixels). */
 const PAD = 16;
@@ -46,11 +54,18 @@ const BRAND_STEPS: ReadonlyArray<
   [16, 2, 10, 5, "#3b82f6"],
 ] as const;
 
+/** Indexed read into the 6-step palette. The `as 0|1|2|3|4|5` cast is
+ *  the assertion that `% 6` produced a valid tuple index — same blast
+ *  radius as a runtime check, visible to TS at the read site. */
+function cubeStep(idx: number): number {
+  return CUBE_STEPS[(idx % 6) as 0 | 1 | 2 | 3 | 4 | 5];
+}
+
 function cubeColor(i: number): string {
   const n = i - 16;
-  const r = CUBE_STEPS[Math.floor(n / 36) % 6]!;
-  const g = CUBE_STEPS[Math.floor(n / 6) % 6]!;
-  const b = CUBE_STEPS[n % 6]!;
+  const r = cubeStep(Math.floor(n / 36));
+  const g = cubeStep(Math.floor(n / 6));
+  const b = cubeStep(n);
   return `rgb(${r},${g},${b})`;
 }
 
@@ -144,33 +159,22 @@ function cellColors(
  *  a bare "terminal" label when metadata isn't available. */
 function titleLabel(meta: TerminalMetadata | undefined): string {
   if (!meta) return "terminal";
-  const name = terminalName(meta);
+  const name = terminalKey(meta).group;
   return meta.git?.branch ? `${name} (${meta.git.branch})` : name;
 }
 
+const BLACK: RGB = { r: 0, g: 0, b: 0 };
+
 /** Mix two hex colors in sRGB. Used for subtle chrome tints derived from
- *  the theme — the title-bar background and the window border. */
+ *  the theme — the title-bar background and the window border. Unknown
+ *  color strings fall back to black, so the mix result is just `b`. */
 function mix(a: string, b: string, ratio: number): string {
-  const pa = parseHex(a);
-  const pb = parseHex(b);
+  const pa = parseColor(a).unwrapOr(BLACK);
+  const pb = parseColor(b).unwrapOr(BLACK);
   const r = Math.round(pa.r * (1 - ratio) + pb.r * ratio);
   const g = Math.round(pa.g * (1 - ratio) + pb.g * ratio);
   const bl = Math.round(pa.b * (1 - ratio) + pb.b * ratio);
   return `rgb(${r},${g},${bl})`;
-}
-
-function parseHex(c: string): { r: number; g: number; b: number } {
-  const m = /^#([0-9a-f]{6})$/i.exec(c);
-  if (m) {
-    const n = parseInt(m[1]!, 16);
-    return { r: (n >> 16) & 0xff, g: (n >> 8) & 0xff, b: n & 0xff };
-  }
-  const rgb = /^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/.exec(c);
-  if (rgb) {
-    return { r: +rgb[1]!, g: +rgb[2]!, b: +rgb[3]! };
-  }
-  // Unknown color string — return black; the mix result will just be `b`.
-  return { r: 0, g: 0, b: 0 };
 }
 
 function roundedRectPath(
@@ -205,6 +209,7 @@ export async function screenshotTerminal(
   }
   const xterm = refs.xterm as unknown as {
     cols: number;
+    rows: number;
     options: {
       fontSize?: number;
       fontFamily?: string;
@@ -212,7 +217,7 @@ export async function screenshotTerminal(
     };
     buffer: {
       active: {
-        length: number;
+        viewportY: number;
         getLine: (
           y: number,
         ) =>
@@ -233,7 +238,8 @@ export async function screenshotTerminal(
   if (document.fonts?.ready) await document.fonts.ready;
   const buffer = xterm.buffer.active;
   const cols = xterm.cols;
-  const rows = buffer.length;
+  const rows = xterm.rows;
+  const yOffset = buffer.viewportY;
 
   // Measure a cell using a probe canvas. A fresh 2d context inherits the
   // browser's default font; we set it explicitly before measuring.
@@ -291,7 +297,7 @@ export async function screenshotTerminal(
 
   // Traffic-light dots.
   const dotY = TITLE_H / 2;
-  for (let i = 0; i < DOT_MACOS.length; i++) {
+  for (const [i, color] of DOT_MACOS.entries()) {
     ctx.beginPath();
     ctx.arc(
       DOT_MARGIN_LEFT + i * (DOT_R * 2 + DOT_GAP),
@@ -300,7 +306,7 @@ export async function screenshotTerminal(
       0,
       Math.PI * 2,
     );
-    ctx.fillStyle = DOT_MACOS[i]!;
+    ctx.fillStyle = color;
     ctx.fill();
   }
 
@@ -351,7 +357,7 @@ export async function screenshotTerminal(
 
   const tempCell = buffer.getNullCell();
   for (let y = 0; y < rows; y++) {
-    const line = buffer.getLine(y);
+    const line = buffer.getLine(yOffset + y);
     if (!line) continue;
     for (let x = 0; x < cols; x++) {
       const cell = line.getCell(x, tempCell);

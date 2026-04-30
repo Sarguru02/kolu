@@ -10,14 +10,14 @@
 
 import fs from "node:fs";
 import {
-  ActivityFeedSchema,
   type ActivityFeed,
-  type RecentRepo,
+  ActivityFeedSchema,
   type RecentAgent,
+  type RecentRepo,
 } from "kolu-common";
-import { store } from "./state.ts";
-import { publishSystem } from "./publisher.ts";
 import { log } from "./log.ts";
+import { publishSystem } from "./publisher.ts";
+import { store } from "./state.ts";
 
 const MAX_RECENT_REPOS = 20;
 const MAX_RECENT_AGENTS = 10;
@@ -87,10 +87,10 @@ export function trackRecentRepo(repoRoot: string, repoName: string): void {
 }
 
 /** Upsert a normalized agent command into the recent agents MRU.
- *  Called from terminals.ts whenever the preexec OSC 633;E handler fires
- *  with a command whose first token matches a known agent binary. The
- *  `command` string is the normalized form produced by `parseAgentCommand` —
- *  raw prompt text has already been stripped. */
+ *  Called from `meta/agent-command.ts` whenever the preexec OSC 633;E
+ *  handler fires with a command whose first token matches a known agent
+ *  binary. The `command` string is the normalized form produced by
+ *  `parseAgentCommand` — raw prompt text has already been stripped. */
 export function trackRecentAgent(command: string): void {
   const next = upsertMru(
     store.get("recentAgents"),

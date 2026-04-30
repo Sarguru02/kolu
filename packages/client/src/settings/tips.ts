@@ -3,7 +3,8 @@
  * All tip IDs and text builders live here for easy maintenance.
  */
 
-import { SHORTCUTS, formatKeybind } from "../input/keyboard";
+import { ACTIONS } from "../input/actions";
+import { formatKeybind } from "../input/keyboard";
 
 export type TipId = string;
 
@@ -18,29 +19,29 @@ export function pillTreeSwitchTip(index: number): Tip {
   const key = (index + 1) as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
   return {
     id: "pill-tree-switch",
-    text: `Tip: ${formatKeybind(SHORTCUTS[`switchTo${key}`].keybind)} switches directly`,
+    text: `Tip: ${formatKeybind(ACTIONS[`switchTo${key}`].keybind)} switches directly`,
   };
 }
 
 export const CONTEXTUAL_TIPS = {
   themeFromPalette: {
     id: "theme-palette",
-    text: `Tip: ${formatKeybind(SHORTCUTS.commandPalette.keybind)} → Theme for quick switching`,
+    text: `Tip: ${formatKeybind(ACTIONS.commandPalette.keybind)} → Theme for quick switching`,
   },
   worktree: {
     id: "worktree",
-    text: `${formatKeybind(SHORTCUTS.commandPalette.keybind)} → New terminal → worktree for parallel sessions`,
+    text: `${formatKeybind(ACTIONS.commandPalette.keybind)} → New terminal → worktree for parallel sessions`,
   },
   themeSwitch: {
     id: "theme-switch",
-    text: `Tip: ${formatKeybind(SHORTCUTS.shuffleTheme.keybind)} cycles through terminal themes`,
+    text: `Tip: ${formatKeybind(ACTIONS.shuffleTheme.keybind)} cycles through terminal themes`,
   },
 } as const satisfies Record<string, Tip>;
 
 export const AMBIENT_TIPS: readonly Tip[] = [
   {
     id: "amb-sub",
-    text: `${formatKeybind(SHORTCUTS.toggleSubPanel.keybind)} splits your terminal into a bottom pane`,
+    text: `${formatKeybind(ACTIONS.toggleSubPanel.keybind)} splits your terminal into a bottom pane`,
   },
   {
     id: "amb-pill-tree",
@@ -48,27 +49,27 @@ export const AMBIENT_TIPS: readonly Tip[] = [
   },
   {
     id: "amb-mru",
-    text: `${formatKeybind(SHORTCUTS.cycleTerminalMru.keybind)} cycles terminals in most-recently-used order`,
+    text: `${formatKeybind(ACTIONS.cycleTerminalMru.keybind)} cycles terminals in most-recently-used order`,
   },
   {
     id: "amb-search",
-    text: `${formatKeybind(SHORTCUTS.findInTerminal.keybind)} searches terminal output`,
+    text: `${formatKeybind(ACTIONS.findInTerminal.keybind)} searches terminal output`,
   },
   {
     id: "amb-shuffle-theme",
-    text: `${formatKeybind(SHORTCUTS.shuffleTheme.keybind)} shuffles the terminal color theme`,
-  },
-  {
-    id: "amb-export-pdf",
-    text: `${formatKeybind(SHORTCUTS.exportSessionAsPdf.keybind)} exports the current session as a PDF`,
+    text: `${formatKeybind(ACTIONS.shuffleTheme.keybind)} shuffles the terminal color theme`,
   },
   {
     id: "amb-screenshot",
-    text: `${formatKeybind(SHORTCUTS.screenshotTerminal.keybind)} copies a PNG screenshot of the active terminal to your clipboard`,
+    text: `${formatKeybind(ACTIONS.screenshotTerminal.keybind)} copies a PNG screenshot of the active terminal to your clipboard`,
+  },
+  {
+    id: "amb-export-session",
+    text: `${formatKeybind(ACTIONS.commandPalette.keybind)} → "Export agent session as HTML" saves the active Claude/OpenCode/Codex transcript as a self-contained, navigable file`,
   },
   {
     id: "amb-inspector",
-    text: `${formatKeybind(SHORTCUTS.toggleRightPanel.keybind)} toggles the inspector panel with full terminal context`,
+    text: `${formatKeybind(ACTIONS.toggleRightPanel.keybind)} toggles the inspector panel with full terminal context`,
   },
   {
     id: "amb-canvas-zoom",
@@ -81,10 +82,6 @@ export const AMBIENT_TIPS: readonly Tip[] = [
   {
     id: "amb-canvas-shift-pan",
     text: "Hold Shift and drag (or scroll) to pan the canvas — even over a terminal tile",
-  },
-  {
-    id: "amb-canvas-minimap",
-    text: "Toggle the minimap via its grid icon (bottom-left) for a bird's-eye view of every tile",
   },
   {
     id: "amb-tile-maximize",

@@ -21,10 +21,14 @@ let
       ./tsconfig.base.json
       ./packages/common
       ./packages/integrations
+      ./packages/nonempty
+      ./packages/shared
       ./packages/terminal-themes
       ./packages/memorable-names
       ./packages/server
       ./packages/client
+      ./packages/transcript-core
+      ./packages/transcript-html
       # pnpm.patchedDependencies entries — read by pnpm during install and
       # applied to the upstream tarball. Currently:
       #   - node-pty@1.1.0.patch: adds a foregroundPid accessor wrapping
@@ -46,7 +50,7 @@ let
     # hash-fresh` enforces this stays in sync with pnpm-lock.yaml by forcing
     # fetchPnpmDeps to re-execute (--rebuild), so stale artifacts in the
     # binary cache can't silently satisfy a hash that no longer matches.
-    hash = "sha256-VXMh+I6dHB1/Dj8g9iw91dZsJWcnplswmpe4+abei7E=";
+    hash = "sha256-6WDGaRDXr2hXtvXurr1BlEfM9u11C1Uhz0aDwGu7EQI=";
     fetcherVersion = 3;
   };
 
@@ -100,7 +104,7 @@ let
       # of 395MB, halving the I/O and Nix NAR hashing time.
       rm -rf packages/client/src packages/client/node_modules
       pushd node_modules/.pnpm
-      rm -rf typescript@* @esbuild* esbuild@* prettier@* \
+      rm -rf typescript@* @esbuild* esbuild@* @biomejs* \
              lightningcss* rollup@* @rollup* \
              vitest@* @vitest* \
              vite@* vitefu@* vite-plugin-* @tailwindcss* tailwindcss@* \
@@ -148,7 +152,7 @@ let
     makeWrapper ${pkgs.tsx}/bin/tsx $out/bin/kolu \
       --add-flags "${koluStamped}/packages/server/src/index.ts" \
       --set KOLU_CLIENT_DIST "${koluStamped}/packages/client/dist" \
-      --set KOLU_CLIPBOARD_SHIM_DIR "${koluEnv.KOLU_CLIPBOARD_SHIM_DIR}" \
+      --set KOLU_GH_BIN "${koluEnv.KOLU_GH_BIN}" \
       --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.nodejs pkgs.git pkgs.gh ]} \
       --run 'if [ -n "''${KOLU_DIAG_DIR:-}" ]; then
                KOLU_DIAG_DIR="$KOLU_DIAG_DIR/$(date +%Y%m%dT%H%M%S)-$$"

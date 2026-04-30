@@ -1,11 +1,11 @@
-import { When, Then } from "@cucumber/cucumber";
+import * as assert from "node:assert";
+import { Then, When } from "@cucumber/cucumber";
 import {
-  KoluWorld,
-  PILL_TREE_ENTRY_SELECTOR,
+  type KoluWorld,
   MOD_KEY,
+  PILL_TREE_ENTRY_SELECTOR,
   POLL_TIMEOUT,
 } from "../support/world.ts";
-import * as assert from "node:assert";
 
 /** Convert "#rrggbb" to "rgb(r, g, b)" for comparison with getComputedStyle. */
 function hexToRgb(hex: string): string {
@@ -67,7 +67,7 @@ When(
     const initial = (await themeName.textContent()) ?? "";
     this.shuffleHistory = [initial];
     for (let i = 0; i < count; i++) {
-      const before = this.shuffleHistory[this.shuffleHistory.length - 1]!;
+      const before = this.shuffleHistory.at(-1) ?? "";
       await this.page.keyboard.press(`${MOD_KEY}+j`);
       // Wait until the theme name actually changes — shuffle is async (RPC
       // round-trip + subscription tick), so reading immediately after the

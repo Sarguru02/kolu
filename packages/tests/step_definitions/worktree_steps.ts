@@ -1,11 +1,11 @@
-import { When, Then } from "@cucumber/cucumber";
+import * as assert from "node:assert";
 import { execFileSync } from "node:child_process";
+import { Then, When } from "@cucumber/cucumber";
 import {
-  KoluWorld,
+  type KoluWorld,
   PILL_TREE_ENTRY_SELECTOR,
   POLL_TIMEOUT,
 } from "../support/world.ts";
-import * as assert from "node:assert";
 
 When(
   "I set up a git repo at {string}",
@@ -36,6 +36,27 @@ When(
     execFileSync("bash", [
       "-c",
       `rm -rf "${repoPath}" && git init --bare "${repoPath}"`,
+    ]);
+  },
+);
+
+When(
+  "I add a git worktree at {string} in repo {string} on branch {string}",
+  async function (
+    this: KoluWorld,
+    worktreePath: string,
+    repoPath: string,
+    branch: string,
+  ) {
+    execFileSync("bash", ["-c", `rm -rf "${worktreePath}"`]);
+    execFileSync("git", [
+      "-C",
+      repoPath,
+      "worktree",
+      "add",
+      worktreePath,
+      "-b",
+      branch,
     ]);
   },
 );
@@ -73,6 +94,29 @@ When(
 When("I confirm worktree removal", async function (this: KoluWorld) {
   await this.page.locator('[data-testid="close-confirm-remove"]').click();
 });
+
+Then(
+  "the close confirmation should not offer worktree removal because {string}",
+  async function (this: KoluWorld, blocker: string) {
+    // The dialog must be visible first — assert the remove button is absent
+    // while the dialog itself is open, so we don't accidentally pass because
+    // the whole dialog hasn't rendered yet.
+    await this.page
+      .locator('[data-testid="close-confirm"]')
+      .waitFor({ state: "visible", timeout: POLL_TIMEOUT });
+    const remove = this.page.locator('[data-testid="close-confirm-remove"]');
+    assert.strictEqual(
+      await remove.count(),
+      0,
+      `Expected 'Remove worktree' button to be absent when blocker=${blocker}`,
+    );
+    await this.page
+      .locator(
+        `[data-testid="close-confirm-removal-blocker"][data-blocker="${blocker}"]`,
+      )
+      .waitFor({ state: "visible", timeout: POLL_TIMEOUT });
+  },
+);
 
 When(
   "I click close only in the close confirmation",
@@ -115,11 +159,9 @@ Then(
 Then(
   "the pill tree should have {int} fewer terminal entry/entries",
   async function (this: KoluWorld, fewer: number) {
-    assert.ok(
-      this.savedPillTreeCount !== undefined,
-      "Must note pill tree count first",
-    );
-    const expected = this.savedPillTreeCount! - fewer;
+    const saved = this.savedPillTreeCount;
+    assert.ok(saved !== undefined, "Must note pill tree count first");
+    const expected = saved - fewer;
     const sel = PILL_TREE_ENTRY_SELECTOR;
     await this.page.waitForFunction(
       ({ sel, exp }) => document.querySelectorAll(sel).length === exp,

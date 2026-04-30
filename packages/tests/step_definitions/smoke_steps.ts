@@ -1,9 +1,12 @@
-import { When, Then } from "@cucumber/cucumber";
-import { KoluWorld } from "../support/world.ts";
 import * as assert from "node:assert";
+import { Then, When } from "@cucumber/cucumber";
+import type { KoluWorld } from "../support/world.ts";
 
 When("I open the app", async function (this: KoluWorld) {
   await this.page.goto("/");
+  await this.page
+    .evaluate(() => navigator.clipboard?.writeText?.(""))
+    .catch(() => undefined);
 });
 
 When("I request {string}", async function (this: KoluWorld, path: string) {

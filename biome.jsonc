@@ -1,0 +1,174 @@
+// Phase 12 of #710: flip on the `a11y` rule group. 88 findings split
+// across mechanical (useButtonType, noSvgWithoutTitle) and judgment
+// (noStaticElementInteractions on canvas widgets). The 4 spatial-mouse
+// sites in `canvas/CanvasMinimap.tsx` and `canvas/CanvasTile.tsx` keep
+// the rules off via overrides — see the bottom of this file for why.
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.13/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": true,
+    "includes": [
+      "**",
+      "!pnpm-lock.yaml",
+      "!apm.lock.yaml",
+      "!AGENTS.md",
+      "!CLAUDE.md",
+      "!.claude/agents",
+      "!.claude/commands",
+      "!.claude/rules",
+      "!.claude/skills",
+      "!.claude/hooks",
+      "!.claude/settings.json",
+      "!.agents",
+      "!.codex",
+      "!.opencode",
+      "!opencode.json",
+      "!**/dist",
+      "!**/node_modules",
+      "!**/.direnv",
+      "!**/.logs",
+      "!patches",
+      // Astro files: frontmatter imports/consts are resolved inside the template
+      // body, which Biome doesn't parse — lint + format would false-positive
+      // and corrupt files. Astro has its own formatter (future: astro fmt).
+      "!**/*.astro",
+      // One-off heap-snapshot analyzers; not part of the product surface.
+      "!docs/perf-investigations/scripts"
+    ]
+  },
+  // Biome is now the sole formatter — Prettier has been retired (#710).
+  // Defaults mirror the old Prettier defaults (2-space indent, 80-column,
+  // double quotes, semicolons, trailing commas) so the one-shot churn
+  // from the flip is whitespace-minimal.
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 80
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "semicolons": "always",
+      "trailingCommas": "all",
+      "arrowParentheses": "always"
+    }
+  },
+  "json": {
+    "formatter": {
+      "enabled": true
+    }
+  },
+  "linter": {
+    "enabled": true,
+    // `project` domain unlocks Biome's type-aware rules (Scanner-backed).
+    // Per-rule opt-in: only the rules explicitly turned on below fire;
+    // Scanner runs lazily for files touched by those rules.
+    "domains": {
+      "project": "all"
+    },
+    "rules": {
+      "recommended": true,
+      "nursery": {
+        // Unawaited promises that silently swallow errors — the
+        // flagship motivation for adopting Biome (#710).
+        "noFloatingPromises": "error",
+        // Type-aware exhaustiveness on discriminated unions — adding a
+        // new variant forces every `switch` site to handle it.
+        "useExhaustiveSwitchCases": "error",
+        // Promises passed where `void` is expected — e.g. Solid
+        // `<button onClick={asyncFn}>` silently swallows errors.
+        "noMisusedPromises": "error"
+      },
+      "performance": {
+        // Solid domain: prefer `<For each={…}>` over `items.map(…)` so
+        // list reactivity is keyed properly instead of re-rendering on
+        // every signal change.
+        "useSolidForComponent": "error"
+      },
+      // Each disable below is a Phase-1 scoping decision. Re-enabling is the
+      // charter of a follow-up PR (one per rule class) — additive, not
+      // structural. The baseline stays `recommended: true` so rules
+      // promoted in future Biome releases surface on the next upgrade.
+      "suspicious": {
+        // Terminal code legitimately parses ANSI escape sequences —
+        // the rule is a permanent false positive against xterm diagnostics.
+        "noControlCharactersInRegex": "off"
+      },
+      "complexity": {
+        // Tailwind `!important` overrides are intentional in kolu's
+        // rare CSS escape-hatches.
+        "noImportantStyles": "off"
+      },
+      "correctness": {
+        // Project-domain rule: 293 sites of bare relative imports that
+        // would need `.ts`/`.tsx` extensions. Kolu uses TS's
+        // `moduleResolution: bundler` which resolves without extensions;
+        // flipping this on is an independent migration.
+        "useImportExtensions": "off",
+        // Project-domain rule: 39 findings. Triggers on path-aliased
+        // imports Biome's resolver doesn't understand the same way tsc
+        // does; dedicated follow-up needed to align them.
+        "noUnresolvedImports": "off"
+      }
+    }
+  },
+  "css": {
+    // Kolu uses Tailwind v4 (`@theme`, `@plugin`, `@apply`) in both the
+    // client and the website — without this flag the CSS parser rejects
+    // those directives even on lint-only runs.
+    "parser": {
+      "tailwindDirectives": true
+    }
+  },
+  "overrides": [
+    {
+      // Test code uses idioms production code doesn't: async generators
+      // that throw before yielding (error-path tests) and assign-in-expr
+      // patterns (indexOf loops, Cucumber world-scratch fields).
+      "includes": ["**/*.test.ts", "**/*.test.tsx", "packages/tests/**"],
+      "linter": {
+        "rules": {
+          "correctness": {
+            "useYield": "off"
+          },
+          "suspicious": {
+            "noAssignInExpressions": "off"
+          }
+        }
+      }
+    },
+    {
+      // Spatial-mouse canvas widgets: the minimap (drag-to-pan, click
+      // empty space to recenter, drag tile rectangles to rearrange) and
+      // the canvas tile wrapper (mousedown to focus, drag-to-rearrange)
+      // are inherently pointer-driven. Synthetic `role="button"` +
+      // `tabIndex={0}` + a fake `onKeyDown` would *claim* keyboard
+      // accessibility without delivering it — worse than no claim.
+      //
+      // Real keyboard navigation across terminals is provided by the
+      // command palette (⌘K, fuzzy search), the pill tree (sidebar,
+      // arrow-key tree nav), and the ⌘1..9 / ⌘J shortcuts. Those are
+      // the canonical a11y entry points for tile selection; the canvas
+      // is the visual layer they drive.
+      "includes": [
+        "packages/client/src/canvas/CanvasMinimap.tsx",
+        "packages/client/src/canvas/CanvasTile.tsx"
+      ],
+      "linter": {
+        "rules": {
+          "a11y": {
+            "noStaticElementInteractions": "off",
+            "useKeyWithClickEvents": "off",
+            "noNoninteractiveElementInteractions": "off"
+          }
+        }
+      }
+    }
+  ]
+}

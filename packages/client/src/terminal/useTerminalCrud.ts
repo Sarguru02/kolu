@@ -1,17 +1,21 @@
-/** Terminal CRUD — create, kill, close-all, theme, reorder, copy text.
+/** Terminal CRUD — create, kill, close-all, theme, copy text.
  *
  *  Uses plain oRPC client calls. Server signals propagate list/metadata
  *  changes via the live subscriptions — no optimistic cache needed. */
 
+import type {
+  CanvasLayout,
+  InitialTerminalMetadata,
+  TerminalId,
+} from "kolu-common";
 import { toast } from "solid-sonner";
-import { availableThemes, resolveThemeBgs, pickTheme } from "terminal-themes";
+import { availableThemes, pickTheme, resolveThemeBgs } from "terminal-themes";
 import { client } from "../rpc/rpc";
-import { useSubPanel } from "./useSubPanel";
-import { writeTextToClipboard } from "./clipboard";
-import { useTips } from "../settings/useTips";
-import { usePreferences } from "../settings/usePreferences";
 import { CONTEXTUAL_TIPS } from "../settings/tips";
-import type { TerminalId, CanvasLayout } from "kolu-common";
+import { usePreferences } from "../settings/usePreferences";
+import { useTips } from "../settings/useTips";
+import { copyTextWithToast } from "./clipboard";
+import { useSubPanel } from "./useSubPanel";
 import type { TerminalStore } from "./useTerminalStore";
 
 export function useTerminalCrud(deps: {
@@ -42,15 +46,6 @@ export function useTerminalCrud(deps: {
       .setTheme({ id, themeName: name })
       .catch((err: Error) =>
         toast.error(`Failed to set theme: ${err.message}`),
-      );
-  }
-
-  /** Reorder terminals on the server. */
-  function reorderTerminals(ids: TerminalId[]) {
-    void client.terminal
-      .reorder({ ids })
-      .catch((err: Error) =>
-        toast.error(`Failed to reorder terminals: ${err.message}`),
       );
   }
 
@@ -102,11 +97,13 @@ export function useTerminalCrud(deps: {
 
   /** Create a new terminal on the server and make it active.
    *  Returns the new terminal ID (for session restore mapping).
-   *  When `themeName` is provided (e.g. session restore), it overrides
-   *  the shuffle-theme preference so only one setTheme RPC fires. */
+   *  `initial` carries client-owned metadata to seed atomically on the
+   *  server — used by session restore so the first `terminal.list`
+   *  yield already carries the saved theme / canvas layout / sub-panel
+   *  state, closing the race with the canvas cascade effect (#642). */
   async function handleCreate(
     cwd?: string,
-    themeName?: string,
+    initial?: InitialTerminalMetadata,
   ): Promise<TerminalId> {
     if (store.activeMeta()?.git) showTipOnce(CONTEXTUAL_TIPS.worktree);
 
@@ -119,18 +116,24 @@ export function useTerminalCrud(deps: {
           (id) => store.getMetadata(id)?.themeName,
         )
       : null;
-    const info = await client.terminal.create({ cwd }).catch((err: Error) => {
-      toast.error(`Failed to create terminal: ${err.message}`);
-      throw err;
-    });
     const theme =
-      themeName ??
+      initial?.themeName ??
       (peerBgs
         ? pickTheme(availableThemes, { spread: true, peerBgs })
         : undefined);
+    const info = await client.terminal
+      .create({
+        cwd,
+        themeName: theme,
+        canvasLayout: initial?.canvasLayout,
+        subPanel: initial?.subPanel,
+      })
+      .catch((err: Error) => {
+        toast.error(`Failed to create terminal: ${err.message}`);
+        throw err;
+      });
     store.setActiveId(info.id);
     deps.subscribeExit(info.id);
-    if (theme) setThemeName(info.id, theme);
     showTipOnce(CONTEXTUAL_TIPS.themeSwitch);
     return info.id;
   }
@@ -168,8 +171,10 @@ export function useTerminalCrud(deps: {
     if (id === null) return;
     try {
       const text = await client.terminal.screenText({ id });
-      await writeTextToClipboard(text);
-      toast.success("Copied terminal text to clipboard");
+      await copyTextWithToast(text, {
+        success: "Copied terminal text to clipboard",
+        failure: "Failed to copy terminal text",
+      });
     } catch (err) {
       console.error("Failed to copy terminal text:", err);
       toast.error(`Failed to copy terminal text: ${(err as Error).message}`);
@@ -201,7 +206,6 @@ export function useTerminalCrud(deps: {
 
   return {
     setThemeName,
-    reorderTerminals,
     setCanvasLayout,
     removeAndAutoSwitch,
     handleCreate,

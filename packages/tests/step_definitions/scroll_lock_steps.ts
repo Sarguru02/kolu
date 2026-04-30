@@ -1,8 +1,8 @@
-import { When, Then } from "@cucumber/cucumber";
 import assert from "node:assert";
 import { writeFile } from "node:fs/promises";
-import { KoluWorld, POLL_TIMEOUT } from "../support/world.ts";
+import { Then, When } from "@cucumber/cucumber";
 import { waitForBufferContains } from "../support/buffer.ts";
+import { type KoluWorld, POLL_TIMEOUT } from "../support/world.ts";
 
 /** Per-scenario FIFO path (avoids collisions when CI runs parallel workers). */
 function scrollFifo(world: KoluWorld): string {
@@ -73,7 +73,7 @@ When("I fire the output trigger", async function (this: KoluWorld) {
   // Write to the FIFO from the test process — bypasses xterm keyboard input
   // entirely, so scrollOnUserInput doesn't interfere with scroll lock state.
   const lines = Array.from({ length: 10 }, (_, i) => `triggered-${i + 1}`);
-  await writeFile(scrollFifo(this), lines.join("\n") + "\n");
+  await writeFile(scrollFifo(this), `${lines.join("\n")}\n`);
   // When scroll-locked, data is buffered — wait for the activity indicator
   await this.page
     .locator('[data-testid="scroll-to-bottom"][data-active]')
@@ -84,7 +84,7 @@ When(
   "I fire the output trigger with {int} lines",
   async function (this: KoluWorld, count: number) {
     const lines = Array.from({ length: count }, (_, i) => `triggered-${i + 1}`);
-    await writeFile(scrollFifo(this), lines.join("\n") + "\n");
+    await writeFile(scrollFifo(this), `${lines.join("\n")}\n`);
     // When scroll-locked, data is buffered — wait for the activity indicator
     await this.page
       .locator('[data-testid="scroll-to-bottom"][data-active]')
@@ -95,10 +95,10 @@ When(
 /** Read the first visible row from the xterm buffer at the current viewport position. */
 function readFirstVisibleLine(world: KoluWorld) {
   return world.page.evaluate(() => {
-    const container = document.querySelector(
+    const container = document.querySelector<HTMLDivElement>(
       "[data-visible][data-terminal-id]",
     );
-    const term = (container as any)?.__xterm;
+    const term = container?.__xterm;
     if (!term) return "";
     const buf = term.buffer.active;
     return buf.getLine(buf.viewportY)?.translateToString(true) ?? "";
@@ -176,10 +176,10 @@ Then(
   async function (this: KoluWorld) {
     await this.page.waitForFunction(
       () => {
-        const container = document.querySelector(
+        const container = document.querySelector<HTMLDivElement>(
           "[data-visible][data-terminal-id]",
         );
-        const term = (container as any)?.__xterm;
+        const term = container?.__xterm;
         if (!term) return false;
         const buf = term.buffer.active;
         return buf.baseY <= buf.viewportY;
@@ -192,8 +192,9 @@ Then(
 Then(
   "the scroll position should be unchanged",
   async function (this: KoluWorld) {
+    const saved = this.savedScrollTop;
     assert.ok(
-      this.savedScrollTop !== undefined,
+      saved !== undefined,
       "No saved scroll position — was 'I note the scroll position' called first?",
     );
     const current = await this.page
@@ -201,8 +202,8 @@ Then(
       .evaluate((el) => el.scrollTop);
     // Allow small tolerance (1px) for rounding
     assert.ok(
-      Math.abs(current - this.savedScrollTop!) <= 1,
-      `Scroll position changed: was ${this.savedScrollTop}, now ${current}`,
+      Math.abs(current - saved) <= 1,
+      `Scroll position changed: was ${saved}, now ${current}`,
     );
   },
 );
