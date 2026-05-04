@@ -1,7 +1,7 @@
 import * as assert from "node:assert";
 import * as os from "node:os";
 import { Given, Then, When } from "@cucumber/cucumber";
-import type { SavedTerminal } from "kolu-common";
+import type { SavedTerminal } from "kolu-common/surface";
 import {
   type KoluWorld,
   PILL_TREE_ENTRY_SELECTOR,
@@ -26,14 +26,14 @@ async function postSavedSessionPayload(
   page: KoluWorld["page"],
   terminals: SavedTerminal[],
 ): Promise<void> {
-  const resp = await page.request.fetch("/rpc/session/test__set", {
+  const resp = await page.request.fetch("/rpc/surface/session/test__set", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     data: JSON.stringify({
       json: { terminals, savedAt: Date.now() },
     }),
   });
-  assert.ok(resp.ok(), `session/test__set failed: ${resp.status()}`);
+  assert.ok(resp.ok(), `surface/session/test__set failed: ${resp.status()}`);
 }
 
 Given(

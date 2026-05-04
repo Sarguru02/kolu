@@ -6,8 +6,7 @@
  *
  * Use this when the upstream stream depends on an input that the user can
  * change (selected file, active git mode, etc.). For static-input streams
- * (terminal metadata for one terminal-id), use `createSubscription` —
- * cheaper, simpler.
+ * use `createSubscription` — cheaper, simpler.
  *
  * Lifecycle: every input change runs `onCleanup` for the previous
  * subscription's `AbortController`, abandons the in-flight iterator (the
@@ -23,35 +22,14 @@ import {
   on,
   onCleanup,
 } from "solid-js";
-import { createStore, reconcile } from "solid-js/store";
+import { createStore } from "solid-js/store";
 import type { Subscription } from "./createSubscription";
+import { writeWrappedValue } from "./writeValue";
 
 export interface ReactiveSubscriptionOptions {
-  /** Called when the stream errors. Mirror of `createSubscription`'s
-   *  option — surface failures via toast.error or similar; the reactive
-   *  `error()` accessor is also available for in-component handling. */
   onError?: (err: Error) => void;
 }
 
-/**
- * Convert a reactive input + factory into a SolidJS-readable async stream
- * subscription that resubscribes on input change.
- *
- * - `inputFn` returns the current input or `null` (input not ready —
- *   subscription is dropped, value resets to `undefined`).
- * - `factory(input, signal)` opens the underlying iterable. The signal
- *   aborts on input change and on consumer disposal.
- *
- * ```tsx
- * const status = createReactiveSubscription(
- *   () => repoPath() ? { repoPath: repoPath(), mode: mode() } : null,
- *   (input, signal) => stream.gitStatus(input.repoPath, input.mode, signal),
- * );
- * status();          // current value or undefined
- * status.pending();  // true between input change and first yield
- * status.error();    // last error or undefined
- * ```
- */
 export function createReactiveSubscription<I, T>(
   inputFn: () => I | null,
   factory: (input: I, signal: AbortSignal) => Promise<AsyncIterable<T>>,
@@ -77,22 +55,12 @@ export function createReactiveSubscription<I, T>(
       const controller = new AbortController();
       onCleanup(() => controller.abort());
 
-      // Reconcile-or-assign branch is the same shape as
-      // `createSubscription`'s `updateValue` — keep in sync if either
-      // changes its store-write strategy.
       void (async () => {
         try {
           const iterable = await factory(input, controller.signal);
           for await (const item of iterable) {
             if (controller.signal.aborted) break;
-            if (item !== null && typeof item === "object") {
-              setStore(
-                "v",
-                reconcile(item as Record<string, unknown>) as unknown as T,
-              );
-            } else {
-              setStore("v", item as T);
-            }
+            writeWrappedValue(setStore, item);
             if (pending()) setPending(false);
             if (error()) setError(undefined);
           }

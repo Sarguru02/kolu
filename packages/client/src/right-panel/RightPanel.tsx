@@ -1,8 +1,8 @@
 /** RightPanel — right panel shell with tabbed navigation.
- *  Routes between Inspector and Code tabs via a discriminated union so
- *  illegal pairings (e.g. Inspector-with-a-code-mode) can't be represented. */
+ *  Routes between Inspector and Code tabs via the DU view exposed by
+ *  `useRightPanel().activeTab()`. */
 
-import type { RightPanelTabKind, TerminalMetadata } from "kolu-common";
+import type { RightPanelTabKind, TerminalMetadata } from "kolu-common/surface";
 import { type Component, For } from "solid-js";
 import { match } from "ts-pattern";
 import { CHROME_ICON_BUTTON_CLASS } from "../ui/chromeSpacing";

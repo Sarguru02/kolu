@@ -9,19 +9,19 @@
  * then persists.
  */
 
-import type { SavedSession, SavedTerminal } from "kolu-common";
+import type { SavedSession, SavedTerminal } from "kolu-common/surface";
 import { log } from "./log.ts";
-import { publisher, publishSystem } from "./publisher.ts";
+import { terminalsDirtyChannel } from "./publisher.ts";
 import { store } from "./state.ts";
+import { surfaceCtx } from "./surface.ts";
 
 /** Pending autosave timer — declared at module top so `setSavedSession`
  *  can cancel it (see comment on that function for the race). */
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 
-/** Write the session blob (or clear it) and publish to subscribers. */
+/** Write the session blob (or clear it). The surface owns persist+publish. */
 function writeSession(next: SavedSession | null): void {
-  store.set("session", next);
-  publishSystem("session:changed", next);
+  surfaceCtx.cells.session.set(next);
 }
 
 /** Save a session snapshot. Clears the session when no terminals remain. */
@@ -94,7 +94,7 @@ export function initSessionAutoSave(
 ): void {
   void (async () => {
     try {
-      for await (const _ of publisher.subscribe("terminals:dirty")) {
+      for await (const _ of terminalsDirtyChannel.subscribe(undefined)) {
         if (saveTimer) continue;
         saveTimer = setTimeout(() => {
           saveTimer = undefined;

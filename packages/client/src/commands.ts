@@ -1,13 +1,13 @@
 /** Command palette registry — declarative list of all app-level actions. */
 
-import type { RecentAgent } from "kolu-common";
+import type { RecentAgent } from "kolu-common/surface";
 import type { Accessor } from "solid-js";
 import { batch, createMemo } from "solid-js";
 import { availableThemes } from "terminal-themes";
 import type { PaletteCommand, PaletteItem } from "./CommandPalette";
 import { type ActionContext, actionPaletteCommand } from "./input/actions";
-import { client } from "./rpc/rpc";
-import { useActivityFeed } from "./settings/useActivityFeed";
+import { client } from "./wire";
+import { recentRepos, recentAgents } from "./wire";
 
 /** PaletteItems listing each recent agent command. Used by the Debug →
  *  "Recent agents" entry (phase 1 prefill flow). */
@@ -63,8 +63,6 @@ export interface CommandDeps extends ActionContext {
 }
 
 export function createCommands(deps: CommandDeps): Accessor<PaletteCommand[]> {
-  const { recentRepos, recentAgents } = useActivityFeed();
-
   return createMemo((): PaletteCommand[] => [
     {
       name: "New terminal",

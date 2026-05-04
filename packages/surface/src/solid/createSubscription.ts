@@ -14,7 +14,8 @@ import {
   on,
   onCleanup,
 } from "solid-js";
-import { createStore, reconcile } from "solid-js/store";
+import { createStore } from "solid-js/store";
+import { writeWrappedValue } from "./writeValue";
 
 /**
  * A SolidJS Accessor backed by a server stream.
@@ -53,22 +54,7 @@ export interface SubscriptionOptions<T, R = T> {
   onError?: (err: Error) => void;
 }
 
-/**
- * Convert an async stream into a SolidJS signal.
- *
- * Returns a callable signal — `meta()` reads the value, triggering
- * SolidJS reactivity. Uses `createStore` + `reconcile` under the hood
- * for fine-grained reactivity on nested object fields.
- *
- * ```tsx
- * const meta = createSubscription(() => client.terminal.onMetadataChange({ id }), {
- *   onError: (err) => toast.error(`Metadata error: ${err.message}`),
- * });
- * meta()?.tickCount  // reactive read — re-renders only when tickCount changes
- * meta.pending()     // true until first event
- * meta.error()       // stream error, if any
- * ```
- */
+/** Convert an async stream into a SolidJS signal. */
 export function createSubscription<T>(
   source: () => Promise<AsyncIterable<T>>,
 ): Subscription<T>;
@@ -103,20 +89,8 @@ export function createSubscription<T, R = T>(
   const [error, setError] = createSignal<Error | undefined>();
   const [pending, setPending] = createSignal(true);
 
-  // Use reconcile for objects/arrays (fine-grained updates),
-  // plain assignment for primitives.
   function updateValue(next: T | R): void {
-    if (next !== null && typeof next === "object") {
-      setStore(
-        "v",
-        reconcile(next as Record<string, unknown>) as unknown as
-          | T
-          | R
-          | undefined,
-      );
-    } else {
-      setStore("v", next as T | R);
-    }
+    writeWrappedValue(setStore, next as T | R | undefined);
   }
 
   function toError(err: unknown): Error {

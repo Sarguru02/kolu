@@ -12,9 +12,9 @@
  *  the client because the scrollback only exists there; this one runs
  *  on the server because the transcript only exists there. */
 
-import type { TerminalId } from "kolu-common";
+import type { TerminalId } from "kolu-common/surface";
 import { toast } from "solid-sonner";
-import { client } from "./rpc/rpc";
+import { client } from "./wire";
 
 export async function exportSessionAsHtml(id: TerminalId): Promise<void> {
   const loadingId = toast.loading("Exporting session…");

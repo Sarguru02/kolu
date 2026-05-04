@@ -7,7 +7,8 @@
 
 import Dialog from "@corvu/dialog";
 import { Meta, Title } from "@solidjs/meta";
-import type { ServerIdentity, TerminalId } from "kolu-common";
+import type { ServerIdentity } from "kolu-common/contract";
+import type { TerminalId } from "kolu-common/surface";
 import {
   type Component,
   createEffect,
@@ -42,7 +43,8 @@ import { useRecorder } from "./recorder/useRecorder";
 import WebcamOverlay from "./recorder/WebcamOverlay";
 import RightPanelLayout from "./right-panel/RightPanelLayout";
 import { useRightPanel } from "./right-panel/useRightPanel";
-import { client, serverProcessId, wsStatus } from "./rpc/rpc";
+import { client } from "./wire";
+import { serverProcessId, wsStatus } from "./rpc/rpc";
 import TransportOverlay from "./rpc/TransportOverlay";
 import ShortcutsHelp from "./ShortcutsHelp";
 import { screenshotTerminal } from "./screenshotTerminal";

@@ -2,14 +2,13 @@
  *  server's live file-content stream so editor saves and branch checkouts
  *  reflect without a manual refresh. The wrapper around Pierre's `File`
  *  renderer provides shiki-powered syntax highlighting; equality-gating
- *  the snapshot via `reconcile` (inside `createReactiveSubscription`)
+ *  the snapshot via `reconcile` (inside `useStream`'s underlying primitive)
  *  avoids stomping scroll position on no-op ticks. */
 
 import { type Component, Match, Show, Switch } from "solid-js";
 import { toast } from "solid-sonner";
-import { createReactiveSubscription } from "../rpc/createReactiveSubscription";
-import { stream } from "../rpc/rpc";
 import PierreFileView from "../ui/PierreFileView";
+import { app } from "../wire";
 
 export type BrowseFileViewProps = {
   repoPath: string;
@@ -18,10 +17,8 @@ export type BrowseFileViewProps = {
 };
 
 const BrowseFileView: Component<BrowseFileViewProps> = (props) => {
-  const fileContent = createReactiveSubscription(
+  const fileContent = app.streams.fsReadFile.use(
     () => ({ repoPath: props.repoPath, filePath: props.filePath }),
-    (input, signal) =>
-      stream.fsReadFile(input.repoPath, input.filePath, signal),
     {
       onError: (err) => toast.error(`File content stream: ${err.message}`),
     },

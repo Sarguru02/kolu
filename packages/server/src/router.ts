@@ -1,62 +1,41 @@
 /**
- * oRPC router: implements the contract with terminal lifecycle and I/O handlers.
+ * oRPC router: composes the surface router fragment (`./surface.ts`) with
+ * hand-listed raw oRPC handlers (terminal lifecycle, attach, git
+ * mutations, server info).
  *
- * Streaming handlers subscribe to publisher channels over WebSocket.
- * Terminal CRUD (create, kill, etc.) is request-response; list and metadata are live streams.
+ * The typed reactive layer goes through `surfaceRouter` / `surfaceCtx`
+ * (see `./surface.ts`). Domain mutations import `surfaceCtx` directly
+ * from there. This file is just the glue between the surface fragment
+ * and the raw RPCs.
  */
-import { implement, ORPCError } from "@orpc/server";
 
+import { ORPCError } from "@orpc/server";
 import { loadClaudeCodeTranscript } from "kolu-claude-code";
 import { loadCodexTranscript } from "kolu-codex";
-import type { Transcript, TranscriptPr } from "kolu-common";
-import { contract } from "kolu-common/contract";
+import type { Transcript, TranscriptPr } from "kolu-common/transcript";
 import { TerminalNotFoundError } from "kolu-common/errors";
-import {
-  fsListAllOutputEqual,
-  fsReadFileOutputEqual,
-  type GitResult,
-  getDiff,
-  getStatus,
-  gitDiffOutputEqual,
-  gitStatusOutputEqual,
-  listAll,
-  readFile,
-  subscribeFileChange,
-  subscribeRepoChange,
-  worktreeCreate,
-  worktreeRemove,
-} from "kolu-git";
+import { worktreeCreate, worktreeRemove } from "kolu-git";
 import { prValue } from "kolu-github/schemas";
 import { loadOpenCodeTranscript } from "kolu-opencode";
 import { transcriptToHtml } from "kolu-transcript-html";
 import { match } from "ts-pattern";
-import { getActivityFeed, setActivityForTest } from "./activity.ts";
 import { saveClipboardImage } from "./clipboard.ts";
 import { serverHostname, serverProcessId } from "./hostname.ts";
 import { log } from "./log.ts";
-import {
-  getPreferences,
-  setPreferencesForTest,
-  updatePreferences,
-} from "./preferences.ts";
+import { terminalChannels } from "./publisher.ts";
 import { pwaIdentityForHostname } from "./pwaIdentity.ts";
-import { subscribeForTerminal_, subscribeSystem_ } from "./publisher.ts";
-import { getSavedSession, setSavedSession } from "./session.ts";
+import { surfaceRouter, t, unwrapGit } from "./surface.ts";
+import { getTerminal, type TerminalProcess } from "./terminal-registry.ts";
 import {
   createTerminal,
-  getTerminal,
   killAllTerminals,
   killTerminal,
-  listTerminals,
   setActiveTerminalId,
   setCanvasLayout,
   setSubPanelState,
   setTerminalParent,
   setTerminalTheme,
-  type TerminalProcess,
 } from "./terminals.ts";
-
-const t = implement(contract);
 
 /** Get terminal or throw — shared by all per-terminal handlers. */
 function requireTerminal(id: string): TerminalProcess {
@@ -65,113 +44,8 @@ function requireTerminal(id: string): TerminalProcess {
   return entry;
 }
 
-/** Unwrap a GitResult or throw an ORPCError for the client. */
-function unwrapGit<T>(result: GitResult<T>): T {
-  if (result.ok) return result.value;
-  const e = result.error;
-  const status =
-    e.code === "BASE_BRANCH_NOT_FOUND"
-      ? "PRECONDITION_FAILED"
-      : "INTERNAL_SERVER_ERROR";
-  const message =
-    e.code === "PATH_ESCAPES_ROOT"
-      ? `path escapes root: ${e.child}`
-      : e.code === "BASE_BRANCH_NOT_FOUND"
-        ? e.message
-        : "message" in e
-          ? e.message
-          : `Git operation failed: ${e.code}`;
-  throw new ORPCError(status, { message });
-}
-
-/** Snapshot-then-deltas loop: yield an initial read, then re-read on every
- *  event tick from `install` and yield only when `isEqual(last, next)` is
- *  false. The initial read's exception propagates to the client (first
- *  frame); subsequent read failures silently retry on the next tick — a
- *  transient git error shouldn't tear down a long-lived subscription.
- *  The equality predicate is passed in so it lives at the call site,
- *  visible to reviewers, alongside the schema it covers. */
-async function* streamSnapshots<T>(
-  read: () => Promise<T>,
-  isEqual: (a: T, b: T) => boolean,
-  install: (onEvent: () => void) => () => void,
-  signal: AbortSignal | undefined,
-): AsyncIterable<T> {
-  let last: T = await read();
-  yield last;
-  for await (const _ of repoEventStream(install, signal)) {
-    let next: T;
-    try {
-      next = await read();
-    } catch (e) {
-      // Transient git errors shouldn't tear down the long-lived
-      // subscription — the upstream debounce will tick again and the
-      // next read may succeed. Log loud enough that a *persistent*
-      // failure is visible to operators (a stuck stream silently
-      // returning stale state is the worse failure mode).
-      log.error(
-        { err: e instanceof Error ? e.message : String(e) },
-        "stream snapshot read failed",
-      );
-      continue;
-    }
-    if (isEqual(last, next)) continue;
-    last = next;
-    yield last;
-  }
-}
-
-/** Convert a callback-based "something changed" subscription into an
- *  AsyncIterable<void> that yields once per debounced tick. The streaming
- *  endpoints subscribe to `subscribeRepoChange` / `subscribeFileChange`
- *  through this adapter so the per-tick re-read + dedup loop can be
- *  written as a plain `for await`.
- *
- *  Coalescing semantics: events that fire while the consumer is mid-yield
- *  collapse into one wakeup (the `dirty` flag flips to true; the consumer
- *  picks it up on the next loop iteration). This complements the upstream
- *  primitive's own debounce — bursts that arrive during snapshot
- *  computation don't queue up extra yields. */
-async function* repoEventStream(
-  install: (onEvent: () => void) => () => void,
-  signal: AbortSignal | undefined,
-): AsyncIterable<void> {
-  let dirty = false;
-  let resolve: (() => void) | null = null;
-  // Drain the pending wake promise so the loop's `await` returns. Both
-  // the upstream event callback and the abort signal need this exact
-  // sequence; factoring it out keeps a future log/error addition from
-  // landing in only one path.
-  const drainResolve = (): void => {
-    if (resolve) {
-      const r = resolve;
-      resolve = null;
-      r();
-    }
-  };
-  const unsub = install(() => {
-    dirty = true;
-    drainResolve();
-  });
-  signal?.addEventListener("abort", drainResolve);
-  try {
-    while (signal?.aborted !== true) {
-      if (dirty) {
-        dirty = false;
-        yield;
-        continue;
-      }
-      await new Promise<void>((r) => {
-        resolve = r;
-      });
-    }
-  } finally {
-    signal?.removeEventListener("abort", drainResolve);
-    unsub();
-  }
-}
-
 export const appRouter = t.router({
+  ...surfaceRouter,
   server: {
     info: t.server.info.handler(async () => ({
       identity: pwaIdentityForHostname(serverHostname),
@@ -186,12 +60,6 @@ export const appRouter = t.router({
         subPanel: input.subPanel,
       }),
     ),
-    list: t.terminal.list.handler(async function* ({ signal }) {
-      yield listTerminals();
-      for await (const list of subscribeSystem_("terminal-list", signal)) {
-        yield list;
-      }
-    }),
 
     resize: t.terminal.resize.handler(async ({ input }) => {
       requireTerminal(input.id).handle.resize(input.cols, input.rows);
@@ -233,14 +101,9 @@ export const appRouter = t.router({
      */
     attach: t.terminal.attach.handler(async function* ({ input, signal }) {
       const entry = requireTerminal(input.id);
-
-      // Subscribe FIRST, then serialize — any output between these two
-      // steps is queued inside the publisher, not lost.
-      const live = subscribeForTerminal_("data", input.id, signal);
-
+      const live = terminalChannels.data(input.id).subscribe(signal);
       const screenState = entry.handle.getScreenState();
       if (screenState) yield screenState;
-
       for await (const data of live) yield data;
     }),
 
@@ -358,33 +221,6 @@ export const appRouter = t.router({
         return { html, filename };
       },
     ),
-
-    onMetadataChange: t.terminal.onMetadataChange.handler(async function* ({
-      input,
-      signal,
-    }) {
-      const entry = requireTerminal(input.id);
-      yield { ...entry.info.meta };
-      for await (const meta of subscribeForTerminal_(
-        "metadata",
-        input.id,
-        signal,
-      )) {
-        yield meta;
-      }
-    }),
-
-    onExit: t.terminal.onExit.handler(async function* ({ input, signal }) {
-      requireTerminal(input.id);
-      for await (const exitCode of subscribeForTerminal_(
-        "exit",
-        input.id,
-        signal,
-      )) {
-        yield exitCode;
-        return;
-      }
-    }),
   },
   git: {
     worktreeCreate: t.git.worktreeCreate.handler(async ({ input }) => {
@@ -399,111 +235,6 @@ export const appRouter = t.router({
     worktreeRemove: t.git.worktreeRemove.handler(async ({ input }) => {
       log.info({ worktree: input.worktreePath }, "worktree remove");
       unwrapGit(await worktreeRemove(input.worktreePath, log));
-    }),
-    onStatusChange: t.git.onStatusChange.handler(async function* ({
-      input,
-      signal,
-    }) {
-      yield* streamSnapshots(
-        async () => unwrapGit(await getStatus(input.repoPath, input.mode, log)),
-        gitStatusOutputEqual,
-        (cb) => subscribeRepoChange(input.repoPath, cb, log),
-        signal,
-      );
-    }),
-    onDiffChange: t.git.onDiffChange.handler(async function* ({
-      input,
-      signal,
-    }) {
-      yield* streamSnapshots(
-        async () =>
-          unwrapGit(
-            await getDiff(
-              input.repoPath,
-              input.filePath,
-              input.mode,
-              log,
-              input.oldPath,
-            ),
-          ),
-        gitDiffOutputEqual,
-        (cb) => subscribeRepoChange(input.repoPath, cb, log),
-        signal,
-      );
-    }),
-  },
-  fs: {
-    onListAllChange: t.fs.onListAllChange.handler(async function* ({
-      input,
-      signal,
-    }) {
-      yield* streamSnapshots(
-        async () => ({ paths: unwrapGit(await listAll(input.repoPath, log)) }),
-        fsListAllOutputEqual,
-        (cb) => subscribeRepoChange(input.repoPath, cb, log),
-        signal,
-      );
-    }),
-    onReadFileChange: t.fs.onReadFileChange.handler(async function* ({
-      input,
-      signal,
-    }) {
-      yield* streamSnapshots(
-        async () =>
-          unwrapGit(await readFile(input.repoPath, input.filePath, log)),
-        fsReadFileOutputEqual,
-        (cb) => subscribeFileChange(input.repoPath, input.filePath, cb, log),
-        signal,
-      );
-    }),
-  },
-  preferences: {
-    get: t.preferences.get.handler(async function* ({ signal }) {
-      yield getPreferences();
-      for await (const prefs of subscribeSystem_(
-        "preferences:changed",
-        signal,
-      )) {
-        yield prefs;
-      }
-    }),
-    update: t.preferences.update.handler(async ({ input }) => {
-      // Log only patched keys — values may carry user-identifying state.
-      log.info(
-        {
-          keys: Object.keys(input),
-          rightPanel: input.rightPanel
-            ? Object.keys(input.rightPanel)
-            : undefined,
-        },
-        "preferences update",
-      );
-      updatePreferences(input);
-    }),
-    test__set: t.preferences.test__set.handler(async ({ input }) => {
-      setPreferencesForTest(input);
-    }),
-  },
-  activity: {
-    get: t.activity.get.handler(async function* ({ signal }) {
-      yield getActivityFeed();
-      for await (const feed of subscribeSystem_("activity:changed", signal)) {
-        yield feed;
-      }
-    }),
-    test__set: t.activity.test__set.handler(async ({ input }) => {
-      setActivityForTest(input);
-    }),
-  },
-  session: {
-    get: t.session.get.handler(async function* ({ signal }) {
-      yield getSavedSession();
-      for await (const session of subscribeSystem_("session:changed", signal)) {
-        yield session;
-      }
-    }),
-    test__set: t.session.test__set.handler(async ({ input }) => {
-      setSavedSession(input);
     }),
   },
 });

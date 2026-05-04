@@ -1,55 +1,120 @@
 /**
  * oRPC contract: defines the typed API shape shared by server and client.
  *
- * Server implements this contract. Client uses the contract type
- * for end-to-end type safety without importing server code.
+ * The typed reactive layer lives in `./surface` (`defineSurface(...)`) and
+ * appears at `surface.<key>.<verb>` on the wire. Raw procedures that don't
+ * fit a surface primitive — terminal lifecycle, attach (streaming with
+ * custom retry), git mutations, server info — live here, hand-listed,
+ * spread alongside `surface.contract` at the host router.
+ *
+ * The procedure I/O schemas this contract consumes are declared in this
+ * file. Schemas shared with the surface layer (TerminalAttachInputSchema,
+ * TerminalIdSchema, etc.) live in `./surface` and are imported here.
  */
+
 import { eventIterator, oc } from "@orpc/contract";
-import { z } from "zod";
 import {
-  ActivityFeedSchema,
-  ExportTranscriptHtmlInputSchema,
-  ExportTranscriptHtmlOutputSchema,
-  FsListAllInputSchema,
-  FsListAllOutputSchema,
-  FsReadFileInputSchema,
-  FsReadFileOutputSchema,
-  GitDiffInputSchema,
-  GitDiffOutputSchema,
-  GitStatusInputSchema,
-  GitStatusOutputSchema,
-  PreferencesPatchSchema,
-  PreferencesSchema,
-  SavedSessionSchema,
-  ServerInfoSchema,
-  SetActiveTerminalInputSchema,
-  TerminalAttachInputSchema,
-  TerminalAttachOutputSchema,
-  TerminalCreateInputSchema,
-  TerminalInfoSchema,
-  TerminalMetadataSchema,
-  TerminalOnExitOutputSchema,
-  TerminalPasteImageInputSchema,
-  TerminalResizeInputSchema,
-  TerminalScreenTextInputSchema,
-  TerminalSendInputSchema,
-  TerminalSetCanvasLayoutInputSchema,
-  TerminalSetParentInputSchema,
-  TerminalSetSubPanelInputSchema,
-  TerminalSetThemeInputSchema,
   WorktreeCreateInputSchema,
   WorktreeCreateOutputSchema,
   WorktreeRemoveInputSchema,
-} from "./index";
+} from "kolu-git/schemas";
+import { z } from "zod";
+import {
+  CanvasLayoutSchema,
+  InitialTerminalMetadataSchema,
+  surface,
+  TerminalAttachInputSchema,
+  TerminalIdSchema,
+  TerminalInfoSchema,
+} from "./surface";
+import {
+  ExportTranscriptHtmlInputSchema,
+  ExportTranscriptHtmlOutputSchema,
+} from "./transcript";
+
+// ── Raw oRPC procedure I/O schemas ────────────────────────────────────
+
+export const TerminalCreateInputSchema = z
+  .object({
+    cwd: z.string().optional(),
+    parentId: TerminalIdSchema.optional(),
+  })
+  .merge(InitialTerminalMetadataSchema);
+
+export const TerminalResizeInputSchema = z.object({
+  id: TerminalIdSchema,
+  cols: z.number(),
+  rows: z.number(),
+});
+
+export const TerminalSendInputSchema = z.object({
+  id: TerminalIdSchema,
+  data: z.string(),
+});
+
+export const TerminalSetThemeInputSchema = z.object({
+  id: TerminalIdSchema,
+  themeName: z.string(),
+});
+
+export const TerminalSetCanvasLayoutInputSchema = z.object({
+  id: TerminalIdSchema,
+  layout: CanvasLayoutSchema,
+});
+
+export const TerminalSetSubPanelInputSchema = z.object({
+  id: TerminalIdSchema,
+  collapsed: z.boolean(),
+  panelSize: z.number(),
+});
+
+export const SetActiveTerminalInputSchema = z.object({
+  id: TerminalIdSchema.nullable(),
+});
+
+export const TerminalAttachOutputSchema = z.string();
+
+export const TerminalScreenTextInputSchema = z.object({
+  id: TerminalIdSchema,
+  /** First line to capture (0-based, inclusive). Defaults to 0 (start of scrollback). */
+  startLine: z.number().int().nonnegative().optional(),
+  /** Last line to capture (exclusive). Defaults to buffer length. */
+  endLine: z.number().int().nonnegative().optional(),
+});
+
+export const TerminalPasteImageInputSchema = z.object({
+  id: TerminalIdSchema,
+  /** Base64-encoded image data (PNG, JPEG, etc.) */
+  data: z.string(),
+});
+
+export const TerminalSetParentInputSchema = z.object({
+  id: TerminalIdSchema,
+  parentId: TerminalIdSchema.nullable(),
+});
+
+export const ServerIdentitySchema = z.object({
+  hostname: z.string(),
+  name: z.string(),
+  themeColor: z.string(),
+});
+export type ServerIdentity = z.infer<typeof ServerIdentitySchema>;
+
+export const ServerInfoSchema = z.object({
+  identity: ServerIdentitySchema,
+  /** Unique ID for this server process — changes on restart. */
+  processId: z.string().uuid(),
+});
+
+// ── The contract ──────────────────────────────────────────────────────
 
 export const contract = oc.router({
+  ...surface.contract,
   server: {
     info: oc.output(ServerInfoSchema),
   },
   terminal: {
     create: oc.input(TerminalCreateInputSchema).output(TerminalInfoSchema),
-    // Stream terminal list changes (create/kill). Yields current list immediately.
-    list: oc.output(eventIterator(z.array(TerminalInfoSchema))),
     resize: oc.input(TerminalResizeInputSchema).output(z.void()),
     sendInput: oc.input(TerminalSendInputSchema).output(z.void()),
     setTheme: oc.input(TerminalSetThemeInputSchema).output(z.void()),
@@ -58,31 +123,21 @@ export const contract = oc.router({
       .output(z.void()),
     setSubPanel: oc.input(TerminalSetSubPanelInputSchema).output(z.void()),
     setActive: oc.input(SetActiveTerminalInputSchema).output(z.void()),
+    /** Bidirectional binary stream — clients use `streamCall` with a
+     *  custom `onRetry` (xterm buffer reset before re-subscribe). Doesn't
+     *  fit a surface primitive; stays raw. */
     attach: oc
       .input(TerminalAttachInputSchema)
       .output(eventIterator(TerminalAttachOutputSchema)),
-    onExit: oc
-      .input(TerminalAttachInputSchema)
-      .output(eventIterator(TerminalOnExitOutputSchema)),
-    // Snapshot of headless xterm screen state (VT sequences) for a terminal
     screenState: oc.input(TerminalAttachInputSchema).output(z.string()),
-    // Plain text content of the terminal buffer (scrollback + viewport)
     screenText: oc.input(TerminalScreenTextInputSchema).output(z.string()),
-    // Stream terminal metadata changes (CWD, git, PR, etc.). Yields current state immediately.
-    onMetadataChange: oc
-      .input(TerminalAttachInputSchema)
-      .output(eventIterator(TerminalMetadataSchema)),
-    // Save image data to the terminal's clipboard shim for Ctrl+V paste
     pasteImage: oc.input(TerminalPasteImageInputSchema).output(z.void()),
-    // Kill a single terminal
     kill: oc.input(TerminalAttachInputSchema).output(TerminalInfoSchema),
-    // Set or clear a terminal's parent (for orphan promotion)
     setParent: oc.input(TerminalSetParentInputSchema).output(z.void()),
-    // Kill and remove all terminals (test-only: reset server state between scenarios)
+    /** Test-only: kill and remove all terminals. */
     killAll: oc.output(z.void()),
-    // One-shot: read the active agent's transcript from disk and render
-    // a self-contained HTML export. Errors with PRECONDITION_FAILED if the
-    // terminal has no agent session attached.
+    /** One-shot: read the active agent's transcript from disk and render
+     *  a self-contained HTML export. */
     exportTranscriptHtml: oc
       .input(ExportTranscriptHtmlInputSchema)
       .output(ExportTranscriptHtmlOutputSchema),
@@ -92,56 +147,5 @@ export const contract = oc.router({
       .input(WorktreeCreateInputSchema)
       .output(WorktreeCreateOutputSchema),
     worktreeRemove: oc.input(WorktreeRemoveInputSchema).output(z.void()),
-    /** Stream changed-files list for the given mode (`local` = vs HEAD;
-     *  `branch` = vs merge-base with `origin/<defaultBranch>`). Yields
-     *  current state immediately, then a fresh full snapshot every time
-     *  the underlying repo state changes (HEAD, reflog, index, working
-     *  tree). Server dedups against the last yielded value. */
-    onStatusChange: oc
-      .input(GitStatusInputSchema)
-      .output(eventIterator(GitStatusOutputSchema)),
-    /** Stream unified diff for one file. Yields current diff, then a fresh
-     *  full snapshot whenever the repo state changes. Server dedups. */
-    onDiffChange: oc
-      .input(GitDiffInputSchema)
-      .output(eventIterator(GitDiffOutputSchema)),
-  },
-  fs: {
-    /** Stream the flat repo-relative path list (tracked + untracked-but-
-     *  not-ignored). Yields current list, then a fresh full snapshot on
-     *  every repo state change. Drives the Code-view's All-mode tree. */
-    onListAllChange: oc
-      .input(FsListAllInputSchema)
-      .output(eventIterator(FsListAllOutputSchema)),
-    /** Stream a file's UTF-8 content. Yields current content, then a
-     *  fresh full snapshot whenever the file or HEAD changes. Path-
-     *  traversal guarded. Drives the Code-view's All-mode body. */
-    onReadFileChange: oc
-      .input(FsReadFileInputSchema)
-      .output(eventIterator(FsReadFileOutputSchema)),
-  },
-  preferences: {
-    // Stream user preferences. Yields current value immediately, then on each change.
-    get: oc.output(eventIterator(PreferencesSchema)),
-    // Partial update — patch fields into current preferences. rightPanel is deep-merged.
-    update: oc.input(PreferencesPatchSchema).output(z.void()),
-    // Reset preferences (test-only: seed defaults between scenarios)
-    test__set: oc.input(PreferencesSchema).output(z.void()),
-  },
-  activity: {
-    // Stream the server-derived activity feed (recent repos + recent agents).
-    // Read-only for clients — server is the sole writer (trackRecentRepo / trackRecentAgent).
-    get: oc.output(eventIterator(ActivityFeedSchema)),
-    // Reset activity feed (test-only: clear MRU lists between scenarios)
-    test__set: oc.input(ActivityFeedSchema).output(z.void()),
-  },
-  session: {
-    // Stream the persisted saved-session blob (or null when none). Read-only —
-    // server writes via debounced autosave on terminal-list changes.
-    // The per-terminal `lastAgentCommand` field rides inside `SavedTerminal`
-    // and drives the resume offer in EmptyState.
-    get: oc.output(eventIterator(SavedSessionSchema.nullable())),
-    // Reset saved session (test-only: seed/clear between scenarios)
-    test__set: oc.input(SavedSessionSchema.nullable()).output(z.void()),
   },
 });

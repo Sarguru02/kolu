@@ -1,7 +1,8 @@
-/** Settings popover — reads and writes preferences via usePreferences directly.
- *  Only needs open/close state and trigger ref from the parent. */
+/** Settings popover — reads and writes preferences via the wire singletons
+ *  (`preferences()` / `updatePreferences(...)`). Only needs open/close state
+ *  and trigger ref from the parent. */
 
-import type { Preferences } from "kolu-common";
+import type { Preferences } from "kolu-common/surface";
 import { type Component, Show } from "solid-js";
 import { Portal } from "solid-js/web";
 import SegmentedControl, {
@@ -11,7 +12,7 @@ import Toggle from "../ui/Toggle";
 import { useAnchoredPopover } from "../ui/useAnchoredPopover";
 import SettingRow, { type Hint } from "./SettingRow";
 import { type ColorScheme, useColorScheme } from "./useColorScheme";
-import { usePreferences } from "./usePreferences";
+import { preferences, updatePreferences } from "../wire";
 
 const SCHEME_OPTIONS: readonly SegmentedControlOption<ColorScheme>[] = [
   { value: "light", label: "Light" },
@@ -54,7 +55,6 @@ const SettingsPopover: Component<{
   onOpenChange: (open: boolean) => void;
   triggerRef?: HTMLElement;
 }> = (props) => {
-  const { preferences, updatePreferences } = usePreferences();
   const { colorScheme, setColorScheme } = useColorScheme();
 
   const { panelRef, panelStyle } = useAnchoredPopover({

@@ -14,7 +14,8 @@
  * tree layout/virtualization; `@pierre/diffs` owns diff parsing and
  * shiki highlighting. This component is just data flow + chrome. */
 
-import type { CodeTabView, GitDiffMode, TerminalMetadata } from "kolu-common";
+import type { GitDiffMode } from "kolu-git/schemas";
+import type { CodeTabView, TerminalMetadata } from "kolu-common/surface";
 import {
   type Component,
   createEffect,
@@ -26,9 +27,8 @@ import {
   Switch,
 } from "solid-js";
 import { toast } from "solid-sonner";
-import { createReactiveSubscription } from "../rpc/createReactiveSubscription";
-import { stream } from "../rpc/rpc";
 import { useColorScheme } from "../settings/useColorScheme";
+import { app } from "../wire";
 import { FileBrowseIcon, FileDiffIcon, GitBranchIcon } from "../ui/Icons";
 import PierreDiffView from "../ui/PierreDiffView";
 import PierreFileTree, { toGitStatusEntries } from "../ui/PierreFileTree";
@@ -69,30 +69,28 @@ const CodeTab: Component<{ meta: TerminalMetadata | null }> = (props) => {
   // mode switch so a stale needle doesn't hide the wrong file set.
   const [searchQuery, setSearchQuery] = createSignal("");
 
-  const status = createReactiveSubscription(
+  const status = app.streams.gitStatus.use(
     () => {
       const p = repoPath();
       const m = diffMode();
       return p && m ? { repoPath: p, mode: m } : null;
     },
-    (input, signal) => stream.gitStatus(input.repoPath, input.mode, signal),
     {
       onError: (err) => toast.error(`Git status stream: ${err.message}`),
     },
   );
 
-  const allPaths = createReactiveSubscription(
+  const allPaths = app.streams.fsListAll.use(
     () => {
       const p = repoPath();
       return p && view() === "browse" ? { repoPath: p } : null;
     },
-    (input, signal) => stream.fsListAll(input.repoPath, signal),
     {
       onError: (err) => toast.error(`File list stream: ${err.message}`),
     },
   );
 
-  const diff = createReactiveSubscription(
+  const diff = app.streams.gitDiff.use(
     () => {
       const p = repoPath();
       const s = selectedPath();
@@ -102,7 +100,6 @@ const CodeTab: Component<{ meta: TerminalMetadata | null }> = (props) => {
       if (!file) return null;
       return { repoPath: p, filePath: s, mode: m, oldPath: file.oldPath };
     },
-    (input, signal) => stream.gitDiff(input, signal),
     {
       onError: (err) => toast.error(`Git diff stream: ${err.message}`),
     },

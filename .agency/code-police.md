@@ -6,6 +6,36 @@ Kolu-specific rules layered on top of the base `code-police` skill — read by `
 
 These rules extend the base code-police skill with Kolu-specific patterns. They are checked during Pass 1 (rule checklist) alongside the generic rules.
 
+### no-re-export-bridge-modules
+
+A module whose entire body is `export … from "another-package"` (no
+locally-defined values, types, or doc) must not exist. Consumers should
+import directly from the source.
+
+Bad: a `kolu-common/integrations.ts` that just re-exports `GitInfoSchema`,
+`PrResultSchema`, `ClaudeCodeInfoSchema`, … from their respective
+integration packages. Or a `kolu-common/pr.ts` whose only content is
+`export … from "kolu-github/schemas"`. Both create a fake fan-in: the
+consumer's import path lies about where the symbol lives.
+
+Good: consumers `import { GitInfo } from "kolu-git/schemas"` directly.
+The integration package is the source of truth; one place to grep.
+
+_Allowed_: a module that re-exports AND adds local content (a curated
+narrow surface plus locally-defined helpers, schemas, or documented
+boundary semantics). A pure re-export with a comment explaining "this
+exists to avoid X bundling" is still a bridge — fix the underlying
+issue (subpath the source package exposes for browser-safe types) or
+let consumers reach for the source directly.
+
+_Rationale_: re-export bridges add an indirection that consumers and
+tools have to chase, drift over time (the bridge's set of re-exports
+goes stale relative to the source), and create the illusion that
+`kolu-common` owns concepts it doesn't. The `kolu-common` package
+should hold things that are genuinely shared across the host app and
+have no other natural home — not be a barrel for every external
+schema the app happens to use.
+
 ### subscription-use-pending
 
 Never check `sub() === undefined` as a proxy for loading — use `sub.pending()`.
@@ -141,6 +171,51 @@ _Good_:
 log?.info({ dir }, "claude-code: dir watcher installed");
 log?.info({ dir }, "claude-code: dir watcher retired");
 ```
+
+### silent-handler-required-on-void-subscriptions
+
+When a hook or subscription primitive returns `void` (no `Subscription<T>` / `error()` accessor / `Result<T,E>` exposed in the result type), its error handler must be **required** at the type level — not optional. A void-returning subscription with optional `onError` silently swallows lifecycle failures: the source dies, the consumer never re-fires, no UI surface, no console warning, nothing.
+
+Bad:
+```ts
+function useEvent(...): void {
+  // catch (err) { if (options?.onError) options.onError(...); }
+}
+```
+
+Good:
+```ts
+function useEvent(..., options: { onError: (err) => void; ... }): void {
+  // catch (err) { options.onError(...); }
+}
+```
+
+_Rationale_: a hook returning `Subscription<T>` with `.error()` lets consumers read the error reactively and render it — optional `onError` is fine there. Void return with no error surface in the result type is a category mismatch; the type system has to require the handler or the failure is invisible by construction. Codified after `useEvent.onError` and `pollOnEvent.onReadError` were tightened to required in `@kolu/surface`.
+
+### migration-shape-guard
+
+A `Conf` (or analogous schema) migration that acts on a specific value shape must early-return when the on-disk shape doesn't match its preconditions. Never write transient orphan fields that subsequent migrations are expected to destructure-out.
+
+Bad:
+```ts
+"1.8.0": (store) => {
+  const tab = rp.tab;
+  // fires on undefined too — adds a `tab` orphan to the new flat shape
+  const stale = tab !== "inspector" && tab !== "review";
+  if (stale) store.set(..., { rightPanel: { ...rp, tab: "inspector" } });
+}
+```
+
+Good:
+```ts
+"1.8.0": (store) => {
+  if (typeof rp.tab !== "string") return;  // skip shapes this migration doesn't recognize
+  const stale = rp.tab !== "inspector" && rp.tab !== "review";
+  if (stale) store.set(..., { rightPanel: { ...rp, tab: "inspector" } });
+}
+```
+
+_Rationale_: a migration that writes orphans assuming a downstream migration will clean them up couples migrations to each other — one can't be removed without breaking the next, and a fresh-install ladder accumulates write-then-strip cycles. The shape guard makes each migration idempotent on shapes it doesn't recognize. Caught when 1.13.0 destructured `codeMode` (a real new-schema field) alongside a `tab` orphan that 1.8.0 had spuriously written for fresh installs.
 
 ### icons-in-registry
 
