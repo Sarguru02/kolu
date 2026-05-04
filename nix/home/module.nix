@@ -85,9 +85,8 @@ in
       } // lib.optionalAttrs (cfg.diagnostics.dir != null) {
         Environment = [ "KOLU_DIAG_DIR=${cfg.diagnostics.dir}" ];
       };
-      Install = {
-        WantedBy = [ "default.target" ];
-      };
+
+        wantedBy = [ "default.target" ];
     };
   };
 }
