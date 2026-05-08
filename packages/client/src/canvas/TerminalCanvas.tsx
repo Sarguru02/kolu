@@ -28,6 +28,7 @@ import {
   For,
   type JSX,
   on,
+  onCleanup,
   Show,
 } from "solid-js";
 import { useTerminalStore } from "../terminal/useTerminalStore";
@@ -41,6 +42,7 @@ import {
   DEFAULT_TILE_W,
   findFreeTilePosition,
 } from "./tilePlacement";
+import { usePendingLayouts } from "./usePendingLayouts";
 import { useTileTheme } from "./useTileTheme";
 import { useViewPosture } from "./useViewPosture";
 import { capturePointerGesture } from "./viewport/capturePointerGesture";
@@ -56,10 +58,6 @@ function isWheelTargetTerminal(e: WheelEvent): boolean {
   return e.target instanceof Element && e.target.closest(".xterm") !== null;
 }
 
-function layoutsEqual(a: TileLayout, b: TileLayout): boolean {
-  return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
-}
-
 const TerminalCanvas: Component<{
   tileIds: TerminalId[];
   /** Optional corner watermark (e.g. `kolu@host`) painted in the
@@ -68,6 +66,30 @@ const TerminalCanvas: Component<{
   watermark?: string;
   /** Saved layout for a tile, or undefined if none exists yet. */
   getLayout: (id: TerminalId) => TileLayout | undefined;
+  /** Optional placement policy hook for new tiles. The canvas asks for a
+   *  position; if the hook returns one it's used, otherwise the default
+   *  cascade kicks in. `existing` is each currently-placed tile's
+   *  effective layout (pending merged with saved) plus tiles that the
+   *  same loop pass has just default-placed. The caller can't reconstruct
+   *  this from its own store: pending overrides live only inside the
+   *  canvas, and same-pass placements haven't round-tripped through the
+   *  server yet. */
+  placeNew?: (
+    id: TerminalId,
+    existing: { id: TerminalId; layout: TileLayout }[],
+  ) => TileLayout | undefined;
+  /** Optional one-shot arrange trigger. When provided, the minimap
+   *  zoom-bar grows an arrange button. The canvas is just plumbing —
+   *  the arrange logic itself lives in `useCanvasArrange`.
+   *
+   *  Threaded as a prop rather than consumed via a singleton hook
+   *  (the way `useCanvasViewport` and `usePendingLayouts` are read
+   *  inside `CanvasMinimap`) because `useCanvasArrange` takes
+   *  composition-root deps (`{ store, crud, viewport, isMobile }`) —
+   *  it's a function, not a zero-arg singleton. The prop captures
+   *  the bound result; the minimap doesn't know or care about the
+   *  arrange policy. */
+  onAutoArrange?: () => void;
   /** Report a layout change (drag commit, resize commit, default assignment). */
   onLayoutChange: (id: TerminalId, layout: TileLayout) => void;
   onSelect: (id: TerminalId) => void;
@@ -86,45 +108,33 @@ const TerminalCanvas: Component<{
   const tileTheme = useTileTheme();
   const posture = useViewPosture();
 
-  /** Pending per-tile layout overrides — used for three cases, all bridging
-   *  a gap until the server's metadata echo arrives:
-   *    1. Default-position seed: a new tile's cascade layout, so the first
-   *       paint isn't at (0,0) before the echo.
-   *    2. Drag commit: hold the drop position until getLayout catches up —
-   *       solid-dnd has already reset its transform to 0 by then.
-   *    3. Resize preview: live width/height during pointer-move; snapped
-   *       value on pointer-up until the server echoes the committed size.
-   *  Entries auto-clear when the echoed layout matches (effect below). */
-  const [pending, setPending] = createSignal<Record<string, TileLayout>>({});
+  /** Pending per-tile layout overrides — bridges the gap between local
+   *  geometry intent (drag-end, resize-end, default-place, arrange) and
+   *  the server metadata echo. Singleton hook so `useCanvasArrange` can
+   *  seed pending for one-shot arrange writes without an imperative ref
+   *  handshake. Entries auto-clear when the echoed layout matches
+   *  (effect below). */
+  const pendingLayouts = usePendingLayouts();
+  const setPendingLayout = (id: string, layout: TileLayout) =>
+    pendingLayouts.setOne(id, layout);
 
-  function setPendingLayout(id: string, layout: TileLayout) {
-    setPending((prev) => ({ ...prev, [id]: layout }));
-  }
-
+  // Drop pending entries for tiles that died OR whose echo caught up.
+  // The cleanup policy itself lives inside `usePendingLayouts` so the
+  // canvas only owns the trigger (tileIds + getLayout changes), not the
+  // rule. `getLayout` is captured in a stable closure so SolidJS's
+  // fine-grained tracking re-runs the effect when either input shifts.
   createEffect(() => {
-    const p = pending();
-    const alive = new Set(props.tileIds);
-    let changed = false;
-    const next: Record<string, TileLayout> = {};
-    for (const [id, layout] of Object.entries(p)) {
-      // Drop entries for removed tiles — metadata never arrives for them.
-      if (!alive.has(id)) {
-        changed = true;
-        continue;
-      }
-      const current = props.getLayout(id);
-      if (current && layoutsEqual(current, layout)) {
-        changed = true;
-      } else {
-        next[id] = layout;
-      }
-    }
-    if (changed) setPending(next);
+    pendingLayouts.dropEvicted(new Set(props.tileIds), props.getLayout);
   });
+
+  // Pending lives at module scope (singleton, shared with useCanvasArrange).
+  // Flush on canvas unmount so a mobile↔desktop remount never inherits a
+  // stale entry whose echo arrived while the canvas was gone.
+  onCleanup(() => pendingLayouts.clear());
 
   /** Effective layout for a tile (pending override wins over saved). */
   function layoutOf(id: string): TileLayout | undefined {
-    return pending()[id] ?? props.getLayout(id);
+    return pendingLayouts.pending[id] ?? props.getLayout(id);
   }
 
   /** Merged layouts keyed by tile ID — consumed by CanvasTile and CanvasMinimap. */
@@ -157,23 +167,46 @@ const TerminalCanvas: Component<{
         const zoom = viewport.zoom();
         const cx = viewport.panX() + width / (2 * zoom);
         const cy = viewport.panY() + height / (2 * zoom);
-        const placed: TileLayout[] = [];
+        const placed: {
+          id: TerminalId;
+          layout: TileLayout;
+          isNew: boolean;
+        }[] = [];
         for (const id of ids) {
           const existing = layoutOf(id);
           if (existing) {
-            placed.push(existing);
+            placed.push({ id, layout: existing, isNew: false });
             continue;
           }
-          const { x, y } = findFreeTilePosition(cx, cy, placed);
-          const defaultLayout: TileLayout = {
-            x,
-            y,
+          const fromPolicy = props.placeNew?.(
+            id,
+            placed.map(({ id, layout }) => ({ id, layout })),
+          );
+          const defaultLayout: TileLayout = fromPolicy ?? {
+            ...findFreeTilePosition(
+              cx,
+              cy,
+              placed.map((p) => p.layout),
+            ),
             w: DEFAULT_TILE_W,
             h: DEFAULT_TILE_H,
           };
           setPendingLayout(id, defaultLayout);
           props.onLayoutChange(id, defaultLayout);
-          placed.push(defaultLayout);
+          placed.push({ id, layout: defaultLayout, isNew: true });
+        }
+        // Recenter on the active newly-placed tile when there are
+        // already-placed siblings — covers "create a 2nd terminal that
+        // lands far from the current viewport (e.g. next to its repo
+        // island)". The first-mount case (no pre-existing siblings) is
+        // handled by the bbox-recenter effect below.
+        const activeId = store.activeId();
+        const hadExisting = placed.some((p) => !p.isNew);
+        const recenterOn = hadExisting
+          ? placed.find((p) => p.isNew && p.id === activeId)?.layout
+          : undefined;
+        if (recenterOn) {
+          requestAnimationFrame(() => viewport.centerOnTile(recenterOn));
         }
       },
     ),
@@ -242,7 +275,7 @@ const TerminalCanvas: Component<{
         onEnd: (ev) => {
           abortResize = null;
           // No motion — skip commit so a bare click doesn't round-trip the server.
-          if (!pending()[id]) return;
+          if (!pendingLayouts.pending[id]) return;
           const { dx, dy } = viewport.normalizeDelta(
             ev.clientX - startX,
             ev.clientY - startY,
@@ -375,6 +408,7 @@ const TerminalCanvas: Component<{
             tileIds={props.tileIds}
             layouts={layouts()}
             onSelect={props.onSelect}
+            onAutoArrange={props.onAutoArrange}
             onStartTileDrag={(id) => {
               const origin = layoutOf(id);
               if (!origin) return null;

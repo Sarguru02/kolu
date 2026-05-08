@@ -191,34 +191,50 @@ Then(
   },
 );
 
-Then(
-  "the newest canvas tile should be centered in the viewport",
-  async function (this: KoluWorld) {
-    await this.page.waitForFunction(
-      (sel: string) => {
-        const container = document.querySelector(sel);
-        if (!container) return false;
+/** Poll until the picked tile's bounding-box center matches the canvas
+ *  container's center within grid-snap tolerance. `pick` chooses which
+ *  tile: "newest" = last in DOM order (waits for ≥2 to exist),
+ *  "active" = the one carrying `data-active="true"`. */
+async function waitForTileCenteredInViewport(
+  world: KoluWorld,
+  pick: "newest" | "active",
+) {
+  await world.page.waitForFunction(
+    ({ sel, pick }: { sel: string; pick: "newest" | "active" }) => {
+      const container = document.querySelector(sel);
+      if (!container) return false;
+      let tile: HTMLElement | null;
+      if (pick === "newest") {
         const tiles = container.querySelectorAll(
           "[data-terminal-id][data-visible]",
         );
         if (tiles.length < 2) return false;
-        const tile = tiles[tiles.length - 1] as HTMLElement;
-        const cRect = container.getBoundingClientRect();
-        const tRect = tile.getBoundingClientRect();
-        // Tile center vs container center — allow tolerance for grid snapping
-        const tileCx = tRect.left + tRect.width / 2 - cRect.left;
-        const tileCy = tRect.top + tRect.height / 2 - cRect.top;
-        const viewCx = cRect.width / 2;
-        const viewCy = cRect.height / 2;
-        const tolerance = 40; // grid snap (24px) + rounding
-        return (
-          Math.abs(tileCx - viewCx) < tolerance &&
-          Math.abs(tileCy - viewCy) < tolerance
-        );
-      },
-      CANVAS_SELECTOR,
-      { timeout: POLL_TIMEOUT },
-    );
+        tile = tiles[tiles.length - 1] as HTMLElement;
+      } else {
+        tile = container.querySelector('[data-active="true"]');
+      }
+      if (!tile) return false;
+      const cRect = container.getBoundingClientRect();
+      const tRect = tile.getBoundingClientRect();
+      const tileCx = tRect.left + tRect.width / 2 - cRect.left;
+      const tileCy = tRect.top + tRect.height / 2 - cRect.top;
+      const viewCx = cRect.width / 2;
+      const viewCy = cRect.height / 2;
+      const tolerance = 40; // grid snap (24px) + rounding
+      return (
+        Math.abs(tileCx - viewCx) < tolerance &&
+        Math.abs(tileCy - viewCy) < tolerance
+      );
+    },
+    { sel: CANVAS_SELECTOR, pick },
+    { timeout: POLL_TIMEOUT },
+  );
+}
+
+Then(
+  "the newest canvas tile should be centered in the viewport",
+  async function (this: KoluWorld) {
+    await waitForTileCenteredInViewport(this, "newest");
   },
 );
 
@@ -250,6 +266,155 @@ Then(
         return Math.abs(rA.left - rB.left) > 1 && Math.abs(rA.top - rB.top) > 1;
       },
       { sel: CANVAS_SELECTOR, i: a - 1, j: b - 1 },
+      { timeout: POLL_TIMEOUT },
+    );
+  },
+);
+
+Then(
+  "canvas tile {int} should be to the right of and in the same row as canvas tile {int}",
+  async function (this: KoluWorld, a: number, b: number) {
+    await this.page.waitForFunction(
+      ({ sel, i, j }: { sel: string; i: number; j: number }) => {
+        const tiles = document.querySelectorAll(
+          `${sel} [data-terminal-id][data-visible]`,
+        );
+        const tileA = tiles.item(i) as HTMLElement | null;
+        const tileB = tiles.item(j) as HTMLElement | null;
+        if (!tileA || !tileB) return false;
+        const rA = tileA.getBoundingClientRect();
+        const rB = tileB.getBoundingClientRect();
+        // Same row: tops match (sub-pixel rounding tolerance); the
+        // subject tile (A) sits to the right of the reference (B).
+        return Math.abs(rA.top - rB.top) <= 2 && rA.left > rB.left;
+      },
+      { sel: CANVAS_SELECTOR, i: a - 1, j: b - 1 },
+      { timeout: POLL_TIMEOUT },
+    );
+  },
+);
+
+Then(
+  "the active canvas tile should be centered in the viewport",
+  async function (this: KoluWorld) {
+    await waitForTileCenteredInViewport(this, "active");
+  },
+);
+
+Then(
+  "arrange should have seeded pending overrides for all current tiles",
+  async function (this: KoluWorld) {
+    // Architectural invariant: `useCanvasArrange.handleCanvasAutoArrange`
+    // calls `pendingLayouts.applyMany(arranged)` synchronously inside
+    // the click handler. Without that call, a new terminal (worktree)
+    // created right after arrange resolves `placeNew(existing)` against
+    // pre-arrange layouts and overlaps the cluster — a race a polled
+    // tile-position assertion can't catch because metadata echoes
+    // arrive within its polling window.
+    //
+    // We assert against the append-only `__koluPendingApplyHistory`
+    // hook rather than the live pending store, because under CI load
+    // the cleanup effect (`dropEvicted`) can fire faster than the
+    // polling can observe the seeded window. The history survives the
+    // cleanup; what we care about is that `applyMany` was called for
+    // every visible tile.
+    await this.page.waitForFunction(
+      () => {
+        const ids = Array.from(
+          document.querySelectorAll(
+            "[data-testid='canvas-container'] [data-terminal-id][data-visible]",
+          ),
+        )
+          .map((el) => (el as HTMLElement).getAttribute("data-terminal-id"))
+          .filter((id): id is string => id !== null);
+        const history = window.__koluPendingApplyHistory ?? [];
+        if (ids.length === 0 || history.length === 0) return false;
+        const seeded = new Set(history.flat());
+        return ids.every((id) => seeded.has(id));
+      },
+      undefined,
+      { timeout: POLL_TIMEOUT },
+    );
+  },
+);
+
+When("I click the minimap arrange button", async function (this: KoluWorld) {
+  const button = this.page.locator('[data-testid="minimap-arrange"]');
+  await button.waitFor({ state: "visible", timeout: POLL_TIMEOUT });
+  await button.click();
+  await this.waitForFrame();
+});
+
+Then("no two canvas tiles should overlap", async function (this: KoluWorld) {
+  await this.page.waitForFunction(
+    (sel: string) => {
+      const tiles = Array.from(
+        document.querySelectorAll(`${sel} [data-terminal-id][data-visible]`),
+      ).map((t) => {
+        const wrapper = (t as HTMLElement).closest(
+          "[style*='left']",
+        ) as HTMLElement | null;
+        return (wrapper ?? (t as HTMLElement)).getBoundingClientRect();
+      });
+      for (let i = 0; i < tiles.length; i++) {
+        for (let j = i + 1; j < tiles.length; j++) {
+          const a = tiles[i];
+          const b = tiles[j];
+          if (!a || !b) continue;
+          // 2 px tolerance: tiles touching at exact grid edges shouldn't
+          // count as overlapping.
+          const overlapX = a.left < b.right - 2 && a.right - 2 > b.left;
+          const overlapY = a.top < b.bottom - 2 && a.bottom - 2 > b.top;
+          if (overlapX && overlapY) return false;
+        }
+      }
+      return true;
+    },
+    CANVAS_SELECTOR,
+    { timeout: POLL_TIMEOUT },
+  );
+});
+
+When("I save the active canvas tile id", async function (this: KoluWorld) {
+  const id = await this.page.evaluate((sel: string) => {
+    const tile = document
+      .querySelector(sel)
+      ?.querySelector('[data-active="true"]');
+    return (
+      tile
+        ?.querySelector("[data-terminal-id]")
+        ?.getAttribute("data-terminal-id") ??
+      tile?.getAttribute("data-terminal-id") ??
+      null
+    );
+  }, CANVAS_SELECTOR);
+  if (!id) throw new Error("No active canvas tile to save");
+  this.savedActiveTerminalId = id;
+});
+
+Then(
+  "the saved active canvas tile should still be active",
+  async function (this: KoluWorld) {
+    const saved = this.savedActiveTerminalId;
+    if (!saved) throw new Error("No saved active canvas tile id");
+    await this.page.waitForFunction(
+      ({ sel, savedId }: { sel: string; savedId: string }) => {
+        // The active tile's CanvasTile wrapper carries data-active="true".
+        // Its inner Terminal element carries data-terminal-id. Walk down
+        // from the active wrapper rather than checking every tile —
+        // that makes "did active flip to a different tile" the failure
+        // mode, not "is savedId still in the DOM" (it always is).
+        const activeWrapper = document
+          .querySelector(sel)
+          ?.querySelector('[data-active="true"]');
+        if (!activeWrapper) return false;
+        const inner = activeWrapper.querySelector("[data-terminal-id]");
+        const activeId =
+          inner?.getAttribute("data-terminal-id") ??
+          activeWrapper.getAttribute("data-terminal-id");
+        return activeId === savedId;
+      },
+      { sel: CANVAS_SELECTOR, savedId: saved },
       { timeout: POLL_TIMEOUT },
     );
   },

@@ -40,6 +40,15 @@ declare global {
      *  patches `WebSocket.prototype.send` once per scenario; subsequent
      *  steps `evaluate` and read this array. */
     __wsSent?: string[];
+
+    /** Append-only history of every `pendingLayouts.applyMany(...)`
+     *  call — set by `usePendingLayouts`. Each entry records the ids
+     *  the call seeded. E2e tests use this to assert that arrange
+     *  seeded pending synchronously without depending on the read
+     *  hitting the brief window before `dropEvicted` clears entries
+     *  (which under CI load can be shorter than the polling
+     *  interval). The history survives the cleanup. */
+    __koluPendingApplyHistory?: string[][];
   }
 
   /** Structural subset of `xterm.Terminal` that e2e steps read off the

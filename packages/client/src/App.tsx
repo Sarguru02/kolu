@@ -24,6 +24,7 @@ import CloseConfirm, { type CloseConfirmTarget } from "./CloseConfirm";
 import CommandPalette from "./CommandPalette";
 import "kolu-common/test-hooks";
 import CanvasWatermark from "./canvas/CanvasWatermark";
+import { useCanvasArrange } from "./canvas/useCanvasArrange";
 import WorkspaceSwitcher, {
   buildWorkspaceEntries,
   buildWorkspaceSwitcherModel,
@@ -181,6 +182,13 @@ const App: Component = () => {
     if (tile) canvasViewport.centerOnTile(tile);
   }
 
+  const arrange = useCanvasArrange({
+    store,
+    crud,
+    viewport: canvasViewport,
+    isMobile,
+  });
+
   // Shared between the keyboard dispatcher and the command palette so a single
   // wiring keeps both surfaces in sync. Palette-only deps (theme management,
   // dialog setters, debug, etc.) are added below in the createCommands call.
@@ -277,6 +285,7 @@ const App: Component = () => {
     simulateAlert: alerts.simulateAlert,
     isMobile,
     canvasCenterActive: handleCanvasCenterActive,
+    canvasAutoArrange: arrange.handleCanvasAutoArrange,
   });
 
   // Reset state on close and return focus to terminal
@@ -538,9 +547,9 @@ const App: Component = () => {
                     tileIds={store.terminalIds()}
                     watermark={appTitle()}
                     getLayout={(id) => store.getMetadata(id)?.canvasLayout}
-                    onLayoutChange={(id, layout) =>
-                      crud.setCanvasLayout(id, layout)
-                    }
+                    placeNew={arrange.placeNew}
+                    onLayoutChange={arrange.applyTileGeometry}
+                    onAutoArrange={arrange.handleCanvasAutoArrange}
                     onSelect={(id) => store.setActiveId(id)}
                     onClose={(id) => closeTerminal(id)}
                     renderTileTitle={(id) => (

@@ -79,6 +79,7 @@ export interface CommandDeps extends ActionContext {
   // the canvas isn't mounted at all.
   isMobile: () => boolean;
   canvasCenterActive: () => void;
+  canvasAutoArrange: () => void;
   // Worktree
   handleCreateWorktree: (
     repoPath: string,
@@ -174,6 +175,18 @@ export function createCommands(deps: CommandDeps): Accessor<PaletteCommand[]> {
             name: "Center on active tile",
             onSelect: () => deps.canvasCenterActive(),
           },
+          // Hide arrange when only one tile exists — a single-tile arrange
+          // is a visual no-op, and offering a command that does nothing
+          // surfaces as broken.
+          ...(deps.terminalIds().length > 1
+            ? [
+                {
+                  kind: "action" as const,
+                  name: "Arrange canvas by repo",
+                  onSelect: () => deps.canvasAutoArrange(),
+                },
+              ]
+            : []),
         ]
       : []),
     ...(deps.terminalIds().length > 0
