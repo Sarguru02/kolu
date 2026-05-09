@@ -38,6 +38,8 @@ const CanvasTile: Component<{
    *  itself lives in the caller; the tile shell only honors the bit. */
   dimmed?: boolean;
   theme: TileTheme;
+  /** Per-repo identity color; drives the tile border. */
+  repoColor: string;
   onSelect: () => void;
   onClose: () => void;
   /** Toggle between tiled and maximized. Bound to title-bar double-click. */
@@ -77,6 +79,14 @@ const CanvasTile: Component<{
     width: `${layout().w}px`,
     height: `${layout().h}px`,
     "background-color": bg(),
+    "border-color": props.repoColor,
+    // Active tile's right edge points at the inspector panel — repoColor
+    // on the other three edges, accent on the right. Longhand wins after
+    // shorthand in the same declaration block.
+    "border-right-color":
+      props.active && !props.maximized
+        ? "var(--color-accent)"
+        : props.repoColor,
     "z-index": props.active ? 10 : 1,
     opacity: props.active ? 1 : inactiveOpacity(),
     "box-shadow": props.active
@@ -109,16 +119,7 @@ const CanvasTile: Component<{
         absolute: true,
         "inset-0 z-40": props.maximized,
         "rounded-xl": !props.maximized,
-        "border-accent/60 shadow-xl": props.active && !props.maximized,
-        // Active-tile right edge is the visual handshake to the right
-        // panel (the panel inspects this tile). The other three edges
-        // stay at accent/60 via the rule above; this overrides only the
-        // right edge to full accent so the cue reads asymmetrically as
-        // "this side points at the inspector." Sits in classList rather
-        // than tiledStyle() so it isn't re-evaluated on every drag tick.
-        "border-r-[var(--color-accent)]": props.active && !props.maximized,
-        "border-edge/40 hover:border-edge/60":
-          !props.active && !props.maximized,
+        "shadow-xl": props.active && !props.maximized,
         "border-transparent": props.maximized,
       }}
       style={props.maximized ? { "background-color": bg() } : tiledStyle()}

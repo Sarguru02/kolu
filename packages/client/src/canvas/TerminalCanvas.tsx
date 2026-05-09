@@ -360,28 +360,33 @@ const TerminalCanvas: Component<{
          *  and (for tiled) the active-state read derived from store. */}
         {(() => {
           const renderTile = (id: TerminalId, maximized: boolean) => (
-            <CanvasTile
-              id={id}
-              active={maximized || store.activeId() === id}
-              maximized={maximized}
-              dimmed={isStale(store.getMetadata(id)?.lastActivityAt ?? 0)}
-              theme={tileTheme(id)}
-              onSelect={() => props.onSelect(id)}
-              onClose={() => props.onClose(id)}
-              onToggleMaximize={posture.toggle}
-              renderTitle={() => props.renderTileTitle(id)}
-              renderTitleActions={
-                props.renderTileTitleActions
-                  ? () => props.renderTileTitleActions?.(id)
-                  : undefined
-              }
-              renderBody={() =>
-                props.renderTileBody(id, () => store.activeId() === id)
-              }
-              layouts={layouts()}
-              startResize={startResize}
-              zoom={viewport.zoom}
-            />
+            <Show when={store.getDisplayInfo(id)}>
+              {(info) => (
+                <CanvasTile
+                  id={id}
+                  active={maximized || store.activeId() === id}
+                  maximized={maximized}
+                  dimmed={isStale(store.getMetadata(id)?.lastActivityAt ?? 0)}
+                  theme={tileTheme(id)}
+                  repoColor={info().repoColor}
+                  onSelect={() => props.onSelect(id)}
+                  onClose={() => props.onClose(id)}
+                  onToggleMaximize={posture.toggle}
+                  renderTitle={() => props.renderTileTitle(id)}
+                  renderTitleActions={
+                    props.renderTileTitleActions
+                      ? () => props.renderTileTitleActions?.(id)
+                      : undefined
+                  }
+                  renderBody={() =>
+                    props.renderTileBody(id, () => store.activeId() === id)
+                  }
+                  layouts={layouts()}
+                  startResize={startResize}
+                  zoom={viewport.zoom}
+                />
+              )}
+            </Show>
           );
           return (
             <>
