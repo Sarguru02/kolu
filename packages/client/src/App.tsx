@@ -31,7 +31,6 @@ import WorkspaceSwitcher, {
 } from "./canvas/workspace-switcher";
 import TerminalCanvas from "./canvas/TerminalCanvas";
 import TileTitleActions from "./canvas/TileTitleActions";
-import { useCanvasViewport } from "./canvas/viewport/useCanvasViewport";
 import { createCommands } from "./commands";
 import DiagnosticInfo from "./DiagnosticInfo";
 import EmptyState from "./EmptyState";
@@ -80,7 +79,6 @@ const App: Component = () => {
   const subPanel = useSubPanel();
   const rightPanel = useRightPanel();
   const { colorScheme } = useColorScheme();
-  const canvasViewport = useCanvasViewport();
 
   // Workspace-switcher feeds — desktop and mobile share the same
   // accessors; `buildWorkspaceSwitcherModel` owns the ordering pipeline.
@@ -177,15 +175,12 @@ const App: Component = () => {
   function handleCanvasCenterActive() {
     if (isMobile()) return;
     const id = store.activeId();
-    if (!id) return;
-    const tile = store.getMetadata(id)?.canvasLayout;
-    if (tile) canvasViewport.centerOnTile(tile);
+    if (id) store.activate(id);
   }
 
   const arrange = useCanvasArrange({
     store,
     crud,
-    viewport: canvasViewport,
     isMobile,
   });
 
@@ -195,7 +190,7 @@ const App: Component = () => {
   const actionContext: ActionContext = {
     terminalIds: store.terminalIds,
     activeId: store.activeId,
-    setActiveId: store.setActiveId,
+    activate: store.activate,
     mruOrder: store.mruOrder,
     activeMeta: store.activeMeta,
     handleCreate: (cwd?: string) => void crud.handleCreate(cwd),
@@ -322,7 +317,7 @@ const App: Component = () => {
         }
         onCloseTerminal={closeTerminal}
         activeMeta={store.activeMeta()}
-        onFocus={() => store.setActiveId(id)}
+        onFocus={() => store.setActiveSilently(id)}
       />
     );
   }
@@ -479,11 +474,7 @@ const App: Component = () => {
               activeId={store.activeId()}
               getRecency={recencyOf}
               openRequest={workspaceSwitcherOpenRequest()}
-              onSelect={(id) => {
-                store.setActiveId(id);
-                const layout = store.getMetadata(id)?.canvasLayout;
-                if (layout) canvasViewport.centerOnTile(layout);
-              }}
+              onSelect={store.activate}
               onCreate={() => openPaletteGroup("New terminal")}
             />
           }
@@ -550,7 +541,7 @@ const App: Component = () => {
                     placeNew={arrange.placeNew}
                     onLayoutChange={arrange.applyTileGeometry}
                     onAutoArrange={arrange.handleCanvasAutoArrange}
-                    onSelect={(id) => store.setActiveId(id)}
+                    onSelect={store.setActiveSilently}
                     onClose={(id) => closeTerminal(id)}
                     renderTileTitle={(id) => (
                       <TerminalMeta info={store.getDisplayInfo(id)} />

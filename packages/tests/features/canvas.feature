@@ -53,6 +53,94 @@ Feature: Canvas workspace
     And canvas tile 3 should be below canvas tile 1 in the same column
     And no two canvas tiles should overlap
 
+  Scenario: Second terminal created at the default viewport is centered in the viewport
+    # Regression: with no prior pan, creating a 2nd tile placed it next to
+    # the existing tile but left the viewport centered on the original —
+    # so the new (active) tile rendered half off-screen.
+    Then there should be 1 canvas tile
+    When I create a terminal
+    Then there should be 2 canvas tiles
+    And the active canvas tile should be centered in the viewport
+
+  Scenario: Each successive terminal create centers the viewport on the new active tile
+    # Reported by user with a 5-tile screenshot: after creating multiple
+    # tiles in succession, the viewport stayed anchored on the original
+    # tile while the active jumped to the latest. The active (last-created)
+    # tile must end up centered, not just the first.
+    Then there should be 1 canvas tile
+    When I create a terminal
+    Then there should be 2 canvas tiles
+    And the active canvas tile should be centered in the viewport
+    When I create a terminal
+    Then there should be 3 canvas tiles
+    And the active canvas tile should be centered in the viewport
+    When I create a terminal
+    Then there should be 4 canvas tiles
+    And the active canvas tile should be centered in the viewport
+    When I create a terminal
+    Then there should be 5 canvas tiles
+    And the active canvas tile should be centered in the viewport
+
+  Scenario: Ctrl+Tab cycle pans the canvas to the newly-active tile
+    # Reported by user: cycling with Ctrl+Tab (or Alt+Tab on macOS Chrome)
+    # changed the active terminal but the viewport stayed put — the new
+    # active tile could land off-screen entirely.
+    Given I create a terminal
+    And I create a terminal
+    And I create a terminal
+    Then there should be 4 canvas tiles
+    When I press Control+Tab
+    Then the active canvas tile should be centered in the viewport
+
+  Scenario: Cmd+1 positional switch pans the canvas to the newly-active tile
+    Given I create a terminal
+    And I create a terminal
+    And I create a terminal
+    Then there should be 4 canvas tiles
+    When I press Control+1
+    Then the active canvas tile should be centered in the viewport
+
+  Scenario: Ctrl+Shift+] next-terminal pans the canvas to the newly-active tile
+    Given I create a terminal
+    And I create a terminal
+    And I create a terminal
+    Then there should be 4 canvas tiles
+    When I press Control+Shift+BracketRight
+    Then the active canvas tile should be centered in the viewport
+
+  Scenario: Command palette "Switch to terminal" pans the canvas to the newly-active tile
+    # Caught by hickey: commands.ts:207,212 spreads actionPaletteCommand then
+    # overrides onSelect with bare setActiveId(id), stripping the centering
+    # the action handler already does.
+    Given I create a terminal
+    And I create a terminal
+    And I create a terminal
+    Then there should be 4 canvas tiles
+    When I open the command palette
+    And I select "Switch terminal" in the palette
+    And I select "Switch to terminal 1" in the palette
+    Then the active canvas tile should be centered in the viewport
+
+  Scenario: First terminal created on an emptied canvas is centered in the viewport
+    Then there should be 1 canvas tile
+    When I scroll the wheel over the canvas background
+    Then the canvas transform should have changed
+    When I click the close button on canvas tile 1
+    Then the close confirmation should be visible
+    When I confirm close all in the close confirmation
+    Then there should be 0 canvas tiles
+    When I create a terminal
+    Then there should be 1 canvas tile
+    And the active canvas tile should be centered in the viewport
+
+  Scenario: Closing the active terminal pans the canvas to the auto-switched tile
+    Given I create a terminal
+    And I create a terminal
+    Then there should be 3 canvas tiles
+    When I close terminal 2 via tile close button
+    Then there should be 2 canvas tiles
+    And the active canvas tile should be centered in the viewport
+
   Scenario: Scroll on terminal does not pan the canvas
     When I record the canvas transform
     And I scroll the wheel over the terminal tile

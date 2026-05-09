@@ -89,7 +89,10 @@ export function useTerminalCrud(deps: {
     store.setMruOrder((prev) => prev.filter((x) => x !== id));
     if (store.activeId() === id) {
       const remaining = ids.filter((x) => x !== id);
-      store.setActiveId(remaining[Math.min(idx, remaining.length - 1)] ?? null);
+      const next = remaining[Math.min(idx, remaining.length - 1)] ?? null;
+      // `activate` pans the canvas to the auto-switched tile — without
+      // it the viewport would stay centered on the just-killed tile.
+      store.activate(next);
     }
   }
 
@@ -131,7 +134,10 @@ export function useTerminalCrud(deps: {
         toast.error(`Failed to create terminal: ${err.message}`);
         throw err;
       });
-    store.setActiveId(info.id);
+    // `setActiveSilently`: the canvas's cascade-placement effect bumps
+    // the centering signal once the new tile's pending layout is set —
+    // calling `activate` here would race the layout and read undefined.
+    store.setActiveSilently(info.id);
     deps.subscribeExit(info.id);
     showTipOnce(CONTEXTUAL_TIPS.themeSwitch);
     return info.id;

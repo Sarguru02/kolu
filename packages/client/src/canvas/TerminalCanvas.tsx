@@ -43,6 +43,7 @@ import {
   DEFAULT_TILE_W,
   findFreeTilePosition,
 } from "./tilePlacement";
+import { useCanvasFocus } from "./useCanvasFocus";
 import { usePendingLayouts } from "./usePendingLayouts";
 import { useTileTheme } from "./useTileTheme";
 import { useViewPosture } from "./useViewPosture";
@@ -113,6 +114,7 @@ const TerminalCanvas: Component<{
 }> = (props) => {
   const viewport = useCanvasViewport();
   const store = useTerminalStore();
+  const focus = useCanvasFocus();
   const tileTheme = useTileTheme();
   const posture = useViewPosture();
   const isStale = useStaleCheck();
@@ -204,18 +206,15 @@ const TerminalCanvas: Component<{
           props.onLayoutChange(id, defaultLayout);
           placed.push({ id, layout: defaultLayout, isNew: true });
         }
-        // Recenter on the active newly-placed tile when there are
-        // already-placed siblings — covers "create a 2nd terminal that
-        // lands far from the current viewport (e.g. next to its repo
-        // island)". The first-mount case (no pre-existing siblings) is
-        // handled by the bbox-recenter effect below.
+        // Pan to the active newly-placed tile. `activate` is a no-op
+        // setter when active is already this id (handleCreate already set
+        // it via setActiveSilently before the cascade ran) — the call's
+        // job here is bumping the centering signal once the new tile's
+        // pending layout exists. Same mechanism the `focus.request`
+        // effect below uses for every other system-driven activation.
         const activeId = store.activeId();
-        const hadExisting = placed.some((p) => !p.isNew);
-        const recenterOn = hadExisting
-          ? placed.find((p) => p.isNew && p.id === activeId)?.layout
-          : undefined;
-        if (recenterOn) {
-          requestAnimationFrame(() => viewport.centerOnTile(recenterOn));
+        if (activeId && placed.some((p) => p.isNew && p.id === activeId)) {
+          store.activate(activeId);
         }
       },
     ),
@@ -304,6 +303,22 @@ const TerminalCanvas: Component<{
       abortResize,
     );
   }
+
+  // No `defer: true`: the cascade effect bumps the signal during canvas
+  // mount and on a remount (close-all → re-create) it can register
+  // before this effect installs its tracker. Without defer the initial
+  // run sees the bumped payload; a stale id from a prior mount resolves
+  // to `layoutOf(id) === undefined` (the tile is gone) so the initial
+  // run is a safe no-op.
+  createEffect(
+    on(focus.request, (id) => {
+      if (!id) return;
+      const layout = layoutOf(id);
+      if (layout) {
+        requestAnimationFrame(() => viewport.centerOnTile(layout));
+      }
+    }),
+  );
 
   // On first mount at the default origin, pan so the persisted active tile
   // is centered (matches what a workspace-switcher click does). If there's no
