@@ -39,7 +39,9 @@ import {
   pierreIconConfig,
   pierreTreesStyle,
 } from "../ui/pierreTheme";
+import { resolveLineRefPath } from "../ui/lineRef";
 import BrowseFileView from "./BrowseFileView";
+import { pendingCodeOpen } from "./codeNavigation";
 import CodeMenuFrame from "./CodeMenuFrame";
 import { projectFileTreeSearch } from "./fileSearch";
 import FileSearchInput from "./FileSearchInput";
@@ -178,11 +180,104 @@ const CodeTab: Component<{ meta: TerminalMetadata | null }> = (props) => {
     on(
       resetKey,
       () => {
-        setSelectedPath(null);
         setSearchQuery("");
+        // Skip the selectedPath clear when an incoming request is
+        // about to land in the new mode — the resetKey effect runs
+        // before the pendingCodeOpen effect (registration order), and
+        // an unconditional clear would null what we're about to set.
+        // Reading `req.targetMode` (not `view()`) makes the guard
+        // robust to user-driven mode flips that race the click.
+        const req = pendingCodeOpen();
+        if (
+          req &&
+          req.repoRoot === repoPath() &&
+          req.targetMode === view() &&
+          handled()?.token !== req.token
+        ) {
+          return;
+        }
+        setSelectedPath(null);
       },
       { defer: true },
     ),
+  );
+
+  // Consume-once record for the latest pendingCodeOpen tick.
+  // Storing the resolved path here lets `selectedRange` derive its
+  // value without re-running `resolveLineRefPath` (single resolution
+  // site per request) and lets `resetKey` know whether a pending
+  // request has already been applied.
+  const [handled, setHandled] = createSignal<{
+    token: number;
+    resolvedPath: string | null;
+  } | null>(null);
+
+  // Honor terminal file-ref clicks. The effect waits for the live
+  // `fsListAll` stream to settle so resolution can validate against
+  // a complete file list — otherwise a request fired during boot
+  // would toast "not found" on a path that just hasn't been
+  // enumerated yet. The terminal click handler is the sole site that
+  // flips the panel to browse mode; this effect only sets
+  // `selectedPath`. The `resetKey` effect above guards against
+  // clearing selectedPath when this effect is about to set it.
+  createEffect(
+    on(
+      () => {
+        const req = pendingCodeOpen();
+        const paths = treePaths();
+        const isPending = allPaths.pending();
+        return { req, repo: repoPath(), paths, isPending };
+      },
+      ({ req, repo, paths, isPending }) => {
+        if (!req) return;
+        if (handled()?.token === req.token) return;
+        if (repo === null || repo !== req.repoRoot) return;
+        if (view() !== req.targetMode || isPending) return;
+        const rel = resolveLineRefPath({
+          rawPath: req.ref.path,
+          repoRoot: repo,
+          cwd: req.cwd,
+          repoPaths: paths,
+        });
+        if (rel === null) {
+          toast.error(`File reference not found: ${req.ref.path}`);
+          setHandled({ token: req.token, resolvedPath: null });
+          return;
+        }
+        setSelectedPath(rel);
+        setHandled({ token: req.token, resolvedPath: rel });
+      },
+      { defer: true },
+    ),
+  );
+
+  // Highlight range derives from the consume-once record: if the
+  // latest handled token matches the latest request AND its resolved
+  // path is still the rendered file, surface the line range. Any
+  // navigation away (user tree-click, mode switch) flips
+  // `selectedPath` and naturally invalidates the memo — no second
+  // resolution call.
+  const selectedRange = createMemo<{
+    start: number;
+    end: number;
+  } | null>(
+    () => {
+      const req = pendingCodeOpen();
+      if (!req) return null;
+      const h = handled();
+      if (!h || h.token !== req.token || h.resolvedPath === null) return null;
+      if (h.resolvedPath !== selectedPath()) return null;
+      return { start: req.ref.startLine, end: req.ref.endLine };
+    },
+    null,
+    {
+      // Same-value re-emits cause the line-selection controller to
+      // re-fire its initial-range effect with an identical object.
+      // Equality-gating here keeps the controller stable when the
+      // request hasn't actually changed.
+      equals: (a, b) =>
+        a === b || (!!a && !!b && a.start === b.start && a.end === b.end),
+    },
   );
 
   const treePaths = createMemo(() => {
@@ -232,7 +327,20 @@ const CodeTab: Component<{ meta: TerminalMetadata | null }> = (props) => {
     // ignore null and only honor explicit non-null selections. Keeping
     // the previous signal value through Pierre's internal churn lets the
     // selected file survive right-panel tab toggles (#818).
-    if (path !== null) setSelectedPath(path);
+    if (path === null) return;
+    // Tree-click to a different file ends the click-targeted-highlight
+    // session — otherwise navigating back to the originally-targeted
+    // file in the tree would resurrect the line range, surprising the
+    // user who treated their tree click as a fresh intent. Same-file
+    // tree-clicks don't trip this branch (Pierre fires `onSelect(rel)`
+    // after our own programmatic `setSelectedPath(rel)` and the path
+    // equals `handled.resolvedPath` in that case — leaving the highlight
+    // intact for the lifetime of the request).
+    const h = handled();
+    if (h && h.resolvedPath !== null && h.resolvedPath !== path) {
+      setHandled(null);
+    }
+    setSelectedPath(path);
   };
 
   const treeError = (): Error | undefined =>
@@ -468,6 +576,7 @@ const CodeTab: Component<{ meta: TerminalMetadata | null }> = (props) => {
                         repoPath={repo}
                         filePath={path}
                         theme={diffTheme()}
+                        initialSelectedLines={selectedRange()}
                       />
                     );
                   })()}

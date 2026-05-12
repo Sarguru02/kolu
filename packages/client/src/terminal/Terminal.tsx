@@ -40,12 +40,16 @@ import { streamCall } from "@kolu/surface/solid";
 import { client } from "../wire";
 import { isExpectedCleanupError } from "../rpc/streamCleanup";
 import { createScrollLock } from "../scrollLock";
+import { requestCodeOpen } from "../right-panel/codeNavigation";
+import { useRightPanel } from "../right-panel/useRightPanel";
 import { preferences } from "../wire";
 import { isTouch } from "../useMobile";
+import { createFileRefLinkProvider } from "./fileRefLinkProvider";
 import ScrollToBottom from "./ScrollToBottom";
 import SearchBar from "./SearchBar";
 import { registerTerminalRefs, unregisterTerminalRefs } from "./terminalRefs";
 import { registerDiagnostics } from "./useTerminalDiagnostics";
+import { useTerminalStore } from "./useTerminalStore";
 import {
   trackCreate,
   trackDispose,
@@ -154,8 +158,11 @@ const Terminal: Component<{
   let containerRef!: HTMLDivElement;
   let terminal: XTerm | null = null;
   let fitAddon: FitAddon | null = null;
+  let linkProviderDisposable: { dispose(): void } | null = null;
   const [searchAddon, setSearchAddon] = createSignal<SearchAddon | null>(null);
   const scrollLock = createScrollLock(() => preferences().scrollLock);
+  const terminalStore = useTerminalStore();
+  const rightPanel = useRightPanel();
   let fitRaf = 0;
 
   /** Debounce fit() to one call per animation frame — ResizeObserver fires rapidly. */
@@ -380,6 +387,8 @@ const Terminal: Component<{
     disposeDiagnostics?.();
     disposeDiagnostics = null;
     unloadWebgl();
+    linkProviderDisposable?.dispose();
+    linkProviderDisposable = null;
     terminal?.dispose();
     terminal = null;
     // Null out the other addon slots on this component's Context. xterm
@@ -451,6 +460,34 @@ const Terminal: Component<{
           fitAddon = new FitAddon();
           term.loadAddon(fitAddon);
           term.loadAddon(new WebLinksAddon());
+          // Linkify `path:line[:col][-end]` references in terminal
+          // output. The link provider reads repoRoot from the
+          // terminal store at click time (not at mount) so a cwd
+          // change keeps subsequent clicks anchored to the new repo.
+          linkProviderDisposable = term.registerLinkProvider(
+            createFileRefLinkProvider(term, {
+              onActivate: (ref) => {
+                const meta = terminalStore.getMetadata(props.terminalId);
+                const repoRoot = meta?.git?.repoRoot ?? null;
+                if (!repoRoot) return;
+                // Issue both writes in the same DOM-event tick: the
+                // panel-mode change and the click request invalidate
+                // CodeTab's `resetKey` and `pendingCodeOpen` effects
+                // together, and Solid runs them in registration order
+                // (resetKey clears, then pendingCodeOpen sets), so
+                // `selectedPath` lands on the click's target. Moving
+                // `openCodeBrowser` inside CodeTab's effect would
+                // invert that ordering and null the path.
+                rightPanel.openCodeBrowser();
+                requestCodeOpen({
+                  ref,
+                  repoRoot,
+                  cwd: meta?.cwd,
+                  targetMode: "browse",
+                });
+              },
+            }),
+          );
           const search = new SearchAddon();
           term.loadAddon(search);
           setSearchAddon(search);
@@ -500,7 +537,12 @@ const Terminal: Component<{
               screen.style.outline = "none";
             }
           }
-          // Expose for e2e tests: read buffer content at viewport position.
+          // Kolu-owned bridge consumed by e2e step definitions —
+          // `support/buffer.ts`, `step_definitions/file_ref_link_steps.ts`,
+          // and friends read `container.__xterm` to drive xterm's
+          // public API (buffer reads, cell-to-pixel math). Removing
+          // this assignment silently breaks every cucumber test that
+          // touches terminal contents.
           (containerRef as HTMLDivElement & { __xterm?: XTerm }).__xterm = term;
           // Production path for handlers that need live xterm/addon refs
           // (e.g. export-as-PDF reads serializeAddon).

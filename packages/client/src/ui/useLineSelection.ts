@@ -17,6 +17,9 @@ import type { CodeContextMenuItem } from "./CodeContextMenu";
 import { formatLineRef } from "./lineRef";
 
 export type LineSelection = {
+  /** Current selection range — bind to Pierre's `selectedLines` prop
+   *  so the visual highlight tracks the controller. */
+  range: Accessor<SelectedLineRange | null>;
   /** Bind to Pierre's `onLineSelected` — the renderer fires this on every
    *  selection commit (single-line click or drag end). */
   handleSelect: (range: SelectedLineRange | null) => void;
@@ -25,14 +28,37 @@ export type LineSelection = {
   buildItems: () => CodeContextMenuItem[];
 };
 
-export function useLineSelection(path: Accessor<string>): LineSelection {
-  const [range, setRange] = createSignal<SelectedLineRange | null>(null);
+export interface LineSelectionOptions {
+  /** Externally-driven initial range — caller updates this when a new
+   *  navigation request lands (e.g. terminal `path:line` click). The
+   *  effect below pushes it into the controller's range, which means
+   *  the right-click menu and the Pierre highlight stay in sync. */
+  initialRange?: Accessor<SelectedLineRange | null | undefined>;
+}
 
-  // A new file replaces the old selection scope — drop it so a stale
-  // "Copy path:N" menu entry from the previous file can't surface.
-  createEffect(on(path, () => setRange(null), { defer: true }));
+export function useLineSelection(
+  path: Accessor<string>,
+  options: LineSelectionOptions = {},
+): LineSelection {
+  const [range, setRange] = createSignal<SelectedLineRange | null>(
+    options.initialRange?.() ?? null,
+  );
+
+  // Reseed the controller on either trigger — a new file replaces the
+  // selection scope (a stale "Copy path:N" entry must not survive),
+  // and an external request ticks `initialRange` with the new target.
+  // Both seed from the same source, so one effect with a combined
+  // dep tuple suffices.
+  createEffect(
+    on(
+      () => [path(), options.initialRange?.() ?? null] as const,
+      ([, initial]) => setRange(initial),
+      { defer: true },
+    ),
+  );
 
   return {
+    range,
     handleSelect: (r) => setRange(r),
     buildItems: () => {
       const items: CodeContextMenuItem[] = [

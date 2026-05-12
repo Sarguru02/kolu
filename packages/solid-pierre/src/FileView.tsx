@@ -32,7 +32,7 @@ import {
   onMount,
 } from "solid-js";
 import { toError } from "./toError";
-import { useVirtualizer } from "./Virtualizer";
+import { useVirtualizer, VIRTUALIZER_SCROLLER_ATTR } from "./Virtualizer";
 
 export type FileViewProps = {
   /** Display name (drives language inference for syntax highlighting). */
@@ -49,6 +49,11 @@ export type FileViewProps = {
   /** Fires on every selection commit (single-line click or drag end);
    *  `null` on deselect. */
   onLineSelected?: (range: SelectedLineRange | null) => void;
+  /** Push this range into Pierre's selection state and scroll the
+   *  start line into view. Consumers typically wire this to a
+   *  line-selection controller signal so user drags and external
+   *  navigation requests both flow through the same source of truth. */
+  selectedLines?: SelectedLineRange | null;
   /** Surface construction and render throws. Required because silent
    *  failures here produce a blank pane indistinguishable from "loading". */
   onError: (err: Error) => void;
@@ -67,7 +72,65 @@ export type FileViewProps = {
 type FileRenderer = {
   render(file: FileContents): void;
   setThemeType(theme: "light" | "dark"): void;
+  setSelectedLines(range: SelectedLineRange | null): void;
+  /** Best-effort scroll the line into view. Returns an rAF handle for
+   *  the virtualized-retry frame (0 when no retry was queued); the
+   *  caller is responsible for cancelling it before scheduling the
+   *  next scroll. */
+  scrollToLine(lineNumber: number): number;
   cleanUp(): void;
+};
+
+/** Find Pierre's row for `lineNumber` (1-based) inside `root` and
+ *  centre-scroll it into view. When the row isn't in the DOM yet —
+ *  virtualized files only render a windowed range — fall back to
+ *  estimating line height from a rendered sibling and scrolling the
+ *  Virtualizer's scroll container directly, then retry the precise
+ *  scroll on the next frame once Pierre has re-rendered.
+ *
+ *  `virtualizerAnchor` is the file's host element (the `<diffs-container>`
+ *  custom element for virtualized files, or the wrapper div for vanilla);
+ *  the fallback path walks up from it to find the enclosing `<Virtualizer>`
+ *  scroll container via `VIRTUALIZER_SCROLLER_ATTR`. */
+/** Result of scheduling a scroll — `0` when the direct query hit (no
+ *  follow-up frame needed) or the rAF handle of the queued retry. The
+ *  caller is expected to `cancelAnimationFrame` on the handle before
+ *  scheduling the next scroll, otherwise rapid clicks stack retries
+ *  that race the latest scrollTop. */
+const scrollToLineIndex = (
+  root: ParentNode | null | undefined,
+  lineNumber: number,
+  virtualizerAnchor?: HTMLElement,
+): number => {
+  const selector = `[data-line-index="${lineNumber - 1}"]`;
+  const direct = root?.querySelector(selector);
+  if (direct instanceof HTMLElement) {
+    direct.scrollIntoView({ block: "center" });
+    return 0;
+  }
+  if (!virtualizerAnchor) return 0;
+  // No row in the DOM — estimate scroll target from any rendered row's
+  // height, jump the outer scroller, then refine on the next frame.
+  const scroller = virtualizerAnchor.closest<HTMLElement>(
+    `[${VIRTUALIZER_SCROLLER_ATTR}]`,
+  );
+  if (!scroller) return 0;
+  const sample = root?.querySelector<HTMLElement>("[data-line-index]");
+  const lineHeight =
+    sample?.getBoundingClientRect().height ||
+    Number.parseFloat(getComputedStyle(scroller).lineHeight) ||
+    Number.parseFloat(getComputedStyle(scroller).fontSize) * 1.4 ||
+    18;
+  scroller.scrollTop = Math.max(
+    0,
+    (lineNumber - 1) * lineHeight - scroller.clientHeight / 2,
+  );
+  return requestAnimationFrame(() => {
+    const retry = root?.querySelector(selector);
+    if (retry instanceof HTMLElement) {
+      retry.scrollIntoView({ block: "center" });
+    }
+  });
 };
 
 const createFileRenderer = (
@@ -138,6 +201,13 @@ const createFileRenderer = (
         instance.render({ fileContainer, file });
       },
       setThemeType: (t) => instance?.setThemeType(t),
+      setSelectedLines: (range) => instance?.setSelectedLines(range),
+      scrollToLine: (lineNumber) =>
+        scrollToLineIndex(
+          fileContainer?.shadowRoot,
+          lineNumber,
+          fileContainer ?? undefined,
+        ),
       cleanUp: () => {
         instance?.cleanUp();
         fileContainer?.remove();
@@ -152,6 +222,9 @@ const createFileRenderer = (
   return {
     render: (file) => instance.render({ containerWrapper: container, file }),
     setThemeType: (t) => instance.setThemeType(t),
+    setSelectedLines: (range) => instance.setSelectedLines(range),
+    scrollToLine: (lineNumber) =>
+      scrollToLineIndex(container, lineNumber, container),
     cleanUp: () => instance.cleanUp(),
   };
 };
@@ -159,6 +232,7 @@ const createFileRenderer = (
 const FileView: Component<FileViewProps> = (props) => {
   let container!: HTMLDivElement;
   let renderer: FileRenderer | undefined;
+  let scrollRaf = 0;
 
   // Captured once at setup; see FileDiff for the rationale.
   const virtualizer = useVirtualizer();
@@ -179,10 +253,37 @@ const FileView: Component<FileViewProps> = (props) => {
     },
   );
 
+  let scrollRetryRaf = 0;
+  const applySelection = () => {
+    if (!renderer) return;
+    const r = props.selectedLines ?? null;
+    try {
+      renderer.setSelectedLines(r);
+      if (r) {
+        // One frame deferral so Pierre's render has actually committed
+        // the gutter/content DOM that `scrollToLine` queries against.
+        // Cancel any prior queued frame so rapid click-spam doesn't
+        // stack scrollIntoView calls with stale targets.
+        cancelAnimationFrame(scrollRaf);
+        cancelAnimationFrame(scrollRetryRaf);
+        scrollRaf = requestAnimationFrame(() => {
+          scrollRetryRaf = renderer?.scrollToLine(r.start) ?? 0;
+        });
+      }
+    } catch (e) {
+      props.onError(toError(e));
+    }
+  };
+
   const safeRender = (file: FileContents) => {
     if (!renderer) return;
     try {
       renderer.render(file);
+      // The virtualized renderer rebuilds its Pierre instance on
+      // every content swap — Pierre's prior selection state lives on
+      // the discarded instance, so we re-push the consumer-driven
+      // range onto the fresh one.
+      applySelection();
     } catch (e) {
       props.onError(toError(e));
     }
@@ -209,6 +310,18 @@ const FileView: Component<FileViewProps> = (props) => {
 
   createEffect(on(fileContents, (file) => safeRender(file), { defer: true }));
 
+  // Re-apply selection when the controller's range ticks (user drag,
+  // external navigation request). The content-change path already
+  // calls `applySelection` from inside `safeRender`. Pierre dedups
+  // identical ranges internally, so user drags don't double-apply.
+  createEffect(
+    on(
+      () => props.selectedLines,
+      () => applySelection(),
+      { defer: true },
+    ),
+  );
+
   createEffect(
     on(
       () => props.theme,
@@ -223,7 +336,11 @@ const FileView: Component<FileViewProps> = (props) => {
     ),
   );
 
-  onCleanup(() => renderer?.cleanUp());
+  onCleanup(() => {
+    cancelAnimationFrame(scrollRaf);
+    cancelAnimationFrame(scrollRetryRaf);
+    renderer?.cleanUp();
+  });
 
   return (
     <div
