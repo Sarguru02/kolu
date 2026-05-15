@@ -71,7 +71,7 @@ body {
  *      agent-state ring on the outside.
  *
  *   2. Agent-state — driven by `--pill-state-color` (bucket accent
- *      from `WORKSPACE_AGENT_BUCKETS`). Both live states pulse so
+ *      from `AGENT_BUCKETS`). Both live states pulse so
  *      motion conveys "alive"; cadence + intensity distinguishes
  *      them. `.pill-border-awaiting` breathes faster (1.6s) and
  *      deeper (20%↔90%) to read as alarm-like; `.pill-border-working`
@@ -200,25 +200,6 @@ body {
   animation: record-capsule-breathe 2s ease-out infinite;
 }
 
-/* ── Chrome bar surface emerges on workspace-switcher engagement ─ */
-/* The chrome bar is normally fully transparent so the canvas grid
- * reads through it. When the workspace switcher is engaged
- * (`data-open` set on the switcher), the bar fades in a frosted
- * surface across the entire header — identity, switcher slot, and
- * controls all sit on the same floating surface as the dropdown
- * panel below. `data-open` is JS-driven (not a CSS pseudo-class) so
- * the bg can be cleared by explicit dismissals like Esc and select,
- * not just by `:hover` clearing. */
-.chrome-bar-surface:has([data-testid="workspace-switcher"][data-open]) {
-  background-color: color-mix(
-    in oklch,
-    var(--color-surface-1) 88%,
-    transparent
-  );
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-}
-
 /* ── Subtle themed scrollbar ─────────────────────────────────── */
 /* Default browser scrollbars look chunky and out-of-place against
  * the panel's frosted surface. `.scrollbar-subtle` gives a thin
@@ -261,7 +242,7 @@ body {
 
 /* `.scrollbar-none` keeps `overflow-y: auto` semantics — wheel / trackpad /
  * keyboard scroll all still work — but suppresses the visible track + thumb
- * entirely. Useful for ambient surfaces (the awaiting dock) where the
+ * entirely. Useful for ambient surfaces (the dock) where the
  * scrollbar would be more visual noise than navigation. */
 .scrollbar-none {
   scrollbar-width: none;

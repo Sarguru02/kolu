@@ -25,10 +25,9 @@ import CommandPalette from "./CommandPalette";
 import "kolu-common/test-hooks";
 import CanvasWatermark from "./canvas/CanvasWatermark";
 import { useCanvasArrange } from "./canvas/useCanvasArrange";
-import WorkspaceSwitcher, {
-  buildWorkspaceEntries,
-  buildWorkspaceSwitcherModel,
-} from "./canvas/workspace-switcher";
+import { buildWorkspaceEntries } from "./canvas/dockModel";
+import { toggleRailCards } from "./canvas/dock/Dock";
+import { rankDockRows } from "./canvas/dock/dockRowRanking";
 import TerminalCanvas from "./canvas/TerminalCanvas";
 import TileTitleActions from "./canvas/TileTitleActions";
 import { createCommands } from "./commands";
@@ -51,6 +50,7 @@ import ShortcutsHelp from "./ShortcutsHelp";
 import { screenshotTerminal } from "./screenshotTerminal";
 import { useColorScheme } from "./settings/useColorScheme";
 import { useTips } from "./settings/useTips";
+import { useStaleCheck } from "./terminal/staleness";
 import TerminalContent from "./terminal/TerminalContent";
 import TerminalMeta from "./terminal/TerminalMeta";
 import { useSubPanel } from "./terminal/useSubPanel";
@@ -81,7 +81,9 @@ const App: Component = () => {
   const { colorScheme } = useColorScheme();
 
   // Workspace-switcher feeds — desktop and mobile share the same
-  // accessors; `buildWorkspaceSwitcherModel` owns the ordering pipeline.
+  // accessors. The mega-level model lives in `buildDockModel` (consumed
+  // inside `Dock`); row order is shared via `rankDockRows` so the
+  // `Cmd+1..9` shortcut targets the same row the dock paints.
   const workspaceEntries = createMemo(() =>
     buildWorkspaceEntries(
       store.terminalIds(),
@@ -91,14 +93,11 @@ const App: Component = () => {
   );
   const recencyOf = (id: TerminalId): number =>
     store.getMetadata(id)?.lastActivityAt ?? 0;
-  const mobileWorkspaceModel = createMemo(() =>
-    buildWorkspaceSwitcherModel(workspaceEntries(), {
-      activeId: store.activeId(),
-      getRecency: recencyOf,
-    }),
-  );
+  const isStale = useStaleCheck();
   const orderedIds = createMemo(() =>
-    mobileWorkspaceModel().entries.map((entry) => entry.id),
+    rankDockRows(store.terminalIds(), store.getMetadata, isStale).map(
+      (row) => row.id,
+    ),
   );
 
   // Fetch server identity for document title, watermark, and PWA chrome color.
@@ -121,8 +120,10 @@ const App: Component = () => {
   // Shortcuts help overlay state
   const [shortcutsHelpOpen, setShortcutsHelpOpen] = createSignal(false);
 
-  const [workspaceSwitcherOpenRequest, setWorkspaceSwitcherOpenRequest] =
-    createSignal(0);
+  // Impulse signal — Mod+Shift+K bumps it; the dock listens and
+  // opens its mega level (search + repo facets + columns). Replaces the
+  // chrome-bar workspace switcher's open-request wiring.
+  const [dockMegaOpenRequest, setDockMegaOpenRequest] = createSignal(0);
 
   // About dialog state
   const [aboutOpen, setAboutOpen] = createSignal(false);
@@ -189,6 +190,7 @@ const App: Component = () => {
   // dialog setters, debug, etc.) are added below in the createCommands call.
   const actionContext: ActionContext = {
     terminalIds: store.terminalIds,
+    dockOrderedIds: orderedIds,
     activeId: store.activeId,
     activate: store.activate,
     mruOrder: store.mruOrder,
@@ -198,7 +200,7 @@ const App: Component = () => {
       void crud.handleCreateSubTerminal(parentId, cwd),
     openNewTerminalMenu: () => openPaletteGroup("New terminal"),
     openWorkspaceSwitcher: () => {
-      if (!isMobile()) setWorkspaceSwitcherOpenRequest((n) => n + 1);
+      if (!isMobile()) setDockMegaOpenRequest((n) => n + 1);
     },
     setPaletteOpen,
     setShortcutsHelpOpen,
@@ -213,6 +215,7 @@ const App: Component = () => {
     handleShuffleTheme,
     handleScreenshotTerminal: () => handleScreenshotTerminal(),
     toggleRightPanel: rightPanel.togglePanel,
+    toggleDock: toggleRailCards,
     toggleRecordingPause: () => useRecorder().togglePause(),
   };
 
@@ -461,24 +464,13 @@ const App: Component = () => {
           if (target) void worktree.handleKillWorktree(target.id);
         }}
       />
-      {/* Desktop chrome — docked top bar carrying workspace switcher, identity,
-       *  and global controls. Mobile has its own pull-down sheet (see
-       *  MobileTileView) and does not render this band. */}
+      {/* Desktop chrome — docked top bar carrying identity and global
+       *  controls. The workspace switcher retired in favor of the
+       *  dock's mega level (#903). Mobile has its own
+       *  pull-down sheet (see MobileTileView) and does not render this
+       *  band. */}
       <Show when={!isMobile()}>
-        <ChromeBar
-          status={wsStatus()}
-          onOpenPalette={() => openPalette()}
-          workspaceSwitcher={
-            <WorkspaceSwitcher
-              entries={workspaceEntries()}
-              activeId={store.activeId()}
-              getRecency={recencyOf}
-              openRequest={workspaceSwitcherOpenRequest()}
-              onSelect={store.activate}
-              onCreate={() => openPaletteGroup("New terminal")}
-            />
-          }
-        />
+        <ChromeBar status={wsStatus()} onOpenPalette={() => openPalette()} />
       </Show>
       {/* relative: anchor for overlay panels.
        *  --active-terminal-{bg,fg} published here so child components
@@ -526,7 +518,6 @@ const App: Component = () => {
                 .with(true, () => (
                   <MobileTileView
                     orderedIds={orderedIds()}
-                    groups={mobileWorkspaceModel().compactGroups}
                     status={wsStatus()}
                     appTitle={appTitle()}
                     onOpenPalette={() => openPalette()}
@@ -544,6 +535,10 @@ const App: Component = () => {
                     onAutoArrange={arrange.handleCanvasAutoArrange}
                     onSelect={store.setActiveSilently}
                     onClose={(id) => closeTerminal(id)}
+                    workspaceEntries={workspaceEntries()}
+                    getRecency={recencyOf}
+                    openMegaRequest={dockMegaOpenRequest()}
+                    onCreate={() => openPaletteGroup("New terminal")}
                     renderTileTitle={(id) => (
                       <TerminalMeta info={store.getDisplayInfo(id)} />
                     )}

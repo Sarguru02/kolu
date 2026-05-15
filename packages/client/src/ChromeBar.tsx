@@ -1,9 +1,10 @@
 /** ChromeBar — the always-visible workspace chrome band.
  *
- *  Replaces the pre-#622 global Header. Carries app identity (logo +
- *  connection dot) on the left, the workspace switcher in the middle, and the
- *  global control cluster (inspector toggle, settings, command palette)
- *  on the right.
+ *  Carries app identity (logo + connection dot) on the left and the
+ *  global control cluster (recorder, inspector, settings, command
+ *  palette) on the right. The live-terminal navigator moved to the
+ *  dock at the canvas's left edge (#903), so the chrome bar
+ *  no longer hosts a workspace switcher slot.
  *
  *  Two positioning modes, switched on `canvasMaximized`:
  *  - Canvas mode (default): absolute overlay above the canvas. Pure
@@ -19,7 +20,8 @@
  *  Mobile uses a different chrome surface — a pull-down sheet — see
  *  `MobileChromeSheet` and `MobileTileView`. */
 
-import { type Component, createSignal, type JSX } from "solid-js";
+import { type Component, createSignal } from "solid-js";
+import { dockExpanded, toggleRailCards } from "./canvas/dock/Dock";
 import { useViewPosture } from "./canvas/useViewPosture";
 import { ACTIONS } from "./input/actions";
 import { formatKeybind } from "./input/keyboard";
@@ -27,7 +29,7 @@ import RecordButton from "./recorder/RecordButton";
 import { useRightPanel } from "./right-panel/useRightPanel";
 import type { WsStatus } from "./rpc/rpc";
 import SettingsPopover from "./settings/SettingsPopover";
-import { InspectorToggleIcon, SettingsIcon } from "./ui/Icons";
+import { DockToggleIcon, InspectorToggleIcon, SettingsIcon } from "./ui/Icons";
 import Kbd from "./ui/Kbd";
 import Tip from "./ui/Tip";
 
@@ -40,10 +42,6 @@ const statusStyles: Record<WsStatus, string> = {
 const ChromeBar: Component<{
   status: WsStatus;
   onOpenPalette: () => void;
-  /** Workspace switcher slot — caller composes the live-terminal navigator.
-   *  ChromeBar is a layout host (logo + switcher + controls); it doesn't need
-   *  to know the switcher's prop shape, just where to drop it. */
-  workspaceSwitcher: JSX.Element;
 }> = (props) => {
   const rightPanel = useRightPanel();
   const posture = useViewPosture();
@@ -108,14 +106,11 @@ const ChromeBar: Component<{
         </Tip>
       </div>
 
-      {/* Workspace switcher — fills the middle, wraps as needed.
-       *  pointer-events-none here so the empty middle space (no pills,
-       *  or padding around them) lets clicks pass through to the right
-       *  panel / canvas underneath; the switcher's own outer wrapper
-       *  re-enables pointer events on the actual pill elements. */}
-      <div class="flex-1 min-w-0 flex justify-center pointer-events-none">
-        {props.workspaceSwitcher}
-      </div>
+      {/* Middle spacer — pointer-events pass through to whatever the
+       *  canvas or right panel is showing underneath. The workspace
+       *  switcher used to live here; with the dock owning the
+       *  navigator, the chrome bar is just identity + global controls. */}
+      <div class="flex-1 min-w-0 pointer-events-none" />
 
       {/* Control cluster: inspector → settings → ⌘K. Cluster wrapper
        *  itself stays pointer-events-none so the gap-2 spaces and any
@@ -123,6 +118,24 @@ const ChromeBar: Component<{
        *  clicks through; each button re-enables pointer-events-auto. */}
       <div class="flex items-center gap-2 shrink-0">
         <RecordButton />
+        <Tip
+          label={`Toggle dock (${formatKeybind(ACTIONS.toggleDock.keybind)})`}
+        >
+          <button
+            type="button"
+            data-testid="dock-toggle"
+            class="pointer-events-auto hidden sm:flex items-center justify-center w-7 h-7 rounded-lg transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
+            classList={{
+              "bg-surface-2 text-fg": dockExpanded(),
+              "text-fg-3 hover:bg-surface-2 hover:text-fg": !dockExpanded(),
+            }}
+            data-active={dockExpanded() ? "" : undefined}
+            onClick={toggleRailCards}
+            aria-label="Toggle dock"
+          >
+            <DockToggleIcon active={dockExpanded()} />
+          </button>
+        </Tip>
         <Tip
           label={`Toggle inspector (${formatKeybind(ACTIONS.toggleRightPanel.keybind)})`}
         >

@@ -1,13 +1,13 @@
-import type { AgentInfo } from "kolu-common/surface";
+import type { AgentInfo, TerminalMetadata } from "kolu-common/surface";
 import { agentNames, stateLabels } from "../../ui/agentDisplay";
-import type { WorkspaceSwitcherEntry } from "./model";
+import type { DockEntry } from "../dockModel";
 
 export function agentLabel(agent: AgentInfo | null | undefined): string {
   if (!agent) return "Plain shell";
   return `${agentNames[agent.kind]} · ${stateLabels[agent.state]}`;
 }
 
-export function metaLine(entry: WorkspaceSwitcherEntry): string {
+export function metaLine(entry: DockEntry): string {
   const { meta } = entry.info;
   if (meta.agent?.summary) return meta.agent.summary;
   if (meta.foreground?.title) return meta.foreground.title;
@@ -15,29 +15,32 @@ export function metaLine(entry: WorkspaceSwitcherEntry): string {
   return meta.cwd;
 }
 
-export function prLine(entry: WorkspaceSwitcherEntry): string | null {
-  const pr = entry.info.meta.pr;
-  if (pr.kind !== "ok") return null;
-  const checks = pr.value.checks ? ` · ${pr.value.checks}` : "";
-  return `#${pr.value.number} ${pr.value.title}${checks}`;
+type ResolvedPr = (TerminalMetadata["pr"] & { kind: "ok" })["value"];
+
+/** Narrow the PR carrier to its resolved value, or null for the
+ *  unresolved kinds (`absent`/`pending`/`unavailable`). The single
+ *  definition of "PR is resolved" — every dock surface reads through
+ *  this so a future kind added to the union forces one edit, not three. */
+export function resolvedPr(pr: TerminalMetadata["pr"]): ResolvedPr | null {
+  return pr.kind === "ok" ? pr.value : null;
 }
 
 /** Structured PR summary for renderers that style number, title, checks
  *  separately (eyebrow vs. headline). Returns null when the PR is not
- *  resolved (`absent`/`pending`/`unavailable`). */
+ *  resolved. */
 export type PrSummary = {
   number: number;
   title: string;
   checks: string | null;
 };
 
-export function prSummary(entry: WorkspaceSwitcherEntry): PrSummary | null {
-  const pr = entry.info.meta.pr;
-  if (pr.kind !== "ok") return null;
+export function prSummary(entry: DockEntry): PrSummary | null {
+  const pr = resolvedPr(entry.info.meta.pr);
+  if (!pr) return null;
   return {
-    number: pr.value.number,
-    title: pr.value.title,
-    checks: pr.value.checks ?? null,
+    number: pr.number,
+    title: pr.title,
+    checks: pr.checks ?? null,
   };
 }
 

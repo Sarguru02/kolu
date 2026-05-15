@@ -19,6 +19,11 @@ import { type Keybind, matchesKeybind } from "./keyboard";
 /** Shared handler context — every dispatched action receives this. */
 export interface ActionContext {
   terminalIds: Accessor<TerminalId[]>;
+  /** Dock row order — recency-descending across all terminals. Drives
+   *  the `Cmd+1..9` positional shortcuts so the keys target what the
+   *  user visibly sees at the top of the dock, not insertion order.
+   *  Same source the dock and mobile drawer render from. */
+  dockOrderedIds: Accessor<TerminalId[]>;
   activeId: Accessor<TerminalId | null>;
   /** Make `id` the active terminal AND pan the canvas to it. The single
    *  writer for keyboard-driven activation (cycle, positional, MRU) so
@@ -41,6 +46,7 @@ export interface ActionContext {
   handleShuffleTheme: () => void;
   handleScreenshotTerminal: () => void;
   toggleRightPanel: () => void;
+  toggleDock: () => void;
   toggleRecordingPause: () => void;
 }
 
@@ -96,7 +102,10 @@ const switchToActions = Object.fromEntries(
       label: `Switch to terminal ${i}`,
       keybind: { key: String(i), mod: true },
       handler: (ctx) => {
-        const target = ctx.terminalIds()[i - 1];
+        // Targets dock row order (recency-sorted) so `Cmd+i` activates
+        // whatever the user sees at row `i` — same surface the
+        // Alt-held numeric hints overlay on the dock rows.
+        const target = ctx.dockOrderedIds()[i - 1];
         if (target !== undefined) ctx.activate(target);
       },
     } satisfies DispatchableAction,
@@ -233,6 +242,14 @@ const _ACTIONS = {
     label: "Toggle inspector panel",
     keybind: { key: "b", code: "KeyB", mod: true, alt: true },
     handler: (ctx) => ctx.toggleRightPanel(),
+  },
+  toggleDock: {
+    label: "Toggle dock (rail / cards)",
+    // Mirror of VS Code's primary-sidebar shortcut. The right-panel
+    // toggle takes `Mod+Alt+B`; the dock (left panel) gets the
+    // shorter `Mod+B`, since the dock is the primary navigator.
+    keybind: { key: "b", code: "KeyB", mod: true },
+    handler: (ctx) => ctx.toggleDock(),
   },
   toggleRecordingPause: {
     label: "Pause / resume recording",

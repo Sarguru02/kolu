@@ -108,14 +108,12 @@ const CanvasTile: Component<{
       data-dimmed={props.dimmed ? "true" : undefined}
       class="flex flex-col overflow-hidden border transition-shadow duration-200"
       classList={{
-        // Maximized stays `absolute inset-0` so it fills the canvas
-        // container — NOT `fixed`, because the transformed pan/zoom
-        // wrapper would otherwise become its containing block (CSS
-        // makes `position: fixed` resolve to the nearest transformed
-        // ancestor, not the viewport). Caller must render maximized
-        // tiles outside that wrapper. Rounding is gated on the same
-        // axis: a maximized tile butts edge-to-edge against the canvas
-        // container, so rounded corners would leave a grid-bg sliver.
+        // Maximized stays `absolute` so it fills the canvas container —
+        // NOT `fixed`, because the transformed pan/zoom wrapper would
+        // otherwise become its containing block. The dock sits
+        // outside this container as a flex sibling in maximized posture
+        // (TerminalCanvas), so the tile naturally fills the remaining
+        // viewport without needing a left-inset (#904).
         absolute: true,
         "inset-0 z-40": props.maximized,
         "rounded-xl": !props.maximized,
