@@ -4,7 +4,7 @@
 
 # kolu
 
-A terminal-native cockpit for coding agents. Bring your own CLI, run them anywhere.
+Your terminals are the workspace. Real `xterm.js` tiles on an infinite 2D canvas, for `claude`, `codex`, `opencode` — anything you run in a shell.
 
 Unlike agent command centers that wrap a single model behind their own chat UI, kolu stays out of the agent's way: the terminal is the universal interface, so `claude`, `opencode`, or whatever ships next week works out of the box — and you can drop to a plain shell whenever you want. It's an [Agentic Development Environment](https://x.com/jdegoes/status/2036931874057314390) (ADE) that treats terminals as the thesis, not the substrate.
 
@@ -20,9 +20,11 @@ Two principles shape what kolu is and isn't:
 
 [Install Nix](https://nixos.asia/en/install) and then run:
 
+The same command runs kolu and updates it — `--refresh` busts Nix's flake cache so you always pull the latest commit:
+
 ```sh
-nix run github:juspay/kolu       # serve on 127.0.0.1:7681
-nix run github:juspay/kolu -- --host 0.0.0.0 --port 8080  # expose on LAN
+nix --refresh run github:juspay/kolu       # serve on 127.0.0.1:7681
+nix --refresh run github:juspay/kolu -- --host 0.0.0.0 --port 8080  # expose on LAN
 ```
 
 Open http://127.0.0.1:7681 (or the address you chose above).
