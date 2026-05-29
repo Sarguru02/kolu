@@ -28,6 +28,7 @@ let
       ./packages/shared
       ./packages/terminal-themes
       ./packages/memorable-names
+      ./packages/pty-host
       ./packages/server
       ./packages/client
       ./packages/transcript-core
