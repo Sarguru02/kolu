@@ -13,6 +13,7 @@ import fs from "node:fs";
 import { agentInfoEqual } from "anyagent";
 import { match } from "ts-pattern";
 import {
+  decayTransientState,
   deriveState,
   deriveTaskProgress,
   deriveWorkflowProgress,
@@ -20,6 +21,7 @@ import {
   extractTasks,
   fetchSessionSummary,
   findTranscriptPath,
+  isClaudeSubtreeIdle,
   liveOutstandingTasks,
   nextWorkflowStaleDeadline,
   outstandingBackgroundTasks,
@@ -250,6 +252,19 @@ export function createSessionWatcher(
     onTranscriptMaybeChanged();
   }
 
+  /** Milliseconds since the transcript was last written, measured against the
+   *  caller's `now` clock sample, or null when it can't be stat-ed — treated as
+   *  "unknown", so no transient de-escalation fires (never clear a pill on a
+   *  stat failure). Sharing `now` with `decayTransientState` keeps the quiet
+   *  window and the re-derived recheck instant on a single clock read. */
+  function transcriptQuietMs(filePath: string, now: number): number | null {
+    try {
+      return now - fs.statSync(filePath).mtimeMs;
+    } catch {
+      return null;
+    }
+  }
+
   function onTranscriptMaybeChanged() {
     if (destroyed) return;
     if (transcriptWatching.kind !== "watching") return;
@@ -273,15 +288,39 @@ export function createSessionWatcher(
       return;
     }
 
-    // Arm a wall-clock recheck only while busy-waiting on a workflow: a stale
-    // journal emits no fs event, so this timer is the sole path that re-derives
-    // and clears the spinner if the agent dies on a still-fresh journal.
-    // Disarm otherwise (any other state already re-renders correctly).
-    scheduleStaleRecheck(
-      derived.state === "running_background"
-        ? nextWorkflowStaleDeadline(session, outstanding)
-        : null,
-    );
+    // Resolve the state to publish and when (if ever) to re-probe. Two
+    // staleness-driven de-escalations live here, on disjoint states — a quiet
+    // transcript / journal fires no fs event, so each arms the reused one-shot
+    // recheck timer that re-derives without an external trigger:
+    //   - running_background (#1109): demote once the workflow journal goes
+    //     stale; the deadline tracks the soonest live-journal stale time.
+    //   - dangling tool_use (#1017): demote to `waiting` once the transcript is
+    //     quiet past the window AND claude's subtree is idle (no descendant
+    //     process). A genuine long tool keeps a child, so it is never wrongly
+    //     cleared; the probe runs only past the window. `thinking` is left
+    //     untouched — a turn awaiting the model's first token also has no
+    //     descendant and writes nothing, so that signal can't distinguish a
+    //     slow model request from abandonment (see decayTransientState).
+    let publishedState = derived.state;
+    let staleDeadline: number | null = null;
+    if (derived.state === "running_background") {
+      staleDeadline = nextWorkflowStaleDeadline(session, outstanding);
+    } else {
+      const now = Date.now();
+      const quietMs = transcriptQuietMs(transcriptWatching.path, now);
+      if (quietMs !== null) {
+        const decayed = decayTransientState(
+          derived.state,
+          quietMs,
+          () => isClaudeSubtreeIdle(session.pid),
+          undefined,
+          now,
+        );
+        publishedState = decayed.state;
+        staleDeadline = decayed.recheckAt;
+      }
+    }
+    scheduleStaleRecheck(staleDeadline);
 
     scanTasksIncremental(transcriptWatching.path);
 
@@ -290,13 +329,13 @@ export function createSessionWatcher(
     // journal files. Recomputed here (not change-gated) so a climbing
     // fan-out count refreshes via the workflows-dir watcher below.
     const workflow =
-      derived.state === "running_background"
+      publishedState === "running_background"
         ? deriveWorkflowProgress(session, outstanding)
         : null;
 
     const info: ClaudeCodeInfo = {
       kind: "claude-code",
-      state: derived.state,
+      state: publishedState,
       sessionId: session.sessionId,
       model: derived.model,
       summary: lastSummary,
