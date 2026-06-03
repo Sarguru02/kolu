@@ -1026,15 +1026,50 @@ async function authorBody(slug, data, baseline, guidance) {
 // decodes it to the file mechanically and never sees it as prose, so no body content
 // can be confused with a workflow instruction. The deterministic baseline is itself a
 // valid body and rides the same opaque path (it's the fallback when authoring fails).
-// UTF-8-safe base64, runtime-agnostic: Node's Buffer if present, else TextEncoder +
-// btoa (handles multi-byte chars, which a bare btoa(string) would corrupt).
+// UTF-8-safe base64. The Workflow runtime has NEITHER `Buffer` NOR `TextEncoder`
+// NOR `btoa` (the old `new TextEncoder()` fallback threw `ReferenceError:
+// TextEncoder is not defined` and crashed the whole Report phase), so the fallback
+// is a self-contained pure-JS encoder that hand-rolls UTF-8 byte emission and a
+// base64 alphabet — no runtime globals. The `Buffer` fast-path is kept behind a
+// `typeof` guard (which never throws) for runtimes that do have it; the pure path
+// is byte-for-byte identical output. UTF-8 is computed manually rather than via
+// `encodeURIComponent`, which throws `URIError` on lone surrogate halves; here, as
+// in Buffer/TextEncoder, an unpaired surrogate is replaced with U+FFFD so the
+// encoder is total over every JS string and never crashes the Report phase.
 function toBase64(s) {
   const str = String(s)
   if (typeof Buffer !== 'undefined') return Buffer.from(str, 'utf8').toString('base64')
-  const bytes = new TextEncoder().encode(str)
+  // UTF-8 bytes as a binary string, decoding surrogate pairs and substituting
+  // U+FFFD for any unpaired surrogate (matching Buffer/TextEncoder semantics).
   let bin = ''
-  for (const b of bytes) bin += String.fromCharCode(b)
-  return btoa(bin)
+  const emit = (cp) => {
+    if (cp < 0x80) bin += String.fromCharCode(cp)
+    else if (cp < 0x800) bin += String.fromCharCode(0xc0 | (cp >> 6), 0x80 | (cp & 0x3f))
+    else if (cp < 0x10000) bin += String.fromCharCode(0xe0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f))
+    else bin += String.fromCharCode(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f))
+  }
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i)
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const next = str.charCodeAt(i + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        emit(0x10000 + ((c - 0xd800) << 10) + (next - 0xdc00))
+        i++
+      } else emit(0xfffd) // unpaired high surrogate
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      emit(0xfffd) // unpaired low surrogate
+    } else emit(c)
+  }
+  const CH = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  let out = ''
+  for (let i = 0; i < bin.length; i += 3) {
+    const n = Math.min(3, bin.length - i)
+    const a = bin.charCodeAt(i)
+    const b = n > 1 ? bin.charCodeAt(i + 1) : 0
+    const c = n > 2 ? bin.charCodeAt(i + 2) : 0
+    out += CH[a >> 2] + CH[((a & 3) << 4) | (b >> 4)] + (n > 1 ? CH[((b & 15) << 2) | (c >> 6)] : '=') + (n > 2 ? CH[c & 63] : '=')
+  }
+  return out
 }
 
 async function postComment(slug, body) {
