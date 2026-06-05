@@ -33,7 +33,7 @@ import { join } from "node:path";
  * parent-forward whitelist.
  */
 export const NIX_ENV_WHITELIST =
-  "HOME,USER,PATH,TERM,LANG,LC_ALL,LOGNAME,DISPLAY,COLORTERM";
+  "HOME,USER,PATH,TERM,LANG,LC_ALL,LOGNAME,DISPLAY,COLORTERM,TERM_PROGRAM,SSH_AUTH_SOCK,JUSPAY_API_KEY";
 
 /** Whitelist set once at startup; undefined means passthrough mode (production). */
 let envWhitelist: Set<string> | undefined;
