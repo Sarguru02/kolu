@@ -10,23 +10,33 @@
  * via `actionPaletteCommand`.
  */
 
-import type { TerminalId, TerminalMetadata } from "kolu-common";
+import type { TerminalId, TerminalMetadata } from "kolu-common/surface";
 import { nonEmpty } from "nonempty";
 import type { Accessor, Setter } from "solid-js";
-import type { PaletteCommand } from "../CommandPalette";
+import type { PaletteAction, SectionId } from "../CommandPalette";
 import { type Keybind, matchesKeybind } from "./keyboard";
 
 /** Shared handler context — every dispatched action receives this. */
 export interface ActionContext {
   terminalIds: Accessor<TerminalId[]>;
+  /** Dock row order — recency-descending across all terminals. Drives
+   *  the `Cmd+1..9` positional shortcuts so the keys target what the
+   *  user visibly sees at the top of the dock, not insertion order.
+   *  Same source the dock and mobile drawer render from. */
+  dockOrderedIds: Accessor<TerminalId[]>;
   activeId: Accessor<TerminalId | null>;
-  setActiveId: Setter<TerminalId | null>;
+  /** Make `id` the active terminal AND pan the canvas to it. The single
+   *  writer for keyboard-driven activation (cycle, positional, MRU) so
+   *  every shortcut gets viewport-follow without remembering a second
+   *  call. Mirrors `store.activate` from `useViewState`. */
+  activate: (id: TerminalId | null) => void;
   /** Terminal IDs in most-recently-used order; used for Alt+Tab / Ctrl+Tab cycling. */
   mruOrder: Accessor<TerminalId[]>;
   activeMeta: Accessor<TerminalMetadata | null>;
   handleCreate: (cwd?: string) => void;
   handleCreateSubTerminal: (parentId: TerminalId, cwd?: string) => void;
   openNewTerminalMenu: () => void;
+  openWorkspaceSwitcher: () => void;
   setPaletteOpen: Setter<boolean>;
   setShortcutsHelpOpen: Setter<boolean>;
   setSearchOpen: Setter<boolean>;
@@ -36,7 +46,7 @@ export interface ActionContext {
   handleShuffleTheme: () => void;
   handleScreenshotTerminal: () => void;
   toggleRightPanel: () => void;
-  canvasCenterActive: () => void;
+  toggleDock: () => void;
   toggleRecordingPause: () => void;
 }
 
@@ -77,7 +87,7 @@ function cycleTerminalByPosition(ctx: ActionContext, direction: 1 | -1) {
   const next = (current + direction + ids.length) % ids.length;
   // Tuple positional `ids[0]` is statically `TerminalId`; `?? ids[0]` is
   // a typed fallback the math never actually triggers.
-  ctx.setActiveId(ids[next] ?? ids[0]);
+  ctx.activate(ids[next] ?? ids[0]);
 }
 
 /** Mod+1 through Mod+9 — direct positional terminal switch. */
@@ -92,8 +102,11 @@ const switchToActions = Object.fromEntries(
       label: `Switch to terminal ${i}`,
       keybind: { key: String(i), mod: true },
       handler: (ctx) => {
-        const target = ctx.terminalIds()[i - 1];
-        if (target !== undefined) ctx.setActiveId(target);
+        // Targets dock row order (recency-sorted) so `Cmd+i` activates
+        // whatever the user sees at row `i` — same surface the
+        // Alt-held numeric hints overlay on the dock rows.
+        const target = ctx.dockOrderedIds()[i - 1];
+        if (target !== undefined) ctx.activate(target);
       },
     } satisfies DispatchableAction,
   ]),
@@ -139,6 +152,11 @@ const _ACTIONS = {
     label: "Command palette",
     keybind: { key: "k", mod: true },
     handler: (ctx) => ctx.setPaletteOpen((v) => !v),
+  },
+  openWorkspaceSwitcher: {
+    label: "Workspace switcher",
+    keybind: { key: "K", code: "KeyK", mod: true, shift: true },
+    handler: (ctx) => ctx.openWorkspaceSwitcher(),
   },
   shortcutsHelp: {
     label: "Shortcuts help",
@@ -198,7 +216,12 @@ const _ACTIONS = {
   },
   shuffleTheme: {
     label: "Shuffle theme",
-    keybind: { key: "j", mod: true },
+    // Mod+Shift+J — bare Mod+J on Linux collided with Claude Code's
+    // in-PTY newline shortcut (Ctrl+J). The shifted chord stays
+    // memorable, frees Ctrl+J to reach the PTY, and matches the
+    // Mod+Shift+<letter> convention used by openWorkspaceSwitcher
+    // and screenshotTerminal. Closes #873.
+    keybind: { key: "J", code: "KeyJ", mod: true, shift: true },
     handler: (ctx) => ctx.handleShuffleTheme(),
   },
   screenshotTerminal: {
@@ -206,15 +229,28 @@ const _ACTIONS = {
     keybind: { key: "S", code: "KeyS", mod: true, shift: true },
     handler: (ctx) => ctx.handleScreenshotTerminal(),
   },
+  copySelection: {
+    label: "Copy selection",
+    // Physical Ctrl (not platform mod) — Linux/Windows terminal chord.
+    // Dispatch is xterm-handler-local (Terminal.tsx) because xterm's
+    // selection lives outside the textarea, so the action only makes
+    // sense with a live xterm ref. Registered here for ShortcutsHelp
+    // visibility and so matchesAnyShortcut sees it.
+    keybind: { key: "C", code: "KeyC", ctrl: true, shift: true },
+  },
   toggleRightPanel: {
     label: "Toggle inspector panel",
-    keybind: { key: "b", code: "KeyB", mod: true },
+    keybind: { key: "b", code: "KeyB", mod: true, alt: true },
     handler: (ctx) => ctx.toggleRightPanel(),
   },
-  canvasCenterActive: {
-    label: "Center on active tile",
-    keybind: { key: "C", code: "KeyC", mod: true, shift: true },
-    handler: (ctx) => ctx.canvasCenterActive(),
+  toggleDock: {
+    label: "Toggle dock (rail / cards)",
+    // Mod+Shift+B — bare Mod+B on Linux/Windows resolves to Ctrl+B,
+    // which Claude Code claims as its in-PTY background-task chord.
+    // The shifted form keeps the B mnemonic for the left panel and
+    // frees Ctrl+B to reach the PTY. See `prohibitedKeybinds.ts`.
+    keybind: { key: "B", code: "KeyB", mod: true, shift: true },
+    handler: (ctx) => ctx.toggleDock(),
   },
   toggleRecordingPause: {
     label: "Pause / resume recording",
@@ -255,12 +291,14 @@ export type DispatchableId = {
 export function actionPaletteCommand(
   id: DispatchableId,
   ctx: ActionContext,
-  overrides: Partial<Pick<PaletteCommand, "name" | "description">> = {},
-): PaletteCommand {
+  overrides: { name?: string; description?: string; section?: SectionId } = {},
+): PaletteAction {
   const a = ACTIONS[id] as DispatchableAction;
   return {
+    kind: "action",
     name: overrides.name ?? a.label,
     description: overrides.description,
+    section: overrides.section,
     keybind: a.keybind,
     onSelect: () => a.handler(ctx),
   };

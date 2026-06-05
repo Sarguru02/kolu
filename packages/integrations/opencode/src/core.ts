@@ -25,6 +25,7 @@
  */
 
 import { DatabaseSync } from "node:sqlite";
+import { classifyByAwaiting } from "anyagent";
 import type { Logger } from "kolu-shared";
 import { withDb as sharedWithDb } from "kolu-shared/sqlite";
 import { match } from "ts-pattern";
@@ -205,36 +206,55 @@ export function getLatestAssistantContextTokens(
 
 // --- Tool detection ---
 
-/**
- * Check whether the given message has any tool parts currently in the
- * "running" state. Scoped to one message (the current assistant turn)
- * rather than the entire session — a session with thousands of completed
- * tool parts from prior turns only needs to check the handful of parts
- * belonging to the latest message.
+/** OpenCode built-in tools whose pending invocation means the agent is
+ *  awaiting the human. Both call `Question.Service.ask` and write a
+ *  `part` row with `state.status = "running"` while blocking on the
+ *  user's reply (upstream verification:
+ *  `packages/opencode/src/tool/question.ts:24` and
+ *  `packages/opencode/src/tool/plan.ts:29`). Other interactive flows
+ *  (`ctx.ask` permission prompts inside `shell`/`edit`/`write`/etc.)
+ *  don't surface a distinct `tool` value — the part stays `shell`/etc.
+ *  and is indistinguishable from a real-work tool. */
+const AWAITING_USER_TOOLS = ["question", "plan_exit"] as const;
+
+/** Classify the tool parts currently in the "running" state for one
+ *  message (the current assistant turn) — scoped per-message rather
+ *  than per-session so a transcript with thousands of completed tool
+ *  parts stays cheap to scan.
  *
- * Uses the `part_message_id_id_idx` index for an O(parts-in-message)
- * scan, not O(all-parts-in-session).
- */
-export function hasRunningTools(
+ *  Returns `null` when no tools are running (the caller keeps its base
+ *  state), `"tool_use"` when at least one real-work tool is in flight,
+ *  and `"awaiting_user"` when every running part is in
+ *  `AWAITING_USER_TOOLS`. One SQL pass counts total + awaiting using
+ *  the `part_message_id_id_idx` index. */
+export function runningToolsBucket(
   messageId: string,
   log?: Logger,
   db?: DatabaseSync,
-): boolean {
+): "tool_use" | "awaiting_user" | null {
+  // SQLite's parameter binding doesn't accept arrays for `IN (...)`,
+  // so the placeholder list is constructed inline from a constant —
+  // safe because every value is a hard-coded literal, not user input.
+  const placeholders = AWAITING_USER_TOOLS.map(() => "?").join(", ");
   return (
     withDb(
       (conn) => {
         const row = conn
           .prepare(
-            "SELECT COUNT(*) AS n FROM part WHERE message_id = ? AND json_extract(data, '$.type') = 'tool' AND json_extract(data, '$.state.status') = 'running'",
+            `SELECT COUNT(*) AS total, SUM(CASE WHEN json_extract(data, '$.tool') IN (${placeholders}) THEN 1 ELSE 0 END) AS awaiting FROM part WHERE message_id = ? AND json_extract(data, '$.type') = 'tool' AND json_extract(data, '$.state.status') = 'running'`,
           )
-          .get(messageId) as { n: number } | undefined;
-        return (row?.n ?? 0) > 0;
+          .get(...AWAITING_USER_TOOLS, messageId) as
+          | { total: number; awaiting: number | null }
+          | undefined;
+        const total = row?.total ?? 0;
+        if (total === 0) return null;
+        return classifyByAwaiting(row?.awaiting ?? 0, total);
       },
       "opencode running-tools query failed",
       { messageId },
       log,
       db,
-    ) ?? false
+    ) ?? null
   );
 }
 
@@ -288,8 +308,14 @@ export function deriveSessionState(
           "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created DESC LIMIT 1",
         )
         .get(sessionId) as { id: string; data: string } | undefined;
-      if (!row) return null;
-      const parsed = parseMessageState(row.data);
+      if (!row) {
+        // Genuinely empty session — an expected-absent condition, logged at
+        // the layer that knows the row is missing. A malformed latest row is
+        // a different story: parseMessageState logs that as an error below.
+        log?.debug({ sessionId }, "no messages yet for opencode session");
+        return null;
+      }
+      const parsed = parseMessageState(row.data, log, sessionId);
       if (!parsed) return null;
       return { ...parsed, messageId: row.id };
     },
@@ -300,13 +326,26 @@ export function deriveSessionState(
   );
 }
 
-/** Parse a `message.data` JSON blob into derived state.
- *  Exported for unit testing. */
-export function parseMessageState(data: string): ParsedMessageState | null {
+/** Parse a `message.data` JSON blob into derived state. Returns null for a
+ *  blob whose role we don't model, and for malformed JSON — but the latter
+ *  is logged as an error (OpenCode owns this JSON, so a parse failure is
+ *  real schema drift or corruption, not an empty session). Pass `sessionId`
+ *  to tag that error. Exported for unit testing. */
+export function parseMessageState(
+  data: string,
+  log?: Logger,
+  sessionId?: string,
+): ParsedMessageState | null {
   let parsed: MessageData;
   try {
     parsed = JSON.parse(data) as MessageData;
-  } catch {
+  } catch (err) {
+    // Distinct from "no row": there IS a latest message, we just can't read
+    // it. Surface it as a dropped-state error so the watcher never reports
+    // it as the benign "no messages yet". Mirrors
+    // getLatestAssistantContextTokens' handling of the same blob — same
+    // `{ err, sessionId }` shape, same error level.
+    log?.error({ err, sessionId }, "opencode message.data parse failed");
     return null;
   }
 

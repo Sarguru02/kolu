@@ -6,10 +6,63 @@ Kolu-specific rules layered on top of the base `code-police` skill — read by `
 
 These rules extend the base code-police skill with Kolu-specific patterns. They are checked during Pass 1 (rule checklist) alongside the generic rules.
 
+### no-re-export-bridge-modules
+
+A module whose entire body is `export … from "another-package"` (no
+locally-defined values, types, or doc) must not exist. Consumers should
+import directly from the source.
+
+Bad: a `kolu-common/integrations.ts` that just re-exports `GitInfoSchema`,
+`PrResultSchema`, `ClaudeCodeInfoSchema`, … from their respective
+integration packages. Or a `kolu-common/pr.ts` whose only content is
+`export … from "kolu-github/schemas"`. Both create a fake fan-in: the
+consumer's import path lies about where the symbol lives.
+
+Good: consumers `import { GitInfo } from "kolu-git/schemas"` directly.
+The integration package is the source of truth; one place to grep.
+
+_Allowed_: a module that re-exports AND adds local content (a curated
+narrow surface plus locally-defined helpers, schemas, or documented
+boundary semantics). A pure re-export with a comment explaining "this
+exists to avoid X bundling" is still a bridge — fix the underlying
+issue (subpath the source package exposes for browser-safe types) or
+let consumers reach for the source directly.
+
+_Rationale_: re-export bridges add an indirection that consumers and
+tools have to chase, drift over time (the bridge's set of re-exports
+goes stale relative to the source), and create the illusion that
+`kolu-common` owns concepts it doesn't. The `kolu-common` package
+should hold things that are genuinely shared across the host app and
+have no other natural home — not be a barrel for every external
+schema the app happens to use.
+
 ### subscription-use-pending
 
 Never check `sub() === undefined` as a proxy for loading — use `sub.pending()`.
 _Rationale_: Conflates "loading" with "no data" and misses error states.
+
+### solid-reactive-prop-passed-to-hook-must-be-reactive
+
+A "hook" call that takes a reactive prop value as a key — `useComments(props.repoRoot)`, `useStore(props.id)`, `useThing(props.path)` — must be wrapped in `createMemo` or called inline at each use site. A bare `const x = useHook(props.key)` in the component body captures `props.key` at mount, locks the result to that initial value, and silently desyncs if the prop changes — by which point the component is bound to the wrong instance and no surface (toast, console, type error) flags it.
+
+Bad:
+```ts
+const store = useComments(props.repoRoot);
+return <Show when={store.comments().length > 0}>…</Show>;
+```
+
+Good:
+```ts
+const store = createMemo(() => useComments(props.repoRoot));
+return <Show when={store().comments().length > 0}>…</Show>;
+```
+
+Also good — inline at an event-handler use site, where the prop is re-read at click time:
+```ts
+const submit = () => useComments(props.repoRoot).add(…);
+```
+
+_Rationale_: SolidJS re-renders don't re-execute a component's body — only JSX-embedded reactive reads do. A function call in the body that takes a prop value sees only the initial value. This is the same failure mode that "props stay reactive" (in `.claude/rules/solidjs.md`) covers for destructuring, but applied to function-argument passing — a subtler trap because no `const { x } = props` appears in the diff. Codified after the `CommentsTray` / `CommentTextSurface` / `CommentIframeSurface` first-comment regression: the tray captured `useComments(props.repoRoot)` at mount when `meta.git.repoRoot` hadn't streamed yet, so `props.repoRoot` was `""`; the composer (which reads `props.repoRoot` inside its submit handler — fresh) wrote to the real-repoRoot store, and the tray stayed bound to the empty-key one until a full refresh re-mounted it.
 
 ### no-untyped-escape-hatches
 
@@ -26,12 +79,21 @@ Bad: `unwrap(arr[i], "out of bounds")` — type system can't see the throw
 Good: `arr[i] ?? arr[0]` on `NonEmpty<T>` — positional `arr[0]` is statically `T`, fallback is typed
 _Rationale_: Every "untyped throw" wrapper is an escape hatch the compiler can't reason about. The fix is structural — make the data model carry the invariant — not packaging the same assertion behind a nicer name.
 
-### catch-must-surface-error
+### toast-must-include-error-message
 
 When catching an error to show a toast, always include `err.message` in the toast text.
 Bad: `.catch(() => toast.error("Failed to set theme"))`
 Good: `.catch((err: Error) => toast.error(\`Failed to set theme: ${err.message}\`))`
 _Rationale_: Generic error toasts hide the server's actual error message, making debugging impossible. The server returns specific error details via oRPC — surface them.
+
+### caught-error-must-not-collapse-to-empty
+
+When a `try`/`catch` converts a thrown error into a "no data" return value (`undefined`, `null`, `[]`, `""`), the failure must be **distinguishable to the user from a legitimate empty result**. `console.warn` / `console.error` does not count — DevTools is not a user surface. Surface via toast, an error signal the caller renders, a `Result<T, E>` return, or an error boundary.
+
+Bad: `try { return parse(raw); } catch (e) { console.warn(e); return undefined; }` — caller can't tell malformed-input from no-input
+Good: `try { return ok(parse(raw)); } catch (e) { return err({ message: e.message }); }` — caller decides how to render the error
+
+_Rationale_: A silent fallback to empty state means a malformed input renders identically to a missing one. The bug stays invisible until someone notices and instruments DevTools — by which point the data path has been wrong for weeks. This rule covers the gap `toast-must-include-error-message` leaves: that one is about *how* to format a toast you've already decided to show; this one is about whether the failure surfaces at all.
 
 ### styling-tailwind-only
 
@@ -132,6 +194,77 @@ _Good_:
 log?.info({ dir }, "claude-code: dir watcher installed");
 log?.info({ dir }, "claude-code: dir watcher retired");
 ```
+
+### silent-handler-required-on-void-subscriptions
+
+When a hook or subscription primitive returns `void` (no `Subscription<T>` / `error()` accessor / `Result<T,E>` exposed in the result type), its error handler must be **required** at the type level — not optional. A void-returning subscription with optional `onError` silently swallows lifecycle failures: the source dies, the consumer never re-fires, no UI surface, no console warning, nothing.
+
+Bad:
+```ts
+function useEvent(...): void {
+  // catch (err) { if (options?.onError) options.onError(...); }
+}
+```
+
+Good:
+```ts
+function useEvent(..., options: { onError: (err) => void; ... }): void {
+  // catch (err) { options.onError(...); }
+}
+```
+
+_Rationale_: a hook returning `Subscription<T>` with `.error()` lets consumers read the error reactively and render it — optional `onError` is fine there. Void return with no error surface in the result type is a category mismatch; the type system has to require the handler or the failure is invisible by construction. Codified after `useEvent.onError` and `pollOnEvent.onReadError` were tightened to required in `@kolu/surface`.
+
+### callback-fanout-guarded-at-funnel
+
+A watcher/subscription that invokes a caller-supplied callback (`onChange`, `onEvent`, an `emit` helper) from **more than one emission path** must place the try/catch at the single shared funnel the callback passes through — never on a subset of the call sites. A throwing consumer that escapes is not a benign log line: floated through a `void fetchAndEmit()` it surfaces as an **unhandled rejection** (fatal — the global handler in `index.ts` calls `process.exit(1)`), and from a synchronous `channel.consume({ onEvent })` callback it **breaks out of `buildConsume`'s `for await` loop** (`@kolu/surface`), silently freezing that subscription for the rest of the terminal's life.
+
+Bad — boundary on the async path only, leaving the synchronous pending emit uncontained:
+```ts
+async function fetchAndEmit(root) {
+  try { emit(await resolveGitHubPr(root)); } catch (err) { log?.error(…); }
+}
+function setGit(...) {
+  emit({ kind: "pending" }); // ← still runs onChange synchronously, unguarded
+  void fetchAndEmit(root);
+}
+```
+
+Good — boundary inside `emit`, the one point every path funnels through:
+```ts
+function emit(pr) {
+  if (stopped || prResultEqual(pr, lastPr)) return;
+  lastPr = pr;
+  try { onChange(pr); } catch (err) { log?.error({ err }, "…: emit failed"); }
+}
+```
+
+_Rationale_: the dangerous escape is the *uncovered* path, and watchers routinely emit from several (a synchronous "pending" on change + an async resolved value + a poll tick). Guarding one path reads as "handled" in review while another stays a live throw vector. Putting the boundary at the shared invocation point makes "the consumer callback cannot throw out of this watcher" a single-site invariant instead of a per-call-site discipline. Complements `silent-handler-required-on-void-subscriptions` (which requires the *primitive's* `onError` at the type level); this rule is about the *watcher implementation* containing the consumer it fans out to. Codified after a `subscribeGitHubPr` fix guarded `fetchAndEmit` but missed `setGit`'s synchronous `emit({ pending })` ([kolu#1143](https://github.com/juspay/kolu/pull/1143)).
+
+### migration-shape-guard
+
+A `Conf` (or analogous schema) migration that acts on a specific value shape must early-return when the on-disk shape doesn't match its preconditions. Never write transient orphan fields that subsequent migrations are expected to destructure-out.
+
+Bad:
+```ts
+"1.8.0": (store) => {
+  const tab = rp.tab;
+  // fires on undefined too — adds a `tab` orphan to the new flat shape
+  const stale = tab !== "inspector" && tab !== "review";
+  if (stale) store.set(..., { rightPanel: { ...rp, tab: "inspector" } });
+}
+```
+
+Good:
+```ts
+"1.8.0": (store) => {
+  if (typeof rp.tab !== "string") return;  // skip shapes this migration doesn't recognize
+  const stale = rp.tab !== "inspector" && rp.tab !== "review";
+  if (stale) store.set(..., { rightPanel: { ...rp, tab: "inspector" } });
+}
+```
+
+_Rationale_: a migration that writes orphans assuming a downstream migration will clean them up couples migrations to each other — one can't be removed without breaking the next, and a fresh-install ladder accumulates write-then-strip cycles. The shape guard makes each migration idempotent on shapes it doesn't recognize. Caught when 1.13.0 destructured `codeMode` (a real new-schema field) alongside a `tab` orphan that 1.8.0 had spuriously written for fresh installs.
 
 ### icons-in-registry
 

@@ -1,28 +1,31 @@
 /** MobileChromeSheet — content of the pull-down chrome drawer for mobile.
  *
- *  On mobile the viewport is too tight for a persistent pill tree or
- *  control cluster, so chrome lives behind a pull-handle at the top of
- *  the terminal. Tap or pull the handle to reveal this sheet. Contents
- *  mirror the desktop ChromeBar — logo + identity, pill tree (as a
- *  vertical tap list), global controls — but reflowed for touch.
+ *  On mobile, the viewport is too tight for a persistent chrome bar, so
+ *  global controls live behind a pull-handle at the top of the
+ *  terminal. Tap or pull the handle to reveal this sheet. Contents:
+ *  identity (logo + connection dot) and the control cluster (command
+ *  palette, settings, inspector toggle).
+ *
+ *  Terminal navigation moved out of this sheet to its own left-edge
+ *  swipe drawer — see `MobileDockDrawer`. The split mirrors the
+ *  desktop: the dock owns the live-terminal navigator, the
+ *  chrome bar owns global controls.
  *
  *  Sheet machinery (open state, drag-to-dismiss, overlay, portal) is
  *  owned by `MobileTileView` via `@corvu/drawer`. This component only
  *  renders the sheet's contents; `onClose` is called after a user
- *  action (branch select, palette open, inspector toggle) so the
- *  parent can close the drawer. */
+ *  action so the parent can close the drawer. */
 
-import type { TerminalId } from "kolu-common";
-import { type Component, createSignal, For, Show } from "solid-js";
-import { type PillRepoGroup, repoColor } from "./canvas/pillTreeOrder";
+import { type Component, createSignal, Show } from "solid-js";
 import { ACTIONS } from "./input/actions";
 import { formatKeybind } from "./input/keyboard";
+import { reloadForUpdate } from "./pwa";
 import { useRightPanel } from "./right-panel/useRightPanel";
 import type { WsStatus } from "./rpc/rpc";
 import SettingsPopover from "./settings/SettingsPopover";
-import { useTerminalStore } from "./terminal/useTerminalStore";
-import { SettingsIcon } from "./ui/Icons";
+import { InspectorToggleIcon, SettingsIcon } from "./ui/Icons";
 import Kbd from "./ui/Kbd";
+import { clientStale, StaleBadge } from "./ui/StaleBadge";
 
 const statusStyles: Record<WsStatus, string> = {
   connecting: "bg-warning animate-pulse",
@@ -34,22 +37,14 @@ const MobileChromeSheet: Component<{
   status: WsStatus;
   appTitle: string;
   onOpenPalette: () => void;
-  groups: PillRepoGroup[];
-  onSelect: (id: TerminalId) => void;
-  /** Close the drawer after the user takes an action (branch select,
-   *  palette open, inspector toggle). The drawer is otherwise dismissed
-   *  by drag-down or overlay tap, both handled by Corvu. */
+  /** Close the drawer after the user takes an action (palette open,
+   *  inspector toggle). The drawer is otherwise dismissed by drag-down
+   *  or overlay tap, both handled by Corvu. */
   onClose: () => void;
 }> = (props) => {
   const rightPanel = useRightPanel();
-  const store = useTerminalStore();
   let settingsTriggerRef!: HTMLButtonElement;
   const [settingsOpen, setSettingsOpen] = createSignal(false);
-
-  function handleSelect(id: TerminalId) {
-    props.onSelect(id);
-    props.onClose();
-  }
 
   return (
     <div data-testid="mobile-chrome-sheet" class="flex flex-col">
@@ -72,65 +67,31 @@ const MobileChromeSheet: Component<{
         />
       </div>
 
-      {/* Pill tree — vertical list, one branch per row. Repo headers
-       *  break up sections; tap any branch to switch and dismiss. */}
-      <div class="flex flex-col py-1">
-        <For each={props.groups}>
-          {(group) => (
-            <div class="flex flex-col">
-              <div
-                class="px-3 pt-2 pb-1 text-[0.65rem] font-semibold uppercase tracking-wide"
-                style={{ color: repoColor(group, store.getDisplayInfo) }}
-              >
-                {group.repoName}
-              </div>
-              <For each={group.branches}>
-                {(b) => {
-                  const active = () => store.activeId() === b.id;
-                  const unread = () => store.isUnread(b.id);
-                  return (
-                    <button
-                      type="button"
-                      data-testid="mobile-pill-branch"
-                      data-terminal-id={b.id}
-                      data-active={active() ? "" : undefined}
-                      data-unread={unread() ? "" : undefined}
-                      class="flex items-center gap-2 px-5 py-2 text-sm text-left transition-colors cursor-pointer active:bg-surface-2"
-                      classList={{
-                        "bg-accent/20 text-fg font-medium": active(),
-                        "text-fg-2": !active(),
-                      }}
-                      // stopPropagation on pointerdown keeps Corvu Drawer's
-                      // drag-to-dismiss handler on Drawer.Content from
-                      // claiming the gesture — without this, any micro-drag
-                      // during a tap suppresses the click event.
-                      onPointerDown={(e) => e.stopPropagation()}
-                      onClick={() => handleSelect(b.id)}
-                    >
-                      <span
-                        aria-hidden="true"
-                        class="font-mono text-xs text-fg-3 select-none"
-                      >
-                        └─
-                      </span>
-                      <span class="flex-1 truncate">{b.label}</span>
-                      <Show when={unread()}>
-                        <span class="w-2 h-2 rounded-full bg-alert" />
-                      </Show>
-                    </button>
-                  );
-                }}
-              </For>
-            </div>
-          )}
-        </For>
-      </div>
+      {/* Client out of sync with the server — the actionable mobile form of the
+       *  desktop rail's `≠ srv` signal: a one-tap reload onto the deployed build
+       *  (reloadForUpdate is a plain location.reload() off HTTPS, landing fresh
+       *  because the shell is no-store). */}
+      <Show when={clientStale()}>
+        <button
+          type="button"
+          data-testid="mobile-stale-reload"
+          class="mx-3 mt-2 flex h-9 items-center justify-center gap-2 rounded-lg border border-warning/40 bg-warning/10 text-sm text-warning active:bg-warning/20"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => {
+            reloadForUpdate();
+            props.onClose();
+          }}
+        >
+          <StaleBadge />
+          <span>Client out of date — reload</span>
+        </button>
+      </Show>
 
       {/* Control cluster — palette, settings, inspector. Each button
        *  stops propagation on pointerdown so Corvu Drawer's drag handler
        *  on Drawer.Content can't claim the tap as the start of a drag
        *  (which would suppress the click). */}
-      <div class="flex items-center gap-2 px-3 py-2 border-t border-edge/50">
+      <div class="flex items-center gap-2 px-3 py-3">
         <button
           type="button"
           data-testid="palette-trigger"
@@ -167,16 +128,19 @@ const MobileChromeSheet: Component<{
           data-testid="inspector-toggle"
           class="h-9 w-9 flex items-center justify-center text-fg-2 bg-surface-2 rounded-lg border border-edge active:bg-surface-3"
           classList={{
-            "bg-surface-3 text-fg": !rightPanel.collapsed(),
+            "bg-surface-3 text-fg": rightPanel.drawerOpen(),
           }}
           onPointerDown={(e) => e.stopPropagation()}
           onClick={() => {
-            rightPanel.togglePanel();
+            // Mobile drawer is session-local — do NOT call togglePanel,
+            // which writes the desktop chrome preference. This is the
+            // whole reason `drawerOpen` exists as a separate signal.
+            rightPanel.setDrawerOpen(!rightPanel.drawerOpen());
             props.onClose();
           }}
           aria-label="Toggle inspector"
         >
-          ⟳
+          <InspectorToggleIcon active={rightPanel.drawerOpen()} />
         </button>
       </div>
     </div>

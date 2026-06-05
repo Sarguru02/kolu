@@ -2,7 +2,7 @@
  *  through the unified action registry in `./actions.ts`. */
 
 import { makeEventListener } from "@solid-primitives/event-listener";
-import type { TerminalId } from "kolu-common";
+import type { TerminalId } from "kolu-common/surface";
 import {
   ACTIONS,
   type ActionContext,
@@ -15,7 +15,7 @@ import { matchesKeybind } from "./keyboard";
 /** MRU cycling state — a frozen snapshot is taken on the first Tab press while
  *  the modifier (Alt or Ctrl) is held, and the cursor advances through that
  *  snapshot on each subsequent Tab. Using the live MRU would re-order under
- *  our feet as setActiveId fires. Snapshot resets on modifier keyup. */
+ *  our feet as activate fires. Snapshot resets on modifier keyup. */
 interface MruCycleState {
   snapshot: TerminalId[];
   cursor: number;
@@ -49,13 +49,23 @@ export function useShortcuts(ctx: ActionContext) {
     const n = cycle.snapshot.length;
     cycle.cursor = (cycle.cursor + direction + n) % n;
     const target = cycle.snapshot[cycle.cursor];
-    if (target) ctx.setActiveId(target);
+    if (target) ctx.activate(target);
   }
 
   makeEventListener(
     window,
     "keydown",
     (e: KeyboardEvent) => {
+      // Bail when focus is inside an opt-in modal — comment composer,
+      // command palette body, anything else that marks itself with
+      // `data-kolu-modal="true"`. Without this, capture-phase global
+      // shortcuts (this listener) fire BEFORE any bubble-phase handler
+      // the modal installs, so Cmd+Enter in a textarea would dispatch
+      // both "New terminal" (here) AND the modal's Save (later). Modals
+      // self-opt by setting the attribute; they keep full control of
+      // every keystroke while focused.
+      const target = e.target as Element | null;
+      if (target?.closest?.('[data-kolu-modal="true"]')) return;
       const handled = dispatch(e, ctx, advanceCycle);
       if (handled) {
         e.preventDefault();

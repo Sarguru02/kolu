@@ -6,7 +6,7 @@
 // Name generation
 export { randomName } from "memorable-names";
 // File tree browsing
-export { listAll, readFile } from "./browse.ts";
+export { listAll, readFile, statFileMtimeMs } from "./browse.ts";
 // Equality predicates for streamed snapshot dedup
 export {
   fsListAllOutputEqual,
@@ -35,13 +35,21 @@ export {
 // Diff review
 export { getDiff, getStatus, parseNameStatus } from "./review.ts";
 // Path security
-export { resolveUnder } from "./safe-path.ts";
+export {
+  assertRealpathUnder,
+  resolveExistingUnder,
+  resolveUnder,
+} from "./safe-path.ts";
+// File-preview classification used to live here; it moved to the node-free
+// `kolu-common/preview` (a preview concern shared by client + server, not a
+// git operation). The `FsReadFileOutput` schema it feeds stays below.
 // Schemas
 export {
   FsListAllInputSchema,
   type FsListAllOutput,
   FsListAllOutputSchema,
   FsReadFileInputSchema,
+  type FsReadFileOutput,
   FsReadFileOutputSchema,
   type GitBaseRef,
   GitBaseRefSchema,
@@ -61,6 +69,7 @@ export {
   GitStatusOutputSchema,
   WorktreeCreateInputSchema,
   WorktreeCreateOutputSchema,
+  WorktreeNameSchema,
   WorktreeRemoveInputSchema,
 } from "./schemas.ts";
 // Working-tree watcher (axis 4, parcel-watcher backed)

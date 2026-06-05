@@ -1,0 +1,34 @@
+{
+  "name": "@kolu/solid-markdown",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./render": "./src/render.ts",
+    "./url-policy": "./src/url-policy.ts",
+    "./markdown.css": "./src/markdown.css"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:unit": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.0"
+  },
+  "dependencies": {
+    "@kolu/html-escape": "workspace:*",
+    "dompurify": "^3.2.4",
+    "marked": "^18.0.2",
+    "marked-alert": "^2.1.2",
+    "marked-footnote": "^1.2.4",
+    "marked-gfm-heading-id": "^4.1.1",
+    "shiki": "^3.23.0",
+    "solid-js": "^1.9.0"
+  }
+}

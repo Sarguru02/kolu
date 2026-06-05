@@ -1,5 +1,5 @@
 import * as assert from "node:assert";
-import { Then, When } from "@cucumber/cucumber";
+import { Given, Then, When } from "@cucumber/cucumber";
 import { type KoluWorld, POLL_TIMEOUT } from "../support/world.ts";
 
 const CANVAS_SELECTOR = '[data-testid="canvas-container"]';
@@ -191,34 +191,50 @@ Then(
   },
 );
 
-Then(
-  "the newest canvas tile should be centered in the viewport",
-  async function (this: KoluWorld) {
-    await this.page.waitForFunction(
-      (sel: string) => {
-        const container = document.querySelector(sel);
-        if (!container) return false;
+/** Poll until the picked tile's bounding-box center matches the canvas
+ *  container's center within grid-snap tolerance. `pick` chooses which
+ *  tile: "newest" = last in DOM order (waits for ≥2 to exist),
+ *  "active" = the one carrying `data-active="true"`. */
+async function waitForTileCenteredInViewport(
+  world: KoluWorld,
+  pick: "newest" | "active",
+) {
+  await world.page.waitForFunction(
+    ({ sel, pick }: { sel: string; pick: "newest" | "active" }) => {
+      const container = document.querySelector(sel);
+      if (!container) return false;
+      let tile: HTMLElement | null;
+      if (pick === "newest") {
         const tiles = container.querySelectorAll(
           "[data-terminal-id][data-visible]",
         );
         if (tiles.length < 2) return false;
-        const tile = tiles[tiles.length - 1] as HTMLElement;
-        const cRect = container.getBoundingClientRect();
-        const tRect = tile.getBoundingClientRect();
-        // Tile center vs container center — allow tolerance for grid snapping
-        const tileCx = tRect.left + tRect.width / 2 - cRect.left;
-        const tileCy = tRect.top + tRect.height / 2 - cRect.top;
-        const viewCx = cRect.width / 2;
-        const viewCy = cRect.height / 2;
-        const tolerance = 40; // grid snap (24px) + rounding
-        return (
-          Math.abs(tileCx - viewCx) < tolerance &&
-          Math.abs(tileCy - viewCy) < tolerance
-        );
-      },
-      CANVAS_SELECTOR,
-      { timeout: POLL_TIMEOUT },
-    );
+        tile = tiles[tiles.length - 1] as HTMLElement;
+      } else {
+        tile = container.querySelector('[data-active="true"]');
+      }
+      if (!tile) return false;
+      const cRect = container.getBoundingClientRect();
+      const tRect = tile.getBoundingClientRect();
+      const tileCx = tRect.left + tRect.width / 2 - cRect.left;
+      const tileCy = tRect.top + tRect.height / 2 - cRect.top;
+      const viewCx = cRect.width / 2;
+      const viewCy = cRect.height / 2;
+      const tolerance = 40; // grid snap (24px) + rounding
+      return (
+        Math.abs(tileCx - viewCx) < tolerance &&
+        Math.abs(tileCy - viewCy) < tolerance
+      );
+    },
+    { sel: CANVAS_SELECTOR, pick },
+    { timeout: POLL_TIMEOUT },
+  );
+}
+
+Then(
+  "the newest canvas tile should be centered in the viewport",
+  async function (this: KoluWorld) {
+    await waitForTileCenteredInViewport(this, "newest");
   },
 );
 
@@ -255,19 +271,257 @@ Then(
   },
 );
 
+Then(
+  "the active canvas tile should be centered in the viewport",
+  async function (this: KoluWorld) {
+    await waitForTileCenteredInViewport(this, "active");
+  },
+);
+
+When("I click the minimap arrange button", async function (this: KoluWorld) {
+  const button = this.page.locator('[data-testid="minimap-arrange"]');
+  await button.waitFor({ state: "visible", timeout: POLL_TIMEOUT });
+  await button.click();
+  await this.waitForFrame();
+});
+
+const WINDOW_TRIGGER_SELECTOR = '[data-testid="minimap-window-trigger"]';
+
+Then(
+  "the minimap window trigger should be visible",
+  async function (this: KoluWorld) {
+    await this.page
+      .locator(WINDOW_TRIGGER_SELECTOR)
+      .waitFor({ state: "visible", timeout: POLL_TIMEOUT });
+  },
+);
+
+Then(
+  /^the minimap window should be "(all|4h|12h|24h|48h)"$/,
+  async function (this: KoluWorld, expected: string) {
+    await this.page.waitForFunction(
+      ({ sel, want }: { sel: string; want: string }) => {
+        const el = document.querySelector(sel) as HTMLElement | null;
+        return el?.getAttribute("data-window") === want;
+      },
+      { sel: WINDOW_TRIGGER_SELECTOR, want: expected },
+      { timeout: POLL_TIMEOUT },
+    );
+  },
+);
+
+When("I click the minimap window trigger", async function (this: KoluWorld) {
+  const button = this.page.locator(WINDOW_TRIGGER_SELECTOR);
+  await button.waitFor({ state: "visible", timeout: POLL_TIMEOUT });
+  await button.click();
+  await this.waitForFrame();
+});
+
+When(
+  /^I pick the minimap window option "(all|4h|12h|24h|48h)"$/,
+  async function (this: KoluWorld, value: string) {
+    const opt = this.page.locator(
+      `[data-testid="minimap-window-option-${value}"]`,
+    );
+    await opt.waitFor({ state: "visible", timeout: POLL_TIMEOUT });
+    await opt.click();
+    await this.waitForFrame();
+  },
+);
+
+Then(
+  /^minimap tile (\d+) should be in the "(awaiting|working|none)" bucket$/,
+  async function (this: KoluWorld, index: number, bucket: string) {
+    const i = Number(index) - 1;
+    await this.page.waitForFunction(
+      ({ i, want }: { i: number; want: string }) => {
+        const rects = document.querySelectorAll(
+          '[data-testid="minimap-tile-rect"]',
+        );
+        const rect = rects[i] as HTMLElement | undefined;
+        if (!rect) return false;
+        return rect.getAttribute("data-bucket") === want;
+      },
+      { i, want: bucket },
+      { timeout: POLL_TIMEOUT },
+    );
+  },
+);
+
+Then("no two canvas tiles should overlap", async function (this: KoluWorld) {
+  await this.page.waitForFunction(
+    (sel: string) => {
+      const tiles = Array.from(
+        document.querySelectorAll(`${sel} [data-terminal-id][data-visible]`),
+      ).map((t) => {
+        const wrapper = (t as HTMLElement).closest(
+          "[style*='left']",
+        ) as HTMLElement | null;
+        return (wrapper ?? (t as HTMLElement)).getBoundingClientRect();
+      });
+      for (let i = 0; i < tiles.length; i++) {
+        for (let j = i + 1; j < tiles.length; j++) {
+          const a = tiles[i];
+          const b = tiles[j];
+          if (!a || !b) continue;
+          // 2 px tolerance: tiles touching at exact grid edges shouldn't
+          // count as overlapping.
+          const overlapX = a.left < b.right - 2 && a.right - 2 > b.left;
+          const overlapY = a.top < b.bottom - 2 && a.bottom - 2 > b.top;
+          if (overlapX && overlapY) return false;
+        }
+      }
+      return true;
+    },
+    CANVAS_SELECTOR,
+    { timeout: POLL_TIMEOUT },
+  );
+});
+
+When("I save the active canvas tile id", async function (this: KoluWorld) {
+  const id = await this.page.evaluate((sel: string) => {
+    const tile = document
+      .querySelector(sel)
+      ?.querySelector('[data-active="true"]');
+    return (
+      tile
+        ?.querySelector("[data-terminal-id]")
+        ?.getAttribute("data-terminal-id") ??
+      tile?.getAttribute("data-terminal-id") ??
+      null
+    );
+  }, CANVAS_SELECTOR);
+  if (!id) throw new Error("No active canvas tile to save");
+  this.savedActiveTerminalId = id;
+});
+
+async function waitForSavedActiveTileStillActive(world: KoluWorld) {
+  const saved = world.savedActiveTerminalId;
+  if (!saved) throw new Error("No saved active canvas tile id");
+  await world.page.waitForFunction(
+    ({ sel, savedId }: { sel: string; savedId: string }) => {
+      // The active tile's CanvasTile wrapper carries data-active="true".
+      // Its inner Terminal element carries data-terminal-id. Walk down
+      // from the active wrapper rather than checking every tile —
+      // that makes "did active flip to a different tile" the failure
+      // mode, not "is savedId still in the DOM" (it always is).
+      const activeWrapper = document
+        .querySelector(sel)
+        ?.querySelector('[data-active="true"]');
+      if (!activeWrapper) return false;
+      const inner = activeWrapper.querySelector("[data-terminal-id]");
+      const activeId =
+        inner?.getAttribute("data-terminal-id") ??
+        activeWrapper.getAttribute("data-terminal-id");
+      return activeId === savedId;
+    },
+    { sel: CANVAS_SELECTOR, savedId: saved },
+    { timeout: POLL_TIMEOUT },
+  );
+}
+
+Then(
+  "the saved active canvas tile should still be active",
+  async function (this: KoluWorld) {
+    await waitForSavedActiveTileStillActive(this);
+  },
+);
+
+// Deterministic race-forcer. Installs a Playwright init script that runs
+// before every subsequent navigation and patches `window.WebSocket` so the
+// first EVENT_ITERATOR yield for `/surface/session/get` is held for `ms`
+// before being dispatched. `terminalList.get`'s first yield reaches the
+// surface client unblocked, so the canvas first-mount centering effect
+// (`TerminalCanvas.tsx:331`) always observes a null `activeId`, takes the
+// bbox-fallback branch, pans the viewport, and the `isDefaultViewport()`
+// guard latches the bug for the rest of the session — exactly the
+// production race described in `useSessionRestore.ts:178-182`, made
+// deterministic. 500ms is overkill for the race window but cheap.
+Given(
+  "session.get's first yield is delayed by {int} ms to force the active-id race",
+  async function (this: KoluWorld, ms: number) {
+    // Plain-string init script: Playwright pipes function-form scripts
+    // through esbuild, which inserts `__name(fn, "…")` for name-preservation
+    // and crashes in the page context with `__name is not defined`. The
+    // hook itself isn't TypeScript-heavy enough to need transpilation, so
+    // a hand-written IIFE sidesteps the toolchain entirely.
+    await this.page.addInitScript(`(() => {
+      const Original = globalThis.WebSocket;
+      const SESSION_PATH = "/surface/session/get";
+      const DELAY_MS = ${ms};
+      function readJsonHeader(bytes) {
+        const delim = bytes.indexOf(255);
+        const jsonBytes = delim >= 0 ? bytes.subarray(0, delim) : bytes;
+        return JSON.parse(new TextDecoder().decode(jsonBytes));
+      }
+      function PatchedWebSocket(url, protocols) {
+        const ws = new Original(url, protocols);
+        if (!String(url).includes("/rpc/ws")) return ws;
+        const sessionIds = new Set();
+        const seenFirstYield = new Set();
+        const origSend = ws.send.bind(ws);
+        ws.send = (data) => {
+          try {
+            let msg = null;
+            if (data instanceof Uint8Array) msg = readJsonHeader(data);
+            else if (data instanceof ArrayBuffer) msg = readJsonHeader(new Uint8Array(data));
+            else if (typeof data === "string") msg = JSON.parse(data);
+            if (msg && typeof msg.p?.u === "string" && msg.p.u.includes(SESSION_PATH)) {
+              sessionIds.add(msg.i);
+            }
+          } catch {}
+          return origSend(data);
+        };
+        const origAdd = ws.addEventListener.bind(ws);
+        ws.addEventListener = (type, listener, options) => {
+          if (type !== "message" || typeof listener !== "function") {
+            return origAdd(type, listener, options);
+          }
+          const wrapped = async (event) => {
+            try {
+              const data = event.data;
+              let bytes = null;
+              if (data instanceof Blob) bytes = new Uint8Array(await data.arrayBuffer());
+              else if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+              else if (typeof data === "string") bytes = new TextEncoder().encode(data);
+              if (bytes) {
+                const msg = readJsonHeader(bytes);
+                // EVENT_ITERATOR=3 (server pushing yields). Only delay the
+                // first one per session id — subsequent updates (session
+                // auto-save echoes) shouldn't be slowed.
+                if (msg && msg.t === 3 && sessionIds.has(msg.i) && !seenFirstYield.has(msg.i)) {
+                  seenFirstYield.add(msg.i);
+                  await new Promise((r) => setTimeout(r, DELAY_MS));
+                }
+              }
+            } catch {}
+            listener.call(ws, event);
+          };
+          return origAdd(type, wrapped, options);
+        };
+        return ws;
+      }
+      PatchedWebSocket.prototype = Original.prototype;
+      Object.setPrototypeOf(PatchedWebSocket, Original);
+      globalThis.WebSocket = PatchedWebSocket;
+    })();`);
+  },
+);
+
 // ── Gesture ownership: two-finger scroll on terminal must not pan the canvas ──
 
-/** Read the inner canvas transform div's transform (scale(z) translate(x, y)).
- *  Stable string identity is enough to prove pan/zoom did or didn't change.
- *  The transform div carries `data-testid="canvas-transform"` — querying by
- *  testid (rather than `firstElementChild`) keeps this robust against
- *  sibling overlays (watermark, future canvas-level chrome). */
+/** Read the canvas viewport transform string (`scale(z) translate(-pan…)`).
+ *  Surfaced as `data-viewport` on the canvas-container element since #988
+ *  retired the wrapper transform div in favour of per-tile composition —
+ *  we still need a pan/zoom-only observable for tests (a tile's own
+ *  `style.transform` also folds in layout coords + drag delta). Stable
+ *  string identity is enough to prove pan/zoom did or didn't change. */
 async function readCanvasTransform(world: KoluWorld): Promise<string> {
   return await world.page.evaluate(() => {
-    const inner = document.querySelector(
-      '[data-testid="canvas-transform"]',
+    const container = document.querySelector(
+      '[data-testid="canvas-container"]',
     ) as HTMLElement | null;
-    return inner?.style.transform ?? "";
+    return container?.getAttribute("data-viewport") ?? "";
   });
 }
 
@@ -500,10 +754,12 @@ Then(
       .__canvasTransform;
     await this.page.waitForFunction(
       (prev: string) => {
-        const inner = document.querySelector(
-          '[data-testid="canvas-transform"]',
+        const container = document.querySelector(
+          '[data-testid="canvas-container"]',
         ) as HTMLElement | null;
-        return inner !== null && inner.style.transform !== prev;
+        return (
+          container !== null && container.getAttribute("data-viewport") !== prev
+        );
       },
       before ?? "",
       { timeout: POLL_TIMEOUT },
@@ -531,14 +787,11 @@ Then("the minimap map should be visible", async function (this: KoluWorld) {
 
 When("I save the canvas viewport state", async function (this: KoluWorld) {
   const state = await this.page.evaluate((sel: string) => {
-    const container = document.querySelector(sel);
-    const inner = document.querySelector(
-      '[data-testid="canvas-transform"]',
-    ) as HTMLElement | null;
+    const container = document.querySelector(sel) as HTMLElement | null;
     if (!container) return null;
     return {
       zoom: container.getAttribute("data-zoom"),
-      transform: inner?.style.transform,
+      transform: container.getAttribute("data-viewport"),
     };
   }, CANVAS_SELECTOR);
   this.savedViewportState = state;
@@ -602,10 +855,13 @@ Then(
     const saved = this.savedViewportState;
     await this.page.waitForFunction(
       (prev: { transform: string | null }) => {
-        const inner = document.querySelector(
-          '[data-testid="canvas-transform"]',
+        const container = document.querySelector(
+          '[data-testid="canvas-container"]',
         ) as HTMLElement | null;
-        return inner !== null && inner.style.transform !== prev.transform;
+        return (
+          container !== null &&
+          container.getAttribute("data-viewport") !== prev.transform
+        );
       },
       { transform: saved?.transform ?? null },
       { timeout: POLL_TIMEOUT },
@@ -855,45 +1111,151 @@ Then(
 );
 
 When(
-  "I move the canvas tile to x={int} y={int}",
-  async function (this: KoluWorld, x: number, y: number) {
-    const { id } = await readFirstTilePosition(this);
-    const layout = { x, y, w: 700, h: 500 };
-    const resp = await this.page.request.fetch(
-      "/rpc/terminal/setCanvasLayout",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        data: JSON.stringify({ json: { id, layout } }),
-      },
+  "I move every canvas tile to a distinct scattered position",
+  async function (this: KoluWorld) {
+    // Distinct, far-apart, off-grid coordinates — deliberately NOT
+    // anywhere an auto-layout would place tiles, so that ANY re-arrange on
+    // the next create would visibly snap a tile off its spot and fail the
+    // position-preservation assertion. Scattering is the whole point: tiles
+    // sitting in auto-grid positions could be "rearranged" right back onto
+    // themselves, masking the bug.
+    const SCATTER = [
+      { x: 220, y: 160 },
+      { x: 2860, y: 360 },
+      { x: 360, y: 2420 },
+      { x: 3040, y: 2580 },
+      { x: 1500, y: 1180 },
+    ];
+    const ids: string[] = await this.page.evaluate(
+      (sel: string) =>
+        Array.from(
+          document.querySelectorAll(`${sel} [data-terminal-id][data-visible]`),
+        )
+          .map((el) => (el as HTMLElement).getAttribute("data-terminal-id"))
+          .filter((id): id is string => id !== null),
+      CANVAS_SELECTOR,
     );
-    assert.ok(resp.ok(), `terminal/setCanvasLayout failed: ${resp.status()}`);
-    // Wait for the tile to render at the new position — proves the metadata
-    // subscription delivered the update (the mechanism that must survive refresh).
+    if (ids.length === 0) throw new Error("No canvas tiles to scatter");
+    for (const [i, id] of ids.entries()) {
+      const pos = SCATTER[i % SCATTER.length];
+      if (!pos) continue;
+      await setCanvasLayoutById(this, id, pos.x, pos.y);
+    }
+  },
+);
+
+When("I record all canvas tile positions", async function (this: KoluWorld) {
+  this.recordedTilePositions = await this.page.evaluate((sel: string) => {
+    const out: Record<string, { left: number; top: number }> = {};
+    for (const inner of document.querySelectorAll(
+      `${sel} [data-terminal-id][data-visible]`,
+    )) {
+      const id = (inner as HTMLElement).getAttribute("data-terminal-id");
+      const tile = (inner as HTMLElement).closest(
+        "[style*='left']",
+      ) as HTMLElement | null;
+      if (id && tile) {
+        out[id] = {
+          left: parseFloat(tile.style.left),
+          top: parseFloat(tile.style.top),
+        };
+      }
+    }
+    return out;
+  }, CANVAS_SELECTOR);
+});
+
+Then(
+  "previously-recorded canvas tiles should not have moved",
+  async function (this: KoluWorld) {
+    const recorded = this.recordedTilePositions;
+    if (!recorded || Object.keys(recorded).length === 0) {
+      throw new Error("No recorded canvas tile positions to compare against");
+    }
+    // Positions are canvas-space (`style.left`/`top`) — pan/zoom rides the
+    // tile's `transform`, so this is immune to the create flow recentring
+    // the viewport. If creating a terminal re-arranged the island, an
+    // existing tile would land at a new left/top and this never settles.
     await this.page.waitForFunction(
       ({
         sel,
-        tileId,
-        wantX,
-        wantY,
+        recorded,
       }: {
         sel: string;
-        tileId: string;
-        wantX: number;
-        wantY: number;
+        recorded: Record<string, { left: number; top: number }>;
       }) => {
-        const tile = document
-          .querySelector(`${sel} [data-terminal-id="${tileId}"]`)
-          ?.closest("[style*='left']") as HTMLElement | null;
-        if (!tile) return false;
-        return (
-          Math.abs(parseFloat(tile.style.left) - wantX) < 1 &&
-          Math.abs(parseFloat(tile.style.top) - wantY) < 1
-        );
+        for (const [id, pos] of Object.entries(recorded)) {
+          const tile = document
+            .querySelector(`${sel} [data-terminal-id="${id}"]`)
+            ?.closest("[style*='left']") as HTMLElement | null;
+          if (!tile) return false;
+          if (Math.abs(parseFloat(tile.style.left) - pos.left) >= 1)
+            return false;
+          if (Math.abs(parseFloat(tile.style.top) - pos.top) >= 1) return false;
+        }
+        return true;
       },
-      { sel: CANVAS_SELECTOR, tileId: id, wantX: x, wantY: y },
+      { sel: CANVAS_SELECTOR, recorded },
       { timeout: POLL_TIMEOUT },
     );
+  },
+);
+
+async function setCanvasLayoutById(
+  world: KoluWorld,
+  id: string,
+  x: number,
+  y: number,
+): Promise<void> {
+  const layout = { x, y, w: 700, h: 500 };
+  const resp = await world.page.request.fetch("/rpc/terminal/setCanvasLayout", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    data: JSON.stringify({ json: { id, layout } }),
+  });
+  assert.ok(resp.ok(), `terminal/setCanvasLayout failed: ${resp.status()}`);
+  // Wait for the tile to render at the new position — proves the metadata
+  // subscription delivered the update (the mechanism that must survive refresh).
+  await world.page.waitForFunction(
+    ({
+      sel,
+      tileId,
+      wantX,
+      wantY,
+    }: {
+      sel: string;
+      tileId: string;
+      wantX: number;
+      wantY: number;
+    }) => {
+      const tile = document
+        .querySelector(`${sel} [data-terminal-id="${tileId}"]`)
+        ?.closest("[style*='left']") as HTMLElement | null;
+      if (!tile) return false;
+      return (
+        Math.abs(parseFloat(tile.style.left) - wantX) < 1 &&
+        Math.abs(parseFloat(tile.style.top) - wantY) < 1
+      );
+    },
+    { sel: CANVAS_SELECTOR, tileId: id, wantX: x, wantY: y },
+    { timeout: POLL_TIMEOUT },
+  );
+}
+
+When(
+  "I move the canvas tile to x={int} y={int}",
+  async function (this: KoluWorld, x: number, y: number) {
+    const { id } = await readFirstTilePosition(this);
+    await setCanvasLayoutById(this, id, x, y);
+  },
+);
+
+When(
+  "I move canvas tile {int} to x={int} y={int}",
+  async function (this: KoluWorld, index: number, x: number, y: number) {
+    const id = this.createdTerminalIds[index - 1];
+    assert.ok(id, `No terminal created at index ${index} in this scenario`);
+    await setCanvasLayoutById(this, id, x, y);
   },
 );
 
@@ -934,7 +1296,7 @@ When(
   async function (this: KoluWorld, index: number) {
     // Synthesize a `dblclick` event directly on the title bar in page
     // context — Playwright's real-mouse dblclick contends with the
-    // PillTree overlay and the parent tile's drag activator on a
+    // Workspace-switcher overlay and the parent tile's drag activator on a
     // maximized tile (its position changes from absolute → fixed mid-
     // sequence). Dispatching the event bypasses both.
     await this.page.evaluate((i) => {
@@ -953,19 +1315,17 @@ When(
 
 Then(
   "canvas tile {int} should be maximized",
-  async function (this: KoluWorld, index: number) {
-    const tile = this.page.locator(TILE_SELECTOR).nth(index - 1);
-    await tile.waitFor({ state: "visible", timeout: POLL_TIMEOUT });
-    await this.page.waitForFunction(
-      (sel: string) => {
-        const tiles = document.querySelectorAll(sel);
-        return [...tiles].some(
-          (t) => t.getAttribute("data-maximized") === "true",
-        );
-      },
-      TILE_SELECTOR,
-      { timeout: POLL_TIMEOUT },
+  async function (this: KoluWorld, _index: number) {
+    // Since #988, all tiles render in one stable list and the maximized
+    // tile is CSS-promoted (`inset-0 z-40`) rather than rendered in a
+    // separate branch. `nth(index-1)` can still resolve to a non-
+    // maximized sibling of the same list, so match on `data-maximized="true"`.
+    const maximizedTile = this.page.locator(
+      `${TILE_SELECTOR}[data-maximized="true"]`,
     );
+    await maximizedTile
+      .first()
+      .waitFor({ state: "visible", timeout: POLL_TIMEOUT });
   },
 );
 
@@ -981,3 +1341,113 @@ Then("no canvas tile should be maximized", async function (this: KoluWorld) {
     { timeout: POLL_TIMEOUT },
   );
 });
+
+When(
+  "I click the chrome-bar maximize toggle",
+  async function (this: KoluWorld) {
+    const button = this.page.locator('[data-testid="maximize-toggle"]');
+    await button.waitFor({ state: "visible", timeout: POLL_TIMEOUT });
+    await button.click();
+    await this.waitForFrame();
+  },
+);
+
+// A covered tile (non-maximized, in maximized posture) must hide itself via
+// computed `visibility: hidden` — Playwright reports it as not visible. Before
+// the fix the covered tile shared `tiledStyle()` (computed visibility
+// "visible") and was only occluded by the maximized tile's z-40 cover, so this
+// assertion fails; it passes once covered tiles hide intrinsically.
+Then(
+  "every non-maximized canvas tile should be hidden",
+  async function (this: KoluWorld) {
+    await this.page.waitForFunction(
+      (sel: string) => {
+        const covered = [...document.querySelectorAll(sel)].filter(
+          (t) => t.getAttribute("data-maximized") !== "true",
+        );
+        return (
+          covered.length > 0 &&
+          covered.every(
+            (t) => getComputedStyle(t as HTMLElement).visibility === "hidden",
+          )
+        );
+      },
+      TILE_SELECTOR,
+      { timeout: POLL_TIMEOUT },
+    );
+  },
+);
+
+// ── Tile xterm-instance stability (regression for #988) ──
+//
+// Detect xterm.js remounts across an active-id switch in maximized mode.
+// The tag is a unique attribute set on the `.xterm` DOM node — it survives
+// iff the same DOM node survives. Today's broken behaviour replaces the
+// node on every switch; the fix promotes a tile to maximized via CSS only,
+// leaving the node intact.
+
+When(
+  "I tag canvas tile {int}'s xterm element",
+  async function (this: KoluWorld, index: number) {
+    // xterm.js's `onMount` awaits `document.fonts.load` before creating
+    // the `.xterm` DOM node, so on a slow host the element may not exist
+    // when this step first fires. Poll until it does, then tag it.
+    await this.page.waitForFunction(
+      ({ sel, i }: { sel: string; i: number }) => {
+        const tile = document
+          .querySelectorAll(`${sel} [data-terminal-id][data-visible]`)
+          .item(i) as HTMLElement | null;
+        return tile?.querySelector(".xterm") != null;
+      },
+      { sel: CANVAS_SELECTOR, i: index - 1 },
+      { timeout: POLL_TIMEOUT },
+    );
+    await this.page.evaluate(
+      ({ sel, i }: { sel: string; i: number }) => {
+        const tile = document
+          .querySelectorAll(`${sel} [data-terminal-id][data-visible]`)
+          .item(i) as HTMLElement | null;
+        const xterm = tile?.querySelector(".xterm") as HTMLElement | null;
+        if (!xterm) throw new Error(`xterm element in tile ${i + 1} not found`);
+        const tag = `xterm-${Date.now()}-${Math.random()}`;
+        xterm.setAttribute("data-stability-tag", tag);
+        (
+          window as unknown as { __xtermStabilityTag?: string }
+        ).__xtermStabilityTag = tag;
+      },
+      { sel: CANVAS_SELECTOR, i: index - 1 },
+    );
+  },
+);
+
+Then("some canvas tile should be maximized", async function (this: KoluWorld) {
+  const maximizedTile = this.page.locator(
+    `${TILE_SELECTOR}[data-maximized="true"]`,
+  );
+  await maximizedTile
+    .first()
+    .waitFor({ state: "visible", timeout: POLL_TIMEOUT });
+});
+
+Then(
+  "the tagged xterm element should still exist in the DOM",
+  async function (this: KoluWorld) {
+    // The tag is unique per-test-run; finding any element with that
+    // attribute proves the originally-tagged `.xterm` node is still
+    // mounted. If the active-switch had remounted xterm.js (the #988
+    // bug), the tagged node would have been disposed and this query
+    // returns null — assertion fails as it would have pre-fix.
+    await this.page.waitForFunction(
+      () => {
+        const tag = (window as unknown as { __xtermStabilityTag?: string })
+          .__xtermStabilityTag;
+        if (!tag) return false;
+        return (
+          document.querySelector(`.xterm[data-stability-tag="${tag}"]`) !== null
+        );
+      },
+      undefined,
+      { timeout: POLL_TIMEOUT },
+    );
+  },
+);

@@ -2,12 +2,14 @@
  *  count. Logo animates when active. Renders the appropriate icon per agent
  *  kind (Claude Code, OpenCode). */
 
-import type { AgentInfo } from "kolu-common";
+import type { AgentInfo } from "kolu-common/surface";
 import { type Component, Show } from "solid-js";
 import { Dynamic } from "solid-js/web";
 import { agentIcons, agentNames, stateLabels } from "../ui/agentDisplay";
 
-/** Busy = actively working (thinking or running tools). Warning = needs user input. */
+/** Busy = actively working (thinking or running tools). Alert = needs user input
+ *  — the same "your turn" token the dock pip and awaiting column use, so a
+ *  waiting agent reads one color everywhere (not yellow here, orange there). */
 const BUSY_COLOR = "text-busy";
 
 /** State → display config. Keyed on state, not kind — all agents currently
@@ -20,7 +22,11 @@ const stateConfig: Record<
 > = {
   thinking: { color: BUSY_COLOR, animation: "animate-pulse" },
   tool_use: { color: BUSY_COLOR, animation: "animate-spin" },
-  waiting: { color: "text-warning", animation: "animate-pulse" },
+  waiting: { color: "text-alert", animation: "animate-pulse" },
+  awaiting_user: { color: "text-alert", animation: "animate-pulse" },
+  // Busy, not awaiting: the agent is working in a background task, so use
+  // the busy treatment rather than the alert color reserved for needs-user.
+  running_background: { color: BUSY_COLOR, animation: "animate-spin" },
 };
 
 /** "47392" → "47K", "1183456" → "1.2M". Single call site; no helper module

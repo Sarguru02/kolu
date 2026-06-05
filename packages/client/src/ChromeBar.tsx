@@ -1,17 +1,18 @@
 /** ChromeBar — the always-visible workspace chrome band.
  *
- *  Replaces the pre-#622 global Header. Carries app identity (logo +
- *  connection dot) on the left, the pill tree in the middle, and the
- *  global control cluster (inspector toggle, settings, command palette)
- *  on the right.
+ *  Carries app identity (logo + connection dot) on the left and the
+ *  global control cluster (recorder, inspector, settings, command
+ *  palette) on the right. The live-terminal navigator moved to the
+ *  dock at the canvas's left edge (#903), so the chrome bar
+ *  no longer hosts a workspace switcher slot.
  *
- *  Two positioning modes, switched on `canvasMaximized`:
- *  - Canvas mode (default): absolute overlay above the canvas. Pure
+ *  Two positioning modes, switched on `posture.mode()`:
+ *  - Tiled (default): absolute overlay above the canvas. Pure
  *    transparent so the grid reads through and the chrome looks like
  *    it floats ON the canvas, not capping it. When the right panel
  *    is open, the overlay's right edge stops at the panel's left
- *    edge so the controls cluster doesn't sit on top of the panel's
- *    tab bar.
+ *    edge (via inline `right: panelSize * 100vw`) so the controls
+ *    cluster doesn't sit on top of the panel's tab bar.
  *  - Maximized mode: docked in flex flow so the maximized terminal
  *    owns the rest of the viewport without the terminal's own title
  *    bar overlapping the chrome.
@@ -19,7 +20,8 @@
  *  Mobile uses a different chrome surface — a pull-down sheet — see
  *  `MobileChromeSheet` and `MobileTileView`. */
 
-import { type Component, createSignal, type JSX } from "solid-js";
+import { type Component, createMemo, createSignal, Show } from "solid-js";
+import { dockExpanded, toggleRailCards } from "./canvas/dock/Dock";
 import { useViewPosture } from "./canvas/useViewPosture";
 import { ACTIONS } from "./input/actions";
 import { formatKeybind } from "./input/keyboard";
@@ -27,23 +29,27 @@ import RecordButton from "./recorder/RecordButton";
 import { useRightPanel } from "./right-panel/useRightPanel";
 import type { WsStatus } from "./rpc/rpc";
 import SettingsPopover from "./settings/SettingsPopover";
-import { InspectorToggleIcon, SettingsIcon } from "./ui/Icons";
+import {
+  DockToggleIcon,
+  InspectorToggleIcon,
+  MaximizeIcon,
+  RestoreIcon,
+  SettingsIcon,
+} from "./ui/Icons";
+import IdentityRail from "./ui/IdentityRail";
 import Kbd from "./ui/Kbd";
 import Tip from "./ui/Tip";
 
-const statusStyles: Record<WsStatus, string> = {
-  connecting: "bg-warning animate-pulse",
-  open: "bg-ok",
-  closed: "bg-danger",
-};
+// Shared base for the square icon toggles in the control cluster
+// (maximize, dock, inspector). Active/idle coloring is layered on via
+// each button's own `classList`. Keep ring/size tweaks here so all
+// three toggles stay in lockstep.
+const toggleBtnClass =
+  "pointer-events-auto hidden sm:flex items-center justify-center w-7 h-7 rounded-lg transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50";
 
 const ChromeBar: Component<{
   status: WsStatus;
   onOpenPalette: () => void;
-  /** Pill tree slot — caller composes `<PillTree ... />`. ChromeBar
-   *  is a layout host (logo + tree + controls); it doesn't need to
-   *  know the tree's prop shape, just where to drop it. */
-  pillTree: JSX.Element;
 }> = (props) => {
   const rightPanel = useRightPanel();
   const posture = useViewPosture();
@@ -53,20 +59,33 @@ const ChromeBar: Component<{
   // Dock only when the terminal is maximized, so its own title bar
   // doesn't collide with the chrome. Panel-open stays on the floating
   // overlay — the `right:` offset below keeps controls off the panel.
-  const docked = () => posture.maximized();
+  const docked = createMemo(() => posture.mode() === "maximized");
+
+  // The maximize toggle's affordance describes the action a click performs,
+  // so both the tooltip and the aria-label read from one source and can't
+  // drift out of sync with the posture.
+  const maximizeLabel = createMemo(() =>
+    docked() ? "Restore canvas" : "Maximize terminal",
+  );
 
   return (
     <header
       data-testid="chrome-bar"
-      data-maximized={posture.maximized() ? "" : undefined}
+      data-maximized={docked() ? "" : undefined}
       // pointer-events-none on the root so the transparent gaps don't
       // eat clicks meant for the canvas under the overlay. Interactive
-      // children (identity row, pill tree, control cluster) re-enable
+      // children (identity row, workspace switcher, control cluster) re-enable
       // pointer events on themselves.
-      class="flex items-center gap-3 px-3 py-2 select-none pointer-events-none"
+      class="chrome-bar-surface flex items-center gap-3 px-3 py-2 select-none pointer-events-none transition-colors duration-150"
+      // z-50 in BOTH modes. Without it on the docked branch, the
+      // `backdrop-filter` we apply to the bar when the workspace
+      // switcher is open creates a stacking context with auto z-index,
+      // which traps the dropdown panel's own z-50 inside the bar — the
+      // maximized tile (z-40 in the canvas) then paints on top of the
+      // panel at the App root's auto-z layer (DOM order wins).
       classList={{
         "absolute top-0 left-0 z-50": !docked(),
-        "relative shrink-0": docked(),
+        "relative shrink-0 z-50": docked(),
       }}
       style={
         docked()
@@ -75,7 +94,16 @@ const ChromeBar: Component<{
               // Stop the floating chrome's right edge at the right
               // panel's left edge so the controls cluster (inspector,
               // settings, ⌘K) doesn't sit on top of the panel's tab
-              // bar. `panelSize` is a [0..1] fraction of viewport width.
+              // bar. `panelSize` is `@corvu/resizable`'s [0..1] fraction
+              // of *the Resizable container's* width — treating it as a
+              // fraction of viewport width is only correct because the
+              // host Resizable in `App.tsx` spans the full viewport in
+              // tiled mode (the Dock floats `position: absolute`, the
+              // canvas-container is the Resizable's left panel).
+              // Maintained by convention across the two files — if a
+              // sibling outside the Resizable ever shrinks the
+              // container, switch to a measured pixel offset or a
+              // host-published CSS custom property.
               right: rightPanel.collapsed()
                 ? 0
                 : `${rightPanel.panelSize() * 100}vw`,
@@ -94,22 +122,14 @@ const ChromeBar: Component<{
         >
           <img src="/favicon.svg" alt="kolu" class="w-5 h-5" />
         </a>
-        <Tip label="Connection status">
-          <span
-            data-ws-status={props.status}
-            class={`inline-block w-2 h-2 rounded-full transition-colors ${statusStyles[props.status]}`}
-          />
-        </Tip>
+        <IdentityRail status={props.status} />
       </div>
 
-      {/* Pill tree — fills the middle, wraps as needed.
-       *  pointer-events-none here so the empty middle space (no pills,
-       *  or padding around them) lets clicks pass through to the right
-       *  panel / canvas underneath; PillTree's own outer wrapper
-       *  re-enables pointer events on the actual pill elements. */}
-      <div class="flex-1 min-w-0 flex justify-center pointer-events-none">
-        {props.pillTree}
-      </div>
+      {/* Middle spacer — pointer-events pass through to whatever the
+       *  canvas or right panel is showing underneath. The workspace
+       *  switcher used to live here; with the dock owning the
+       *  navigator, the chrome bar is just identity + global controls. */}
+      <div class="flex-1 min-w-0 pointer-events-none" />
 
       {/* Control cluster: inspector → settings → ⌘K. Cluster wrapper
        *  itself stays pointer-events-none so the gap-2 spaces and any
@@ -117,13 +137,52 @@ const ChromeBar: Component<{
        *  clicks through; each button re-enables pointer-events-auto. */}
       <div class="flex items-center gap-2 shrink-0">
         <RecordButton />
+        <Tip label={maximizeLabel()}>
+          <button
+            type="button"
+            data-testid="maximize-toggle"
+            class={toggleBtnClass}
+            classList={{
+              "bg-surface-2 text-fg": docked(),
+              "text-fg-3 hover:bg-surface-2 hover:text-fg": !docked(),
+            }}
+            data-active={docked() ? "" : undefined}
+            onClick={() => posture.toggle()}
+            aria-label={maximizeLabel()}
+          >
+            <Show
+              when={docked()}
+              fallback={<MaximizeIcon class="w-3.5 h-3.5" />}
+            >
+              <RestoreIcon class="w-3.5 h-3.5" />
+            </Show>
+          </button>
+        </Tip>
+        <Tip
+          label={`Toggle dock (${formatKeybind(ACTIONS.toggleDock.keybind)})`}
+        >
+          <button
+            type="button"
+            data-testid="dock-toggle"
+            class={toggleBtnClass}
+            classList={{
+              "bg-surface-2 text-fg": dockExpanded(),
+              "text-fg-3 hover:bg-surface-2 hover:text-fg": !dockExpanded(),
+            }}
+            data-active={dockExpanded() ? "" : undefined}
+            onClick={toggleRailCards}
+            aria-label="Toggle dock"
+          >
+            <DockToggleIcon active={dockExpanded()} />
+          </button>
+        </Tip>
         <Tip
           label={`Toggle inspector (${formatKeybind(ACTIONS.toggleRightPanel.keybind)})`}
         >
           <button
             type="button"
             data-testid="inspector-toggle"
-            class="pointer-events-auto hidden sm:flex items-center justify-center w-7 h-7 rounded-lg transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
+            class={toggleBtnClass}
             classList={{
               "bg-surface-2 text-fg": !rightPanel.collapsed(),
               "text-fg-3 hover:bg-surface-2 hover:text-fg":

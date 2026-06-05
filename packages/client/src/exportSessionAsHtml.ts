@@ -12,9 +12,10 @@
  *  the client because the scrollback only exists there; this one runs
  *  on the server because the transcript only exists there. */
 
-import type { TerminalId } from "kolu-common";
+import type { TerminalId } from "kolu-common/surface";
 import { toast } from "solid-sonner";
-import { client } from "./rpc/rpc";
+import { triggerDownload } from "./download";
+import { client } from "./wire";
 
 export async function exportSessionAsHtml(id: TerminalId): Promise<void> {
   const loadingId = toast.loading("Exporting session…");
@@ -29,16 +30,9 @@ export async function exportSessionAsHtml(id: TerminalId): Promise<void> {
     // has time to fetch and parse it.
     const win = window.open(url, "_blank", "noopener");
     if (!win) {
-      // Popup blocked — fall back to a download via an anchor click. Same
-      // origin (blob:) and no user-supplied content in the path so this
-      // is safe.
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename;
-      a.rel = "noopener";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      // Popup blocked — fall back to a download. Same origin (blob:) and no
+      // user-supplied content in the path so this is safe.
+      triggerDownload(url, filename);
     }
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
     toast.success("Session exported", { id: loadingId });

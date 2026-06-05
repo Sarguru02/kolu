@@ -17,11 +17,23 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { After, AfterAll, Before, BeforeAll, Status } from "@cucumber/cucumber";
 import getPort from "get-port";
+import { NIX_ENV_WHITELIST } from "kolu-pty";
 import type { Browser, BrowserContext, Page } from "playwright";
 import { chromium } from "playwright";
 import type { KoluWorld } from "./world.ts";
 
 const workerId = parseInt(process.env.CUCUMBER_WORKER_ID || "0", 10);
+
+/** Fixtures scaffold real git repos in /tmp and run `git commit` against
+ *  them. On a pristine NixOS host with no `~/.gitconfig`, git aborts with
+ *  "Author identity unknown" and 31 scenarios fail (see #887). Pin a test
+ *  identity here so every fixture — current and future — inherits one.
+ *  `??=` lets a host with `git config --global` set still take precedence
+ *  when developers run locally. */
+process.env.GIT_AUTHOR_NAME ??= "kolu-test";
+process.env.GIT_AUTHOR_EMAIL ??= "test@kolu.dev";
+process.env.GIT_COMMITTER_NAME ??= "kolu-test";
+process.env.GIT_COMMITTER_EMAIL ??= "test@kolu.dev";
 
 /** One base $TMPDIR per worker holds everything this test run creates:
  *  the kolu server's state dir and the Claude Code mock harness's
@@ -99,6 +111,31 @@ process.env.KOLU_FAKE_OPENCODE_BIN = fakeBins.opencode;
  *  `testBaseDir` means the whole run's scratch space cleans up together. */
 const koluStateDir = mkSubDir("state");
 
+/** PR-evidence capture (set `KOLU_EVIDENCE=1`): record a Playwright video per
+ *  scenario and save it, scenario-named, under `reports/videos/` for the /do
+ *  evidence flow to transcode + upload (the same GIF/Pages-player delivery the
+ *  bespoke `capture.mjs` used). Off by default so normal runs pay nothing — the
+ *  whole point of reusing the harness is that capture rides the existing step
+ *  library. See `docs/atlas/src/content/atlas/video-evidence.mdx`. `rawVideoDir` holds
+ *  Playwright's auto-named files (under `testBaseDir`, wiped in AfterAll);
+ *  `evidenceVideoDir` holds the saved, named `.webm`s and survives the run. */
+const EVIDENCE = !!process.env.KOLU_EVIDENCE;
+const rawVideoDir = EVIDENCE ? mkSubDir("video-raw") : undefined;
+const evidenceVideoDir = path.resolve(
+  import.meta.dirname,
+  "..",
+  "reports",
+  "videos",
+);
+/** Per-worker kolu-server stdout/stderr capture, written in BeforeAll. Under
+ *  `reports/` (gitignored) so a post-mortem survives the run. */
+const serverLogDir = path.resolve(import.meta.dirname, "..", "reports");
+/** Evidence records at a denser desktop viewport than the normal 1920×1080:
+ *  at full width the single terminal tile + side panel float small in a sea of
+ *  canvas, so the clip reads tiny. 1280×720 fills the frame and matches
+ *  recordVideo.size exactly, so the capture is 1:1 with no downscaling. */
+const EVIDENCE_VIEWPORT = { width: 1280, height: 720 };
+
 let baseUrl: string;
 let browser: Browser;
 let serverProcess: ChildProcess | undefined;
@@ -113,11 +150,37 @@ const TRANSIENT_SETUP_ERRORS = [
   "EPIPE",
   "socket hang up",
   "read ECONNRESET",
+  "ETIMEDOUT",
+  "EADDRNOTAVAIL",
 ];
 
+/** Collect errno `code`s from an error tree. Node raises a dual-stack
+ *  `AggregateError` for a refused connection (IPv4 + IPv6) whose own
+ *  `.message` is empty and whose real errno lives on `.code` and on each
+ *  `.errors[].code`. */
+function errorCodes(err: unknown, out: string[] = []): string[] {
+  if (err && typeof err === "object") {
+    const code = (err as { code?: unknown }).code;
+    if (typeof code === "string") out.push(code);
+    const inner = (err as { errors?: unknown }).errors;
+    if (Array.isArray(inner)) for (const e of inner) errorCodes(e, out);
+  }
+  return out;
+}
+
+/** A setup POST/GET error worth retrying. Checks both the message AND the
+ *  errno `code` tree: a server that briefly refuses connections (mid-restart,
+ *  GC pause, the instant before it dies) surfaces as an `AggregateError` with
+ *  an EMPTY message but `code: "ECONNREFUSED"`. The prior message-only check
+ *  missed that, so `retryTransient` bailed on the FIRST attempt with no retry
+ *  and rethrew an empty-tailed "failed after retries:" — and under parallel
+ *  load a single such miss let one worker fail (and queue-drain) hundreds of
+ *  scenarios. Matching on `code` restores the intended 3× retry. */
 function isTransientSetupError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return TRANSIENT_SETUP_ERRORS.some((needle) => msg.includes(needle));
+  if (TRANSIENT_SETUP_ERRORS.some((needle) => msg.includes(needle)))
+    return true;
+  return errorCodes(err).some((code) => TRANSIENT_SETUP_ERRORS.includes(code));
 }
 
 function sleep(ms: number): Promise<void> {
@@ -138,11 +201,15 @@ async function retryTransient<T>(
       await sleep(100 * attempt);
     }
   }
+  // Append the errno code(s) so an empty-message AggregateError (the
+  // dual-stack ECONNREFUSED a dead server produces) still names its cause.
+  const codes = errorCodes(last);
+  const suffix = codes.length ? ` [${[...new Set(codes)].join(",")}]` : "";
   throw last instanceof Error
-    ? new Error(`${label} failed after retries: ${last.message}`, {
+    ? new Error(`${label} failed after retries: ${last.message}${suffix}`, {
         cause: last,
       })
-    : new Error(`${label} failed after retries: ${String(last)}`);
+    : new Error(`${label} failed after retries: ${String(last)}${suffix}`);
 }
 
 /** POST JSON to a local URL, reusing TCP connections via keepAlive. */
@@ -160,7 +227,16 @@ function postJSONOnce(url: string, body: object): Promise<void> {
       },
       (res) => {
         res.resume();
-        res.on("end", resolve);
+        res.on("end", () => {
+          // Reject non-2xx so a reset the server actually rejected (it was
+          // briefly unready, or an endpoint drifted) surfaces instead of
+          // resolving as success and letting the scenario start against stale
+          // state. Mirrors httpGet's status check; 2xx resolves exactly as
+          // before, so green runs are unchanged.
+          const code = res.statusCode ?? 0;
+          if (code >= 200 && code < 300) resolve();
+          else reject(new Error(`POST ${url} -> HTTP ${code}`));
+        });
         res.on("error", reject);
       },
     );
@@ -230,9 +306,15 @@ async function newScenarioPage(
       previousContext = undefined;
     }
     const context = await browser.newContext({
+      // 1920×1080 matches a typical desktop monitor — the previous 1280×720
+      // default hid viewport-size-dependent bugs (e.g. the canvas
+      // centering math behaves differently when the tile is small relative
+      // to the viewport vs nearly filling it).
       viewport: isMobile
         ? { width: 390, height: 844 }
-        : { width: 1280, height: 720 },
+        : EVIDENCE
+          ? EVIDENCE_VIEWPORT
+          : { width: 1920, height: 1080 },
       ...(isMobile && { hasTouch: true, isMobile: true }),
       baseURL: baseUrl,
       ignoreHTTPSErrors: true,
@@ -240,6 +322,13 @@ async function newScenarioPage(
       // clipboard-read: lets tests verify clipboard contents after copy operations.
       // Production code never calls clipboard.read — these are test-only permissions.
       permissions: ["clipboard-write", "clipboard-read"],
+      // KOLU_EVIDENCE: record a video of the context. recordVideo is a
+      // context option (not a launch option); the file is finalized on
+      // context.close() and retrieved per-page via page.video() in After.
+      // size matches the evidence viewport so the capture is 1:1.
+      ...(rawVideoDir
+        ? { recordVideo: { dir: rawVideoDir, size: EVIDENCE_VIEWPORT } }
+        : {}),
     });
     previousContext = context;
     const page = await context.newPage();
@@ -276,11 +365,20 @@ BeforeAll(async () => {
     const port = await getPort();
     baseUrl = `http://localhost:${port}`;
     console.log(`[worker:${workerId}] Starting server on port ${port}...`);
+    // Extend NIX_ENV_WHITELIST with GIT_AUTHOR_*/GIT_COMMITTER_* so PTY
+    // shells in fixtures like `code-tab.feature` (which run `git init &&
+    // git commit` inside the terminal under test) inherit the same
+    // identity set on process.env above. Without this, the whitelist
+    // filter strips them and those scenarios fail on pristine hosts.
+    const envWhitelist = [
+      NIX_ENV_WHITELIST,
+      "GIT_AUTHOR_NAME,GIT_AUTHOR_EMAIL,GIT_COMMITTER_NAME,GIT_COMMITTER_EMAIL",
+    ].join(",");
     serverProcess = spawn(
       koluServer,
       [
         "--allow-nix-shell-with-env-whitelist",
-        "default",
+        envWhitelist,
         "--port",
         String(port),
       ],
@@ -300,16 +398,34 @@ BeforeAll(async () => {
         },
       },
     );
+    // Tee the spawned server's stdout+stderr to a per-worker file. A server
+    // that dies mid-run otherwise leaves NO trace in the suite log (its only
+    // visible symptom is downstream `ECONNREFUSED` resets on its port); the
+    // file preserves the crash stack / clean-exit / silence-then-gone that
+    // distinguishes a crash from a wedge. Append-mode so a re-spawn doesn't
+    // clobber the prior life. Cheap, always on (replaces the KOLU_TEST_VERBOSE
+    // stdout gate — stdout is still drained so the pipe can't block pino).
+    fs.mkdirSync(serverLogDir, { recursive: true });
+    const serverLog = fs.createWriteStream(
+      path.join(serverLogDir, `server-w${workerId}.log`),
+      { flags: "a" },
+    );
     serverProcess.stderr?.on("data", (data: Buffer) => {
+      serverLog.write(data);
       process.stderr.write(`[server:${workerId}] ${data}`);
     });
-    // Drain stdout so the pipe buffer can't fill and block the server's
-    // pino writes (pino targets stdout). Forward to stderr when
-    // KOLU_TEST_VERBOSE is set for local debugging.
     serverProcess.stdout?.on("data", (data: Buffer) => {
+      serverLog.write(data);
       if (process.env.KOLU_TEST_VERBOSE) {
         process.stderr.write(`[server:${workerId}:out] ${data}`);
       }
+    });
+    // Record the death itself: code/signal disambiguates crash (code≠0 or a
+    // signal) from a clean exit from a never-fired handler (wedge).
+    serverProcess.on("exit", (code, signal) => {
+      const line = `[server:${workerId}] process exited code=${code} signal=${signal}\n`;
+      serverLog.write(line);
+      process.stderr.write(line);
     });
     await waitForHealth(`${baseUrl}/api/health`, 10_000);
     console.log(`[worker:${workerId}] Server is healthy.`);
@@ -319,6 +435,10 @@ BeforeAll(async () => {
   browser = await chromium.launch({
     headless: process.env.HEADLESS !== "false",
     args: ciArgs,
+    // KOLU_EVIDENCE: pace driver actions so the recorded video is legible
+    // (the lead-up; the app's own async — e.g. an iframe reload — still runs
+    // at real speed, so the payoff is shown via the scenario's own waits).
+    ...(EVIDENCE ? { slowMo: 250 } : {}),
   });
 });
 
@@ -347,7 +467,7 @@ Before(async function (this: KoluWorld, scenario) {
   // stays the same.
   await Promise.all([
     postJSON(`${baseUrl}/rpc/terminal/killAll`, {}),
-    postJSON(`${baseUrl}/rpc/preferences/test__set`, {
+    postJSON(`${baseUrl}/rpc/surface/preferences/test__set`, {
       json: {
         // Reset all preferences to defaults (shuffleTheme off for deterministic tests)
         seenTips: [],
@@ -360,14 +480,16 @@ Before(async function (this: KoluWorld, scenario) {
         rightPanel: {
           collapsed: true,
           size: 0.25,
-          tab: { kind: "inspector" },
+          activeTab: "inspector",
+          codeMode: "local",
+          codeTabTreeSize: 0.35,
         },
       },
     }),
-    postJSON(`${baseUrl}/rpc/activity/test__set`, {
+    postJSON(`${baseUrl}/rpc/surface/activityFeed/test__set`, {
       json: { recentRepos: [], recentAgents: [] },
     }),
-    postJSON(`${baseUrl}/rpc/session/test__set`, { json: null }),
+    postJSON(`${baseUrl}/rpc/surface/session/test__set`, { json: null }),
   ]);
 
   // @mobile tag → emulate a touch phone (flips `(pointer: coarse)` to true,
@@ -380,18 +502,24 @@ Before(async function (this: KoluWorld, scenario) {
   this.context = created.context;
   this.page = created.page;
   // Disable CSS transitions/animations so Corvu dialogs open/close instantly.
-  // prefers-reduced-motion tells well-behaved libraries to skip animations.
-  // The style override catches anything that doesn't respect the media query.
-  await this.page.emulateMedia({ reducedMotion: "reduce" });
+  // prefers-reduced-motion tells well-behaved libraries to skip animations;
+  // the style override catches anything that ignores the media query. SKIPPED
+  // under KOLU_EVIDENCE — when we're recording a video, motion is the point.
+  if (!EVIDENCE) {
+    await this.page.emulateMedia({ reducedMotion: "reduce" });
+    await this.page.addInitScript(`
+      document.addEventListener("DOMContentLoaded", function() {
+        var style = document.createElement("style");
+        style.textContent = "*, *::before, *::after { transition-duration: 0s !important; animation-duration: 0s !important; }";
+        document.head.appendChild(style);
+      });
+    `);
+  }
+  // Shared xterm buffer reader for e2e tests — used by waitForBufferContains,
+  // readBufferText, and getTerminalPid via page.evaluate / page.waitForFunction.
+  // Single definition avoids the buffer-read loop being duplicated across files.
+  // Always injected (independent of the motion gate above).
   await this.page.addInitScript(`
-    document.addEventListener("DOMContentLoaded", function() {
-      var style = document.createElement("style");
-      style.textContent = "*, *::before, *::after { transition-duration: 0s !important; animation-duration: 0s !important; }";
-      document.head.appendChild(style);
-    });
-    // Shared xterm buffer reader for e2e tests — used by waitForBufferContains,
-    // readBufferText, and getTerminalPid via page.evaluate / page.waitForFunction.
-    // Single definition avoids the buffer-read loop being duplicated across files.
     window.__readXtermBuffer = function(sel, idx) {
       var containers = document.querySelectorAll(sel);
       var container = containers[idx];
@@ -434,5 +562,22 @@ After(async function (this: KoluWorld, scenario) {
         );
       });
   }
+  // PR-evidence video (KOLU_EVIDENCE): grab the page's video handle BEFORE
+  // closing the context — the .webm is only finalized on close — then save it
+  // scenario-named under reports/videos/ once closed. saveAs waits for the
+  // file to be fully written, so the order (handle → close → save) is safe.
+  const video = EVIDENCE ? this.page?.video() : undefined;
   if (this.context) await this.context.close();
+  if (video) {
+    const name = scenario.pickle.name.replace(/\s+/g, "-").toLowerCase();
+    fs.mkdirSync(evidenceVideoDir, { recursive: true });
+    await video
+      .saveAs(path.join(evidenceVideoDir, `${name}.webm`))
+      .catch((err) => {
+        console.error(
+          `[worker:${workerId}] Failed to save evidence video:`,
+          err,
+        );
+      });
+  }
 });

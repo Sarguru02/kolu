@@ -6,14 +6,17 @@
  *   - Branch: working tree vs `merge-base(origin/<default>)` — same, with a
  *     branch base. Forge-agnostic "what this branch will ship".
  *
- * The mode trio is structured as a nested segmented control: All sits
- * apart from the Local/Branch pair because Local and Branch are siblings
- * (both filter to changed files; only the diff base differs), while All
- * is the unfiltered base view. Pierre's `@pierre/trees` owns the tree
- * layout/search/virtualization; `@pierre/diffs` owns diff parsing and
- * shiki highlighting. This component is just data flow + chrome. */
+ * The toolbar combines two independent filter axes — mode picker
+ * (`ModeChipPicker`) and filename input (`FileSearchInput`) — in one
+ * row. Pierre's built-in tree-header search is disabled so the
+ * `FileSearchInput` is the single source of filter state, forwarded
+ * via `FileTree.searchQuery`. `@kolu/solid-pierre` owns the imperative
+ * Pierre lifecycle; this component is just data flow + chrome. */
 
-import type { CodeTabView, GitDiffMode, TerminalMetadata } from "kolu-common";
+import Resizable from "@corvu/resizable";
+import { FileTree } from "@kolu/solid-pierre";
+import type { TerminalId, TerminalMetadata } from "kolu-common/surface";
+import type { GitDiffMode } from "kolu-git/schemas";
 import {
   type Component,
   createEffect,
@@ -25,25 +28,41 @@ import {
   Switch,
 } from "solid-js";
 import { toast } from "solid-sonner";
-import { createReactiveSubscription } from "../rpc/createReactiveSubscription";
-import { stream } from "../rpc/rpc";
+import { CommentComposer } from "../comments/CommentComposer";
+import { CommentsTray } from "../comments/CommentsTray";
+import { CommentTextSurface } from "../comments/CommentTextSurface";
+import { useComposer } from "../comments/composerState";
+import { useCommentScrollRequest } from "../comments/scrollRequest";
 import { useColorScheme } from "../settings/useColorScheme";
-import { FileDiffIcon, GitBranchIcon } from "../ui/Icons";
-import PierreDiffView from "../ui/PierreDiffView";
-import PierreFileTree, { toGitStatusEntries } from "../ui/PierreFileTree";
-import BrowseFileView from "./BrowseFileView";
+import { isMobile, isTouch } from "../useMobile";
+import { FileBrowseIcon, FileDiffIcon, GitBranchIcon } from "../ui/Icons";
+import { resolveLineRefPath } from "../ui/lineRef";
+import { mergeGitStatusEntries } from "../ui/gitStatusEntries";
+import { renderTreeContextMenu } from "../ui/pierreAdapters";
+import {
+  pierreIconConfig,
+  pierreTreesShadowCss,
+  pierreTreesStyle,
+} from "../ui/pierreTheme";
+import { Z_HANDLE_INNER } from "../ui/stackLayers";
+import { app } from "../wire";
+import BrowseDiffView from "./BrowseDiffView";
+import BrowseFileDispatcher from "./BrowseFileDispatcher";
+import FileSearchInput from "./FileSearchInput";
+import { projectFileTreeSearch } from "./fileSearch";
+import { attachPierreTouchScroll } from "./pierreTouchScroll";
+import ModeChipPicker, { type ModeOption } from "./ModeChipPicker";
+import {
+  type OpenInCodeTabRequest,
+  openInCodeTab,
+  pendingOpen,
+} from "./openInCodeTab";
 import { useRightPanel } from "./useRightPanel";
 
 const EMPTY_STATE: Record<GitDiffMode, string> = {
   local: "No local changes",
   branch: "No changes vs base",
 };
-
-/** Pill button shared by both segment groups. Inherits the same active-state
- *  chrome the canvas tile chrome uses (lifted surface-0 + soft shadow), so
- *  the mode picker reads as a continuation of kolu's existing tab language. */
-const PILL_BUTTON_CLASS =
-  "px-2 h-5 rounded text-[10px] font-mono cursor-pointer transition-colors text-fg-3/50 hover:text-fg-2 data-[active=true]:text-fg data-[active=true]:bg-surface-0 data-[active=true]:shadow-sm";
 
 const FileSelectHint: Component<{ label: string }> = (props) => (
   <div class="flex flex-col items-center justify-center h-full text-fg-3/40 gap-2">
@@ -52,92 +71,415 @@ const FileSelectHint: Component<{ label: string }> = (props) => (
   </div>
 );
 
-const CodeTab: Component<{ meta: TerminalMetadata | null }> = (props) => {
+const BinaryFileHint: Component<{ fileName: string | null }> = (props) => (
+  <div
+    class="flex flex-col items-center justify-center h-full text-fg-3/40 gap-2"
+    data-testid="diff-binary"
+  >
+    <FileDiffIcon class="w-8 h-8 opacity-40" />
+    <span class="text-[11px]">Binary file — not displayable</span>
+    <span class="text-[10px] text-fg-3/30">{props.fileName}</span>
+  </div>
+);
+
+const CodeTab: Component<{
+  terminalId: TerminalId | null;
+  meta: TerminalMetadata | null;
+}> = (props) => {
   const { themeTypeLiteral: diffTheme } = useColorScheme();
   const rightPanel = useRightPanel();
-  const [selectedPath, setSelectedPath] = createSignal<string | null>(null);
 
-  const view = (): CodeTabView => {
-    const tab = rightPanel.activeTab();
-    return tab.kind === "code" ? tab.mode : "local";
-  };
+  // Pierre captures `density` once at construction (like `initialExpansion`),
+  // so snapshot the choice here rather than passing a reactive accessor in the
+  // JSX, where it would read as reactive. Keyed on `isTouch` (input modality),
+  // not `isMobile` (viewport): roomier rows are a tap-target affordance, so a
+  // coarse-pointer tablet wider than `sm` wants them too.
+  const treeDensity = isTouch() ? "relaxed" : undefined;
+
+  // Read `codeMode` directly rather than projecting it from `activeTab`.
+  // CodeTab now stays mounted across the Inspector tab toggle (#818); a
+  // projection-with-fallback (`activeTab.kind === "code" ? mode : "local"`)
+  // would flip `view()` from the persisted mode (e.g. `"browse"`) to the
+  // fallback `"local"` while Inspector is active, then back on return —
+  // a real value transition that fires the `slotKey` effect and
+  // wipes selection on every Inspector round-trip in non-local modes.
+  const view = rightPanel.codeMode;
   const setView = rightPanel.setCodeMode;
 
   const repoPath = () => props.meta?.git?.repoRoot ?? null;
+
+  // Dismiss any open comment composer when the user navigates away from
+  // the file/mode/repo the draft was anchored to. Without this, the
+  // composer floats over a different file's content and the user has
+  // to dismiss it manually. Draft body is lost, which matches every
+  // other modal-on-navigate behavior in kolu.
+  const composer = useComposer();
+  createEffect(
+    on(
+      () => [selectedPath(), view(), repoPath()] as const,
+      () => composer.close(),
+      { defer: true },
+    ),
+  );
   const isDiffView = () => view() !== "browse";
   const diffMode = (): GitDiffMode | undefined =>
     view() === "browse" ? undefined : (view() as GitDiffMode);
 
-  const status = createReactiveSubscription(
+  // Selection is per-terminal, keyed by mode, stored in
+  // `TerminalMetadata.rightPanel.selectedFileByMode` via `useRightPanel`.
+  // Each (terminal, mode) slot owns its own pick — switching modes within
+  // a terminal restores that mode's last file; switching terminals
+  // restores that terminal's last (file, mode) pair.
+  //
+  // The `slotKey` memo doubles as the source of truth for the
+  // search-reset effect below; collision-safe by construction since
+  // `view()` is a typed enum and `repoPath()` is absolute-or-null.
+  const selectedPath = (): string | null => rightPanel.selectedFile(view());
+  const setSelectedPath = (path: string | null) => {
+    rightPanel.setSelectedFile(view(), path);
+  };
+  const slotKey = createMemo(() => `${repoPath() ?? ""}::${view()}`);
+
+  // Filename filter — drives Pierre's tree filter externally. Reset on
+  // mode switch so a stale needle doesn't hide the wrong file set.
+  const [searchQuery, setSearchQuery] = createSignal("");
+
+  // ── Selection-stability invariants ─────────────────────────────────
+  // CodeTab survives right-panel tab toggles and panel collapse (#818)
+  // — every reactive surface stays alive across UI state changes that
+  // previously destroyed and rebuilt it. Two independent sources of
+  // spurious `selectedPath = null` would fire without explicit guards:
+  //
+  //   1. `pending()` gate on the membership check — gitStatus / fsList
+  //      stream resubscribes briefly drop `treePaths()` to `[]`; without
+  //      the gate, the membership check reads transient empty as
+  //      "selected file is missing" and deletes the slot.
+  //   2. `handleSelect` ignores Pierre's `null` events — Pierre fires
+  //      `onSelectionChange([])` from `resetPaths` and tear-down, not
+  //      just user deselect; the Code tab has no UX for explicit
+  //      deselect anyway (user switches by clicking another file).
+  //
+  // (Repo / view transitions used to be a third churn source — the
+  // resetKey effect cleared selection on every (repoPath, view) change.
+  // Per-slot storage above makes that clear obsolete: the new slot's
+  // value is already correct without writing through. slotKey effect now
+  // only clears `searchQuery`, which is genuinely shared across slots.)
+
+  const status = app.streams.gitStatus.use(
     () => {
       const p = repoPath();
       const m = diffMode();
       return p && m ? { repoPath: p, mode: m } : null;
     },
-    (input, signal) => stream.gitStatus(input.repoPath, input.mode, signal),
     {
       onError: (err) => toast.error(`Git status stream: ${err.message}`),
     },
   );
 
-  const allPaths = createReactiveSubscription(
+  const allPaths = app.streams.fsListAll.use(
     () => {
       const p = repoPath();
       return p && view() === "browse" ? { repoPath: p } : null;
     },
-    (input, signal) => stream.fsListAll(input.repoPath, signal),
     {
       onError: (err) => toast.error(`File list stream: ${err.message}`),
     },
   );
 
-  const diff = createReactiveSubscription(
+  // Browse decorates the full-repo tree with git status too — overlaying local
+  // status (primary) on branch status (fallback) in `treeGitStatus` below.
+  // Both inert outside browse (input fn → null), so Local/Branch modes — which
+  // read decoration straight off the `status` stream — pay nothing for these.
+  const browseLocalStatus = app.streams.gitStatus.use(
+    () => {
+      const p = repoPath();
+      return p && view() === "browse"
+        ? { repoPath: p, mode: "local" as const }
+        : null;
+    },
+    {
+      onError: (err) => toast.error(`Git status stream: ${err.message}`),
+    },
+  );
+  // Best-effort branch layer: a repo with no `origin/<default>` errors with
+  // BASE_BRANCH_NOT_FOUND (review.ts `resolveBase`) — an expected, not broken,
+  // state in this passive overlay. Swallow it (no toast): the merge falls back
+  // to the always-available local layer. The explicit Branch *mode* still
+  // surfaces the same error via its own `status` subscription, where it's
+  // actionable ("run git fetch").
+  const browseBranchStatus = app.streams.gitStatus.use(
+    () => {
+      const p = repoPath();
+      return p && view() === "browse"
+        ? { repoPath: p, mode: "branch" as const }
+        : null;
+    },
+    {
+      onError: () => {},
+    },
+  );
+
+  const diff = app.streams.gitDiff.use(
     () => {
       const p = repoPath();
       const s = selectedPath();
       const m = diffMode();
       if (!p || !s || !m) return null;
       const file = status()?.files.find((f) => f.path === s);
-      return { repoPath: p, filePath: s, mode: m, oldPath: file?.oldPath };
+      if (!file) return null;
+      return { repoPath: p, filePath: s, mode: m, oldPath: file.oldPath };
     },
-    (input, signal) => stream.gitDiff(input, signal),
     {
       onError: (err) => toast.error(`Git diff stream: ${err.message}`),
     },
   );
 
-  // Reset selection when the repo or view changes so a stale path doesn't
-  // bleed across modes (e.g. a browse-mode pick showing up in diff mode).
+  // Clear the filename filter when the slot changes — the search needle
+  // was scoped to the previous file set and rarely makes sense post-
+  // switch. Selection itself is per-slot (read/written via
+  // `rightPanel.selectedFile(mode)` → `selectedFileByMode` on the
+  // per-terminal record) so the new view automatically surfaces its own
+  // pick without a clear here. `slotKey` is memoized, so this fires
+  // only when the tuple genuinely changes — without the memo, `on(...)`
+  // would re-run its callback on every incidental tick of `repoPath()`
+  // (metadata cell) or `view()` (per-terminal in-memory store) and wipe
+  // the filter spuriously after #818 made CodeTab survive right-panel
+  // tab toggles.
   createEffect(
-    on([repoPath, view], () => setSelectedPath(null), { defer: true }),
+    on(
+      slotKey,
+      () => {
+        setSearchQuery("");
+      },
+      { defer: true },
+    ),
   );
 
+  // Consume-once record for the latest pendingOpen tick. Holds the
+  // full request object (reference identity discriminates two
+  // structurally-identical clicks — `openInCodeTab` mints a fresh
+  // object per call) alongside the resolved path. Storing the
+  // request here lets `selectedRange` derive its value without
+  // re-running `resolveLineRefPath` (single resolution site per
+  // request).
+  const [handled, setHandled] = createSignal<{
+    request: OpenInCodeTabRequest;
+    resolvedPath: string | null;
+  } | null>(null);
+
+  // Honor every `openInCodeTab` request — terminal file-ref clicks,
+  // right-click "Open path:N" entries, and any future producer. The
+  // effect waits for the live `fsListAll` stream to settle so
+  // resolution can validate against a complete file list — otherwise
+  // a request fired during boot would toast "not found" on a path
+  // that just hasn't been enumerated yet. `openInCodeTab` flips the
+  // panel to browse mode itself; this effect only sets `selectedPath`.
+  createEffect(
+    on(
+      () => {
+        const req = pendingOpen();
+        const paths = treePaths();
+        const isPending = allPaths.pending();
+        return { req, repo: repoPath(), paths, isPending };
+      },
+      ({ req, repo, paths, isPending }) => {
+        if (!req) return;
+        if (handled()?.request === req) return;
+        if (repo === null || repo !== req.repoRoot) return;
+        if (view() !== req.targetMode || isPending) return;
+        const rel = resolveLineRefPath({
+          rawPath: req.ref.path,
+          repoRoot: repo,
+          cwd: req.cwd,
+          repoPaths: paths,
+          allowBasenameFallback: req.allowBasenameFallback,
+        });
+        if (rel === null) {
+          toast.error(`File reference not found: ${req.ref.path}`);
+          setHandled({ request: req, resolvedPath: null });
+          return;
+        }
+        setSelectedPath(rel);
+        setHandled({ request: req, resolvedPath: rel });
+      },
+      { defer: true },
+    ),
+  );
+
+  // Highlight range derives from the consume-once record: if the
+  // request we last handled matches the latest pending one AND its
+  // resolved path is still the rendered file, surface the line
+  // range. Any navigation away (user tree-click, mode switch) flips
+  // `selectedPath` and naturally invalidates the memo — no second
+  // resolution call.
+  //
+  // No `equals` override: two clicks on the same `path:line` produce
+  // structurally identical `{start, end}` but distinct request
+  // objects (`openInCodeTab` mints a fresh one per call), so the
+  // memo emits a fresh value on every click. Pierre's
+  // `InteractionManager.setSelection` re-renders when the selection
+  // is "dirty" — and tearing down the gutter (panel collapse,
+  // virtualizer recreate) leaves `renderedSelectionRange === null`,
+  // which dirties it. Re-emitting per click is what re-paints the
+  // highlight in that case; the same content equality the old
+  // override gated on would silently drop the re-paint.
+  const selectedRange = createMemo<{
+    start: number;
+    end: number;
+  } | null>(() => {
+    const req = pendingOpen();
+    if (!req) return null;
+    const h = handled();
+    if (!h || h.request !== req || h.resolvedPath === null) return null;
+    if (h.resolvedPath !== selectedPath()) return null;
+    // No-line refs (`src/Main.hs` with no `:N`) open the file with no
+    // highlight — the user asked for the file, not a specific line.
+    if (req.ref.startLine === null || req.ref.endLine === null) return null;
+    return { start: req.ref.startLine, end: req.ref.endLine };
+  });
+
   const treePaths = createMemo(() => {
-    if (view() === "browse") return allPaths()?.paths ?? [];
+    // Copy `paths` out rather than returning the store proxy directly:
+    // `fsListAll` lands in a reconciled store whose `paths` array is
+    // mutated in place, so the proxy's reference is stable across an
+    // in-place add/remove. Returning it bare means this memo never reads
+    // the contents (so an in-place add doesn't re-run it) and, even when it
+    // does re-run, the stable reference defeats the downstream
+    // reference-equality memos/effects that feed Pierre — a file created in
+    // a hand-expanded folder would never surface. Spreading tracks every
+    // element + length and mints a fresh reference, matching the diff
+    // branch's `.map()` below. See `createReactiveSubscription` /
+    // `writeValue.ts` for the reconcile strategy.
+    if (view() === "browse") return [...(allPaths()?.paths ?? [])];
     return status()?.files.map((f) => f.path) ?? [];
   });
+
+  const treeSearch = createMemo(() =>
+    projectFileTreeSearch(treePaths(), searchQuery()),
+  );
+
+  // Track membership rather than the treePaths array identity: browse paths
+  // come from a reconciled store array whose contents can change in place.
+  // Gate on the relevant stream's `pending()` — when the gitStatus / fsList
+  // stream resubscribes (e.g. on right-panel tab switch, since its inputFn
+  // returns a fresh object literal), the value briefly resets to undefined
+  // and `treePaths()` collapses to `[]`. Treating that transient empty as
+  // "selected file is missing" would null `selectedPath` on every
+  // resubscribe and lose the selection across tab toggles. Once the stream
+  // has delivered (`!pending()`), an empty paths set IS authoritative —
+  // the file truly went away (commit cleared local diff, rm deleted it).
+  //
+  // Bail on the tick where `slotKey` itself just changed: the shared
+  // `treePaths()` / `pending()` signals can momentarily expose the
+  // previous slot's snapshot before `createReactiveSubscription` resets
+  // them for the new input, so the new slot's selection would be checked
+  // against the previous slot's tree and falsely cleared. The next tick
+  // (after the reset effect runs) re-evaluates with the authoritative
+  // values for the new slot.
+  createEffect(
+    on(
+      () => {
+        const s = selectedPath();
+        const sk = slotKey();
+        const isPending = isDiffView() ? status.pending() : allPaths.pending();
+        const paths = treePaths();
+        return { s, sk, pathExists: !s || isPending || paths.includes(s) };
+      },
+      (cur, prev) => {
+        if (prev && prev.sk !== cur.sk) return;
+        if (cur.s && !cur.pathExists) setSelectedPath(null);
+      },
+      { defer: true },
+    ),
+  );
+
   const treeGitStatus = createMemo(() => {
+    // Browse overlays both layers (local primary, branch fallback). Outside
+    // browse, decoration comes straight off the active mode's `status` stream.
+    if (view() === "browse") {
+      const local = browseLocalStatus()?.files ?? [];
+      const branch = browseBranchStatus()?.files ?? [];
+      return mergeGitStatusEntries(local, branch);
+    }
     const s = status();
-    return s ? toGitStatusEntries(s.files) : undefined;
+    return s ? mergeGitStatusEntries(s.files, []) : undefined;
   });
 
   const handleSelect = (path: string | null) => {
-    // Pierre emits null on deselect; keep our single-select toggle semantics.
-    setSelectedPath((prev) => (prev === path ? null : path));
+    // Pierre fires null in many situations beyond user intent — including
+    // `resetPaths` clearing its selection during stream resubscribe, and
+    // tear-down on unmount. The Code tab has no UX affordance for
+    // deselect (user switches selection by clicking another file), so
+    // ignore null and only honor explicit non-null selections. Keeping
+    // the previous signal value through Pierre's internal churn lets the
+    // selected file survive right-panel tab toggles (#818).
+    if (path === null) return;
+    // Tree-click to a different file ends the click-targeted-highlight
+    // session — otherwise navigating back to the originally-targeted
+    // file in the tree would resurrect the line range, surprising the
+    // user who treated their tree click as a fresh intent. Same-file
+    // tree-clicks don't trip this branch (Pierre fires `onSelect(rel)`
+    // after our own programmatic `setSelectedPath(rel)` and the path
+    // equals `handled.resolvedPath` in that case — leaving the highlight
+    // intact for the lifetime of the request).
+    const h = handled();
+    if (h && h.resolvedPath !== null && h.resolvedPath !== path) {
+      setHandled(null);
+    }
+    setSelectedPath(path);
   };
 
   const treeError = (): Error | undefined =>
     isDiffView() ? status.error() : allPaths.error();
   const treeReady = () => (isDiffView() ? status() : allPaths());
-  const branchTooltip = () =>
-    `Changes vs ${status()?.base?.ref ?? "branch base"}`;
+  const branchRef = (): string | null => status()?.base?.ref ?? null;
+
+  // Mode catalog — owns the list of views, their labels, hints, and
+  // test IDs. Adding a new mode (e.g. "stash") happens here, plus the
+  // data-source switch above. ModeChipPicker is purely a presenter.
+  const modeOptions = createMemo<ModeOption[]>(() => {
+    const ref = branchRef();
+    return [
+      {
+        view: "browse",
+        label: "All files",
+        hint: "Browse the whole repo",
+        testId: "diff-mode-browse",
+        icon: FileBrowseIcon,
+      },
+      {
+        view: "local",
+        group: "Git",
+        label: "Local",
+        hint: "Working tree vs HEAD",
+        testId: "diff-mode-local",
+        icon: GitBranchIcon,
+      },
+      {
+        view: "branch",
+        group: "Git",
+        label: "Branch",
+        hint: ref ? `vs ${ref}` : "Working tree vs branch base",
+        testId: "diff-mode-branch",
+        icon: GitBranchIcon,
+      },
+    ];
+  });
 
   /** Diff value narrowed to "this is a pure-rename" (no hunks, both old +
    *  new file names present and different). Returning the full diff so the
-   *  rendering Match can read its names without re-narrowing. */
+   *  rendering Match can read its names without re-narrowing.
+   *
+   *  Binary excluded from the rename predicate: a binary rename satisfies
+   *  hunks.length === 0 with distinct old/new names *and* `binary === true`.
+   *  Without this guard, dispatch between the binary placeholder and the
+   *  rename hint would depend on Switch arm ordering — load-bearing and
+   *  invisible. With this guard, the mutual exclusion lives in the data,
+   *  so a Switch refactor can't silently flip the rendering. */
   const renamedDiff = createMemo(() => {
     const d = diff();
     if (!d) return undefined;
+    if (d.binary) return undefined;
     if (d.hunks.length !== 0) return undefined;
     const { oldFileName, newFileName } = d;
     if (!oldFileName || !newFileName || oldFileName === newFileName) {
@@ -163,160 +505,310 @@ const CodeTab: Component<{ meta: TerminalMetadata | null }> = (props) => {
         class="flex flex-col h-full min-h-0 text-[11px]"
         data-testid="diff-tab"
       >
-        <div class="flex items-center h-7 px-1.5 bg-surface-1/30 border-b border-edge shrink-0 gap-1.5">
-          <div class="flex items-center bg-surface-2/40 rounded p-0.5">
-            <button
-              type="button"
-              onClick={() => setView("browse")}
-              title="Browse all files"
-              class={PILL_BUTTON_CLASS}
-              data-testid="diff-mode-browse"
-              data-active={view() === "browse"}
-              aria-pressed={view() === "browse"}
-            >
-              All
-            </button>
-          </div>
-          <div class="flex items-center bg-surface-2/40 rounded p-0.5 gap-0.5">
-            <button
-              type="button"
-              onClick={() => setView("local")}
-              title="Changes vs HEAD"
-              class={PILL_BUTTON_CLASS}
-              data-testid="diff-mode-local"
-              data-active={view() === "local"}
-              aria-pressed={view() === "local"}
-            >
-              Local
-            </button>
-            <button
-              type="button"
-              onClick={() => setView("branch")}
-              title={branchTooltip()}
-              class={PILL_BUTTON_CLASS}
-              data-testid="diff-mode-branch"
-              data-active={view() === "branch"}
-              aria-pressed={view() === "branch"}
-            >
-              Branch
-            </button>
-          </div>
-          <div class="flex-1" />
+        <div class="flex items-center h-7 px-1.5 bg-surface-1/30 border-b border-edge shrink-0 gap-2">
+          <ModeChipPicker
+            view={view()}
+            onViewChange={setView}
+            modes={modeOptions()}
+          />
+          <FileSearchInput value={searchQuery()} onChange={setSearchQuery} />
         </div>
 
-        <div
-          class="shrink-0 h-[35%] min-h-0 border-b border-edge"
-          data-testid="diff-file-list"
+        {/* Vertical split between tree and content. Mirrors the horizontal
+         *  split that the desktop host wires up in `App.tsx` — same
+         *  `@corvu/resizable` shell, vertical orientation. Split fraction
+         *  persists via `rightPanel.codeTabTreeSize` so reload restores
+         *  the user's layout. */}
+        <Resizable
+          orientation="vertical"
+          sizes={[
+            rightPanel.codeTabTreeSize(),
+            1 - rightPanel.codeTabTreeSize(),
+          ]}
+          onSizesChange={(sizes) => {
+            if (sizes[0] !== undefined) rightPanel.setCodeTabTreeSize(sizes[0]);
+          }}
+          class="flex-1 min-h-0 overflow-hidden"
         >
-          <Switch fallback={<div class="px-2 py-1 text-fg-3/50">Loading…</div>}>
-            <Match when={treeError()}>
-              {(err) => (
-                <div class="px-2 py-1 text-danger" data-testid="diff-error">
-                  Error: {err().message}
-                </div>
-              )}
-            </Match>
-            <Match when={treeReady()}>
-              <Show
-                when={treePaths().length > 0}
-                fallback={
-                  <div
-                    class="px-2 py-4 text-fg-3/50 text-center"
-                    data-testid="diff-empty"
-                  >
-                    {(() => {
-                      const m = diffMode();
-                      return m ? EMPTY_STATE[m] : "Empty repository";
-                    })()}
-                  </div>
-                }
-              >
-                <PierreFileTree
-                  paths={treePaths()}
-                  gitStatus={treeGitStatus()}
-                  selectedPath={selectedPath()}
-                  onSelect={handleSelect}
-                  initialExpansion={isDiffView() ? "open" : "closed"}
-                />
-              </Show>
-            </Match>
-          </Switch>
-        </div>
-
-        <div class="flex-1 min-h-0 overflow-auto" data-testid="diff-content">
-          <Show
-            when={selectedPath()}
-            keyed
-            fallback={
-              <FileSelectHint
-                label={
-                  isDiffView()
-                    ? "Select a file to view its diff"
-                    : "Select a file to view its content"
-                }
-              />
-            }
+          <Resizable.Panel
+            as="div"
+            data-testid="diff-file-list"
+            // Pierre renders its scroller inside a shadow root. The mobile
+            // right-panel host is a Corvu bottom-sheet drawer that walks up
+            // from the event target looking for a `data-corvu-no-drag` opt-out
+            // before claiming a vertical drag as a sheet-dismiss; without it,
+            // Corvu eats every drag and the tree can't scroll. So this is
+            // necessary — but NOT sufficient on real hardware: with Corvu out
+            // of the way, iOS Safari's own native scroll still can't reach the
+            // shadow-rooted scroller below the portaled drawer. The manual
+            // touch-scroll driver below closes that gap. Inert on desktop (no
+            // Corvu drawer there). The sibling diff panel scrolls fine — its
+            // `overflow-auto` is a light-DOM scroller Corvu can see.
+            data-corvu-no-drag=""
+            class="min-h-0 border-b border-edge"
+            minSize={0.1}
           >
-            {(path) => (
-              // `keyed` remounts this subtree whenever the selected file
-              // changes. Pierre's `FileDiff.render(newFileDiff)` reuses
-              // the same instance — its line-selection handlers don't
-              // re-bind to the new gutter elements, so right-clicking on
-              // a line in the second file would yield a "Copy path" menu
-              // with no "Copy path:line" entry. Per-file remount gives
-              // each file a fresh `FileDiff` and a clean
-              // `useLineSelection` range, which is also the right
-              // semantic — line refs don't survive across files.
-              <Switch>
-                <Match when={isDiffView()}>
-                  <Switch
-                    fallback={
-                      <div class="px-2 py-1 text-fg-3/50">Loading diff…</div>
-                    }
+            <Switch
+              fallback={<div class="px-2 py-1 text-fg-3/50">Loading…</div>}
+            >
+              <Match when={treeError()}>
+                {(err) => (
+                  <div class="px-2 py-1 text-danger" data-testid="diff-error">
+                    Error: {err().message}
+                  </div>
+                )}
+              </Match>
+              <Match when={treeReady()}>
+                <Show
+                  when={treePaths().length > 0}
+                  fallback={
+                    <div
+                      class="px-2 py-4 text-fg-3/50 text-center"
+                      data-testid="diff-empty"
+                    >
+                      {(() => {
+                        const m = diffMode();
+                        return m ? EMPTY_STATE[m] : "Empty repository";
+                      })()}
+                    </div>
+                  }
+                >
+                  <div
+                    class="h-full w-full min-h-0"
+                    ref={(el) => {
+                      // Keyed on `isMobile` (the mobile drawer layout), NOT
+                      // `isTouch`: the workaround is for iOS native scroll
+                      // failing to reach Pierre's shadow scroller below the
+                      // *portaled* drawer (see pierreTouchScroll.ts). A touch
+                      // tablet on the desktop split uses the non-portaled
+                      // Resizable panel where native scroll works — attaching
+                      // the driver there would preventDefault working scroll.
+                      if (isMobile()) attachPierreTouchScroll(el);
+                    }}
                   >
-                    <Match when={diff.error()}>
-                      {(err) => (
-                        <div class="px-2 py-1 text-danger">
-                          Error: {err().message}
-                        </div>
-                      )}
-                    </Match>
-                    <Match when={renamedDiff()}>
-                      {(rename) => (
-                        <div class="flex items-center justify-center h-full text-fg-3/50">
-                          File renamed: {rename().oldFileName} →{" "}
-                          {rename().newFileName}
-                        </div>
-                      )}
-                    </Match>
-                    <Match when={diff()}>
-                      {(d) => (
-                        <PierreDiffView
-                          path={path}
-                          rawDiff={d().hunks[0] ?? ""}
+                    <FileTree
+                      paths={treeSearch().projectedPaths}
+                      gitStatus={treeGitStatus()}
+                      selectedPath={selectedPath()}
+                      onSelect={handleSelect}
+                      initialExpansion={isDiffView() ? "open" : "closed"}
+                      search={false}
+                      expandPaths={treeSearch().expandedAncestors}
+                      icons={pierreIconConfig}
+                      shadowCss={pierreTreesShadowCss}
+                      contextMenu={{
+                        enabled: true,
+                        triggerMode: "both",
+                        render: renderTreeContextMenu,
+                      }}
+                      onError={(err) =>
+                        toast.error(`File tree render failed: ${err.message}`)
+                      }
+                      // Roomier rows on touch (36px vs 30px) for a comfortable
+                      // tap target; clears the WCAG 2.2 24px floor with margin.
+                      // Snapshotted above — Pierre reads density at construction.
+                      density={treeDensity}
+                      class="h-full w-full"
+                      style={pierreTreesStyle}
+                    />
+                  </div>
+                </Show>
+              </Match>
+            </Switch>
+          </Resizable.Panel>
+
+          <Resizable.Handle
+            data-testid="diff-tree-content-handle"
+            aria-label="Resize tree pane"
+            // Disable startIntersection (the handle's left edge): Corvu's
+            // registerHandle keeps a *module-level* handles[] and pairs
+            // handles whose orientations differ and rects touch at the
+            // corner (see @corvu/resizable/dist/index.js:201–222). Without
+            // this opt-out, our left edge equals the outer horizontal
+            // handle's (in `App.tsx`) right edge → the two are coupled,
+            // and clicks on the outer handle near the file-tree row land
+            // on the inner handle instead. The outer handle carries the
+            // symmetric `startIntersection={false}` so both sides are
+            // defended.
+            startIntersection={false}
+            // `Z_HANDLE_INNER` raises the ::before pseudo-element above
+            // Pierre's tree (the previous flex sibling). Without it, the
+            // tree's bottom 4px shadow the upper half of the handle's hit
+            // area — Pierre's row hit-targets paint above the handle's
+            // absolute ::before because both use auto z-index and the tree
+            // comes first in document order with positioned descendants.
+            // Setting the explicit z-index creates a stacking context that
+            // lifts the ::before in front of the tree's interior.
+            // See `ui/stackLayers.ts` for the full layering contract.
+            class="shrink-0 h-0 relative before:absolute before:inset-x-0 before:-top-1 before:h-2 before:cursor-row-resize before:hover:bg-accent/30 before:transition-colors"
+            style={{ "z-index": Z_HANDLE_INNER }}
+          />
+
+          <Resizable.Panel
+            as="div"
+            data-testid="diff-content"
+            class="min-h-0 overflow-auto"
+            minSize={0.1}
+          >
+            <Show
+              when={selectedPath()}
+              keyed
+              fallback={
+                <FileSelectHint
+                  label={
+                    isDiffView()
+                      ? "Select a file to view its diff"
+                      : "Select a file to view its content"
+                  }
+                />
+              }
+            >
+              {(path) => (
+                // `keyed` remounts this subtree whenever the selected file
+                // changes — line refs don't survive across files, so the
+                // `useLineSelection` controller resets cleanly with the
+                // surrounding subtree. The inner `<CodeView>` would also
+                // accept an in-place item swap via `updateItemId`, but
+                // remount is the simpler idiom here and the right semantic
+                // for the per-file menu state.
+                <Switch>
+                  <Match when={isDiffView()}>
+                    <Switch
+                      fallback={
+                        <div class="px-2 py-1 text-fg-3/50">Loading diff…</div>
+                      }
+                    >
+                      <Match when={diff.error()}>
+                        {(err) => (
+                          <div class="px-2 py-1 text-danger">
+                            Error: {err().message}
+                          </div>
+                        )}
+                      </Match>
+                      <Match when={diff()?.binary && diff()}>
+                        {(d) => (
+                          <BinaryFileHint
+                            fileName={d().newFileName ?? d().oldFileName}
+                          />
+                        )}
+                      </Match>
+                      <Match when={renamedDiff()}>
+                        {(rename) => (
+                          <div class="flex items-center justify-center h-full text-fg-3/50">
+                            File renamed: {rename().oldFileName} →{" "}
+                            {rename().newFileName}
+                          </div>
+                        )}
+                      </Match>
+                      <Match when={diff()}>
+                        {(d) => {
+                          const repo = repoPath();
+                          const tid = props.terminalId;
+                          if (repo === null || tid === null) return null;
+                          // The comment capture surface is applied here at the
+                          // seam — `BrowseDiffView` is a pure presenter, exactly
+                          // like `BrowseFileView`, so "is this commentable?"
+                          // lives in one place per view family rather than being
+                          // re-open-coded inside the leaf. `contentTick` is the
+                          // raw hunk string so the highlight overlay re-anchors
+                          // when a live edit re-diffs the file.
+                          return (
+                            <CommentTextSurface
+                              terminalId={tid}
+                              path={path}
+                              contentTick={d().hunks[0] ?? ""}
+                              class="h-full w-full"
+                              lineAnchored={true}
+                            >
+                              <BrowseDiffView
+                                path={path}
+                                hunk={d().hunks[0] ?? ""}
+                                theme={diffTheme()}
+                                repoRoot={repo}
+                              />
+                            </CommentTextSurface>
+                          );
+                        }}
+                      </Match>
+                    </Switch>
+                  </Match>
+                  <Match when={!isDiffView()}>
+                    {(() => {
+                      const repo = repoPath();
+                      const tid = props.terminalId;
+                      if (repo === null || tid === null) return null;
+                      return (
+                        <BrowseFileDispatcher
+                          terminalId={tid}
+                          repoPath={repo}
+                          filePath={path}
                           theme={diffTheme()}
+                          initialSelectedLines={selectedRange()}
+                          // Following a link inside an HTML preview is the
+                          // same intent as a tree click: move selection to the
+                          // new file and drop any line-range highlight.
+                          onNavigate={handleSelect}
                         />
-                      )}
-                    </Match>
-                  </Switch>
-                </Match>
-                <Match when={!isDiffView()}>
-                  {(() => {
-                    const repo = repoPath();
-                    if (repo === null) return null;
-                    return (
-                      <BrowseFileView
-                        repoPath={repo}
-                        filePath={path}
-                        theme={diffTheme()}
-                      />
-                    );
-                  })()}
-                </Match>
-              </Switch>
-            )}
-          </Show>
-        </div>
+                      );
+                    })()}
+                  </Match>
+                </Switch>
+              )}
+            </Show>
+          </Resizable.Panel>
+        </Resizable>
+        <Show when={repoPath() !== null && props.terminalId !== null}>
+          {(_present) => (
+            <>
+              <CommentsTray
+                terminalId={props.terminalId as string}
+                onJumpTo={(comment) => {
+                  const repo = repoPath();
+                  if (repo === null) return;
+                  // Two complementary highlights on land:
+                  //   1. Pierre's blue line bar (full-row selection)
+                  //      via `openInCodeTab` when we have a stored
+                  //      `lineRange` — the same machinery terminal
+                  //      `path:line` clicks use.
+                  //   2. The CSS Custom Highlight overlay's yellow
+                  //      underline on the exact quote — applied by
+                  //      `highlightOverlay` after the file mounts.
+                  // Plus a scroll request so the matched range lands
+                  // in view even if Pierre's `scrollToLine` and our
+                  // re-find disagree on the row.
+                  if (comment.lineRange) {
+                    openInCodeTab({
+                      ref: {
+                        path: comment.path,
+                        startLine: comment.lineRange.start,
+                        endLine: comment.lineRange.end,
+                      },
+                      repoRoot: repo,
+                      targetMode: "browse",
+                    });
+                  } else {
+                    setView("browse");
+                    setSelectedPath(comment.path);
+                  }
+                  // Carry the comment's surface so the dispatcher flips the
+                  // Source ⇄ Rendered toggle back to it before the overlay
+                  // re-finds the quote: a prose ("Hello Doc") comment landing
+                  // on the source view ("# Hello Doc") would fail to re-anchor
+                  // (and the source view wouldn't even highlight it). When the
+                  // file is already open in the other mode, `setSelectedPath`
+                  // is a no-op (same path → no remount), so the toggle flip is
+                  // the only thing that moves the user back to the right view.
+                  useCommentScrollRequest().set({
+                    commentId: comment.id,
+                    path: comment.path,
+                    surface: comment.surface,
+                  });
+                }}
+              />
+              <CommentComposer terminalId={props.terminalId as string} />
+            </>
+          )}
+        </Show>
       </div>
     </Show>
   );

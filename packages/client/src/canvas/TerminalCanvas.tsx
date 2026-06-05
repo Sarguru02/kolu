@@ -19,7 +19,7 @@ import {
   DragDropSensors,
   type DragEvent,
 } from "@thisbeyond/solid-dnd";
-import type { TerminalId } from "kolu-common";
+import type { TerminalId } from "kolu-common/surface";
 import {
   type Component,
   createEffect,
@@ -28,12 +28,16 @@ import {
   For,
   type JSX,
   on,
+  onCleanup,
   Show,
 } from "solid-js";
+import { useStaleCheck } from "../terminal/staleness";
 import { useTerminalStore } from "../terminal/useTerminalStore";
+import { savedSessionSub } from "../wire";
 import CanvasMinimap from "./CanvasMinimap";
-import CanvasTile from "./CanvasTile";
+import CanvasTile, { type CanvasTileMode } from "./CanvasTile";
 import CanvasWatermark from "./CanvasWatermark";
+import Dock from "./dock/Dock";
 import { applyResize, type ResizeDirection } from "./resizeGeometry";
 import type { TileLayout } from "./TileLayout";
 import {
@@ -41,6 +45,8 @@ import {
   DEFAULT_TILE_W,
   findFreeTilePosition,
 } from "./tilePlacement";
+import { useCanvasFocus } from "./useCanvasFocus";
+import { usePendingLayouts } from "./usePendingLayouts";
 import { useTileTheme } from "./useTileTheme";
 import { useViewPosture } from "./useViewPosture";
 import { capturePointerGesture } from "./viewport/capturePointerGesture";
@@ -56,10 +62,6 @@ function isWheelTargetTerminal(e: WheelEvent): boolean {
   return e.target instanceof Element && e.target.closest(".xterm") !== null;
 }
 
-function layoutsEqual(a: TileLayout, b: TileLayout): boolean {
-  return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
-}
-
 const TerminalCanvas: Component<{
   tileIds: TerminalId[];
   /** Optional corner watermark (e.g. `kolu@host`) painted in the
@@ -68,10 +70,28 @@ const TerminalCanvas: Component<{
   watermark?: string;
   /** Saved layout for a tile, or undefined if none exists yet. */
   getLayout: (id: TerminalId) => TileLayout | undefined;
+  /** Optional one-shot arrange trigger. When provided, the minimap
+   *  zoom-bar grows an arrange button. The canvas is just plumbing —
+   *  the arrange logic itself lives in `useCanvasArrange`.
+   *
+   *  Threaded as a prop rather than consumed via a singleton hook
+   *  (the way `useCanvasViewport` and `usePendingLayouts` are read
+   *  inside `CanvasMinimap`) because `useCanvasArrange` takes
+   *  composition-root deps (`{ store, crud }`) —
+   *  it's a function, not a zero-arg singleton. The prop captures
+   *  the bound result; the minimap doesn't know or care about the
+   *  arrange policy. */
+  onAutoArrange?: () => void;
   /** Report a layout change (drag commit, resize commit, default assignment). */
   onLayoutChange: (id: TerminalId, layout: TileLayout) => void;
   onSelect: (id: TerminalId) => void;
   onClose: (id: TerminalId) => void;
+  /** Invoked when the dock's search-icon button is clicked. Opens the
+   *  command palette pre-drilled into the "Search workspaces" group —
+   *  the same surface `Mod+Shift+K` reaches. */
+  onOpenWorkspaceSearch: () => void;
+  /** Open the "new terminal" flow — wired into the dock header's `+`. */
+  onCreate: () => void;
   renderTileTitle: (id: TerminalId) => JSX.Element;
   /** Optional title-bar actions injected between the title and the close
    *  button — e.g. the screenshot button, theme pill, agent indicator. */
@@ -83,48 +103,38 @@ const TerminalCanvas: Component<{
 }> = (props) => {
   const viewport = useCanvasViewport();
   const store = useTerminalStore();
+  const focus = useCanvasFocus();
   const tileTheme = useTileTheme();
   const posture = useViewPosture();
+  const isStale = useStaleCheck();
 
-  /** Pending per-tile layout overrides — used for three cases, all bridging
-   *  a gap until the server's metadata echo arrives:
-   *    1. Default-position seed: a new tile's cascade layout, so the first
-   *       paint isn't at (0,0) before the echo.
-   *    2. Drag commit: hold the drop position until getLayout catches up —
-   *       solid-dnd has already reset its transform to 0 by then.
-   *    3. Resize preview: live width/height during pointer-move; snapped
-   *       value on pointer-up until the server echoes the committed size.
-   *  Entries auto-clear when the echoed layout matches (effect below). */
-  const [pending, setPending] = createSignal<Record<string, TileLayout>>({});
+  /** Pending per-tile layout overrides — bridges the gap between local
+   *  geometry intent (drag-end, resize-end, default-place, arrange) and
+   *  the server metadata echo. Singleton hook so `useCanvasArrange` can
+   *  seed pending for one-shot arrange writes without an imperative ref
+   *  handshake. Entries auto-clear when the echoed layout matches
+   *  (effect below). */
+  const pendingLayouts = usePendingLayouts();
+  const setPendingLayout = (id: string, layout: TileLayout) =>
+    pendingLayouts.setOne(id, layout);
 
-  function setPendingLayout(id: string, layout: TileLayout) {
-    setPending((prev) => ({ ...prev, [id]: layout }));
-  }
-
+  // Drop pending entries for tiles that died OR whose echo caught up.
+  // The cleanup policy itself lives inside `usePendingLayouts` so the
+  // canvas only owns the trigger (tileIds + getLayout changes), not the
+  // rule. `getLayout` is captured in a stable closure so SolidJS's
+  // fine-grained tracking re-runs the effect when either input shifts.
   createEffect(() => {
-    const p = pending();
-    const alive = new Set(props.tileIds);
-    let changed = false;
-    const next: Record<string, TileLayout> = {};
-    for (const [id, layout] of Object.entries(p)) {
-      // Drop entries for removed tiles — metadata never arrives for them.
-      if (!alive.has(id)) {
-        changed = true;
-        continue;
-      }
-      const current = props.getLayout(id);
-      if (current && layoutsEqual(current, layout)) {
-        changed = true;
-      } else {
-        next[id] = layout;
-      }
-    }
-    if (changed) setPending(next);
+    pendingLayouts.dropEvicted(new Set(props.tileIds), props.getLayout);
   });
+
+  // Pending lives at module scope (singleton, shared with useCanvasArrange).
+  // Flush on canvas unmount so a mobile↔desktop remount never inherits a
+  // stale entry whose echo arrived while the canvas was gone.
+  onCleanup(() => pendingLayouts.clear());
 
   /** Effective layout for a tile (pending override wins over saved). */
   function layoutOf(id: string): TileLayout | undefined {
-    return pending()[id] ?? props.getLayout(id);
+    return pendingLayouts.pending[id] ?? props.getLayout(id);
   }
 
   /** Merged layouts keyed by tile ID — consumed by CanvasTile and CanvasMinimap. */
@@ -137,7 +147,10 @@ const TerminalCanvas: Component<{
     return result;
   });
 
-  // Auto-assign a default layout for tiles with no saved position.
+  // Auto-assign a default layout for tiles with no saved position. A new
+  // tile opens at the viewport-center cascade and NOTHING ELSE MOVES —
+  // there is no per-create auto-arrange. Repo-island clustering happens
+  // only on the explicit "Arrange canvas by repo" command (`onAutoArrange`).
   // The pending seed makes the tile paint at the cascade position on its
   // first render — without it, there would be a (0,0) frame while waiting
   // for the server's metadata echo.
@@ -157,23 +170,39 @@ const TerminalCanvas: Component<{
         const zoom = viewport.zoom();
         const cx = viewport.panX() + width / (2 * zoom);
         const cy = viewport.panY() + height / (2 * zoom);
-        const placed: TileLayout[] = [];
+        const placed: {
+          id: TerminalId;
+          layout: TileLayout;
+          isNew: boolean;
+        }[] = [];
         for (const id of ids) {
           const existing = layoutOf(id);
           if (existing) {
-            placed.push(existing);
+            placed.push({ id, layout: existing, isNew: false });
             continue;
           }
-          const { x, y } = findFreeTilePosition(cx, cy, placed);
           const defaultLayout: TileLayout = {
-            x,
-            y,
+            ...findFreeTilePosition(
+              cx,
+              cy,
+              placed.map((p) => p.layout),
+            ),
             w: DEFAULT_TILE_W,
             h: DEFAULT_TILE_H,
           };
           setPendingLayout(id, defaultLayout);
           props.onLayoutChange(id, defaultLayout);
-          placed.push(defaultLayout);
+          placed.push({ id, layout: defaultLayout, isNew: true });
+        }
+        // Pan to the active newly-placed tile. `activate` is a no-op
+        // setter when active is already this id (handleCreate already set
+        // it via setActiveSilently before the cascade ran) — the call's
+        // job here is bumping the centering signal once the new tile's
+        // pending layout exists. Same mechanism the `focus.request`
+        // effect below uses for every other system-driven activation.
+        const activeId = store.activeId();
+        if (activeId && placed.some((p) => p.isNew && p.id === activeId)) {
+          store.activate(activeId);
         }
       },
     ),
@@ -242,7 +271,7 @@ const TerminalCanvas: Component<{
         onEnd: (ev) => {
           abortResize = null;
           // No motion — skip commit so a bare click doesn't round-trip the server.
-          if (!pending()[id]) return;
+          if (!pendingLayouts.pending[id]) return;
           const { dx, dy } = viewport.normalizeDelta(
             ev.clientX - startX,
             ev.clientY - startY,
@@ -263,8 +292,24 @@ const TerminalCanvas: Component<{
     );
   }
 
+  // No `defer: true`: the cascade effect bumps the signal during canvas
+  // mount and on a remount (close-all → re-create) it can register
+  // before this effect installs its tracker. Without defer the initial
+  // run sees the bumped payload; a stale id from a prior mount resolves
+  // to `layoutOf(id) === undefined` (the tile is gone) so the initial
+  // run is a safe no-op.
+  createEffect(
+    on(focus.request, (id) => {
+      if (!id) return;
+      const layout = layoutOf(id);
+      if (layout) {
+        requestAnimationFrame(() => viewport.centerOnTile(layout));
+      }
+    }),
+  );
+
   // On first mount at the default origin, pan so the persisted active tile
-  // is centered (matches what a pill-tree click does). If there's no
+  // is centered (matches what a workspace-switcher click does). If there's no
   // active tile, fall back to centering the bounding box of all tiles so
   // restored sessions whose tiles live far from (0,0) don't open empty.
   const isDefaultViewport = () =>
@@ -273,6 +318,16 @@ const TerminalCanvas: Component<{
   createEffect(() => {
     const ids = props.tileIds;
     if (ids.length === 0 || !isDefaultViewport()) return;
+    // Wait for `session.get` to yield before deciding between "centre on
+    // saved active" and "bbox fallback". `terminalList.get` (which feeds
+    // `tileIds`) can win the race against `session.get` on cold load —
+    // running the bbox fallback now would pan the viewport off-default,
+    // and the `isDefaultViewport()` guard above would then block any
+    // re-centre once `useSessionRestore` calls `setActiveSilently` with
+    // the persisted id. Once `pending()` flips false, `useSessionRestore`'s
+    // hydration effect runs synchronously (registered earlier) and assigns
+    // the active id, so this effect re-runs and observes it.
+    if (savedSessionSub.pending() && store.activeId() === null) return;
     const active = store.activeId();
     const activeLayout = active ? layoutOf(active) : undefined;
     if (activeLayout) {
@@ -300,104 +355,128 @@ const TerminalCanvas: Component<{
   return (
     <DragDropProvider onDragMove={handleDragMove} onDragEnd={handleDragEnd}>
       <DragDropSensors />
-      <div
-        ref={(el) => viewport.setContainerRef(el, isWheelTargetTerminal)}
-        data-testid="canvas-container"
-        data-zoom={viewport.zoom()}
-        class="flex-1 min-h-0 overflow-hidden relative canvas-grid-bg"
-        style={{
-          "background-position": viewport.gridBgPosition(),
-          "background-size": viewport.gridBgSize(),
-        }}
-      >
-        <Show when={props.watermark}>
-          {(text) => <CanvasWatermark text={text()} />}
-        </Show>
-        {/* renderTile: one definition shared by tiled and maximized
-         *  branches — the only difference is the `maximized` boolean
-         *  and (for tiled) the active-state read derived from store. */}
-        {(() => {
-          const renderTile = (id: TerminalId, maximized: boolean) => (
-            <CanvasTile
-              id={id}
-              active={maximized || store.activeId() === id}
-              maximized={maximized}
-              theme={tileTheme(id)}
-              onSelect={() => props.onSelect(id)}
-              onClose={() => props.onClose(id)}
-              onToggleMaximize={posture.toggle}
-              renderTitle={() => props.renderTileTitle(id)}
-              renderTitleActions={
-                props.renderTileTitleActions
-                  ? () => props.renderTileTitleActions?.(id)
-                  : undefined
-              }
-              renderBody={() =>
-                props.renderTileBody(id, () => store.activeId() === id)
-              }
-              layouts={layouts()}
-              startResize={startResize}
-              zoom={viewport.zoom}
-            />
-          );
-          return (
-            <>
-              {/* Tiled canvas — tiles live inside the pan/zoom transform.
-               *  Hidden entirely when maximized; no reason to paint
-               *  tiles the user can't see. */}
-              <Show when={!posture.maximized()}>
-                <div
-                  data-testid="canvas-transform"
-                  style={{
-                    "transform-origin": "0 0",
-                    transform: viewport.canvasTransform(),
-                  }}
-                >
-                  <For each={props.tileIds}>
-                    {(id) => renderTile(id, false)}
-                  </For>
-                </div>
-              </Show>
-
-              {/* Maximized view — only the active tile, outside any
-               *  transform, covering the canvas via `absolute inset-0`. */}
-              <Show when={posture.maximized() && store.activeId()} keyed>
-                {(id) => renderTile(id, true)}
-              </Show>
-            </>
-          );
-        })()}
-
-        {/* Minimap: spatial dashboard; hides in fullscreen-single-tile mode
-         *  since there's nothing spatial to summarize. */}
-        <Show when={!posture.maximized()}>
-          <CanvasMinimap
-            tileIds={props.tileIds}
-            layouts={layouts()}
-            onSelect={props.onSelect}
-            onStartTileDrag={(id) => {
-              const origin = layoutOf(id);
-              if (!origin) return null;
-              return {
-                preview: (dx, dy) =>
-                  setPendingLayout(id, {
-                    ...origin,
-                    x: origin.x + dx,
-                    y: origin.y + dy,
-                  }),
-                commit: (dx, dy) => {
-                  const next: TileLayout = {
-                    ...origin,
-                    x: viewport.snapToGrid(origin.x + dx),
-                    y: viewport.snapToGrid(origin.y + dy),
-                  };
-                  setPendingLayout(id, next);
-                  props.onLayoutChange(id, next);
-                },
-              };
+      {/* Outer flex container — single mount point for the activity
+       *  dock. The dock owns its own posture-conditional positioning:
+       *  in maximized mode it's `relative shrink-0` (real left-panel
+       *  flex sibling — the canvas takes the remaining width via
+       *  `flex-1`); in tiled mode it's `absolute z-30 top-12 left-4`
+       *  (floats over the canvas). The wrapper is `relative` so the
+       *  dock's absolute coordinates in tiled mode resolve to the same
+       *  `top: 5rem, left: 1rem` they did when mounted inside the
+       *  canvas div.
+       *  Mounting the dock once instead of toggling between two
+       *  `<Show>` branches avoids tearing down its reactive scope on
+       *  posture flips — the prior split-mount approach left the dock
+       *  invisible until full page reload after enough toggles
+       *  (#909 follow-up bug report). */}
+      <div class="flex-1 min-h-0 overflow-hidden flex relative">
+        <Dock
+          onOpenWorkspaceSearch={props.onOpenWorkspaceSearch}
+          onCreate={props.onCreate}
+        />
+        <div
+          ref={(el) => viewport.setContainerRef(el, isWheelTargetTerminal)}
+          data-testid="canvas-container"
+          data-zoom={viewport.zoom()}
+          data-viewport={viewport.canvasTransform()}
+          class="flex-1 min-w-0 overflow-hidden relative canvas-grid-bg"
+          style={{
+            "background-position": viewport.gridBgPosition(),
+            "background-size": viewport.gridBgSize(),
+          }}
+        >
+          <Show when={props.watermark}>
+            {(text) => <CanvasWatermark text={text()} />}
+          </Show>
+          {/* All tiles render in one stable list, every render. Pan/zoom
+           *  composes into each tile's own `transform` (CanvasTile), so
+           *  there's no wrapper transform — which means the active tile in
+           *  maximized mode can use `absolute inset-0 z-40` to cover the
+           *  canvas without a containing-block trap. Switching activeId in
+           *  maximized mode reduces to a CSS class reshuffle on already-
+           *  mounted tiles: no Terminal remount, no `document.fonts.load`,
+           *  no stream re-attach, no scrollback replay (#988).
+           *
+           *  `data-viewport` on `canvas-container` carries the pan/zoom-only
+           *  CSS string so tests can observe viewport state independently of
+           *  per-tile transforms (which also fold in layout coords + drag). */}
+          <For each={props.tileIds}>
+            {(id) => {
+              const active = () => store.activeId() === id;
+              const mode = (): CanvasTileMode =>
+                posture.mode() === "tiled"
+                  ? "tiled"
+                  : active()
+                    ? "maximized"
+                    : "covered";
+              return (
+                <Show when={store.getDisplayInfo(id)}>
+                  {(info) => (
+                    <CanvasTile
+                      id={id}
+                      active={active()}
+                      mode={mode()}
+                      dimmed={isStale(
+                        store.getMetadata(id)?.lastActivityAt ?? 0,
+                      )}
+                      theme={tileTheme(id)}
+                      repoColor={info().repoColor}
+                      onSelect={() => props.onSelect(id)}
+                      onClose={() => props.onClose(id)}
+                      onToggleMaximize={posture.toggle}
+                      renderTitle={() => props.renderTileTitle(id)}
+                      renderTitleActions={
+                        props.renderTileTitleActions
+                          ? () => props.renderTileTitleActions?.(id)
+                          : undefined
+                      }
+                      renderBody={() =>
+                        props.renderTileBody(id, () => store.activeId() === id)
+                      }
+                      layouts={layouts()}
+                      startResize={startResize}
+                      panX={viewport.panX}
+                      panY={viewport.panY}
+                      zoom={viewport.zoom}
+                    />
+                  )}
+                </Show>
+              );
             }}
-          />
-        </Show>
+          </For>
+
+          {/* Minimap: spatial dashboard; hides in fullscreen-single-tile mode
+           *  since there's nothing spatial to summarize. */}
+          <Show when={posture.mode() === "tiled"}>
+            <CanvasMinimap
+              tileIds={props.tileIds}
+              layouts={layouts()}
+              onSelect={props.onSelect}
+              onAutoArrange={props.onAutoArrange}
+              onStartTileDrag={(id) => {
+                const origin = layoutOf(id);
+                if (!origin) return null;
+                return {
+                  preview: (dx, dy) =>
+                    setPendingLayout(id, {
+                      ...origin,
+                      x: origin.x + dx,
+                      y: origin.y + dy,
+                    }),
+                  commit: (dx, dy) => {
+                    const next: TileLayout = {
+                      ...origin,
+                      x: viewport.snapToGrid(origin.x + dx),
+                      y: viewport.snapToGrid(origin.y + dy),
+                    };
+                    setPendingLayout(id, next);
+                    props.onLayoutChange(id, next);
+                  },
+                };
+              }}
+            />
+          </Show>
+        </div>
       </div>
     </DragDropProvider>
   );

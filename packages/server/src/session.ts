@@ -9,15 +9,47 @@
  * then persists.
  */
 
-import type { SavedSession, SavedTerminal } from "kolu-common";
+import type { SavedSession, SavedTerminal } from "kolu-common/surface";
 import { log } from "./log.ts";
-import { publisher, publishSystem } from "./publisher.ts";
+import { terminalsDirtyChannel } from "./publisher.ts";
 import { store } from "./state.ts";
+import { surfaceCtx } from "./surfaceCtx.ts";
 
-/** Write the session blob (or clear it) and publish to subscribers. */
+/** Pending autosave timer — declared at module top so `setSavedSession`
+ *  and the surface cell's `store.set` adapter can cancel it (see comment
+ *  on `cancelPendingAutosave` for the race). */
+let saveTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Cancel any pending `saveSession([])` autosave callback that's been
+ *  armed by a recent `terminalsDirtyChannel` event but hasn't fired yet.
+ *
+ *  Called both from the named `setSavedSession` and from the surface
+ *  session cell's `store.set` adapter (see `surface.ts`). Wiring it into
+ *  the cell adapter is what extends the cancel to the surface's
+ *  `test__set` verb — which the e2e harness uses to seed scenarios,
+ *  and which would otherwise be clobbered ~500 ms later by a stale
+ *  killAll-time dirty event.
+ *
+ *  Harmless on the autosave loop's own write path: by the time the
+ *  loop's callback reaches `cells.session.set`, the callback has
+ *  already cleared `saveTimer` itself (see `initSessionAutoSave`), so
+ *  this is a no-op. Subsequent dirty events received after the callback
+ *  exits arm a fresh timer that is *not* cancelled — autosave keeps
+ *  working as designed.
+ *
+ *  See `initSessionAutoSave` for the autosave loop, and the original
+ *  e2e race description on `setSavedSession` (#320 / cycle 6 of
+ *  `docs/flaky-tests-ralph-report-2.md`). */
+export function cancelPendingAutosave(): void {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = undefined;
+  }
+}
+
+/** Write the session blob (or clear it). The surface owns persist+publish. */
 function writeSession(next: SavedSession | null): void {
-  store.set("session", next);
-  publishSystem("session:changed", next);
+  surfaceCtx.cells.session.set(next);
 }
 
 /** Save a session snapshot. Clears the session when no terminals remain. */
@@ -48,14 +80,23 @@ export function clearSavedSession(): void {
   writeSession(null);
 }
 
-/** Set the saved session directly (used by test harness and session tests). */
+/** Set the saved session directly (used by test harness and session tests).
+ *
+ *  Also cancels any pending autosave timer so a stale `terminals:dirty`
+ *  event scheduled before this call cannot fire after it and clobber the
+ *  manually-set session with an empty-snapshot null. The race surfaces in
+ *  e2e: the test scenario's Before hook drains terminals, then posts a
+ *  fresh saved session, then loads the page; in between, a lingering
+ *  provider event from a previous scenario's drained terminal fires
+ *  `terminals:dirty`, the autosave callback runs 500ms later with an empty
+ *  terminal snapshot, and `saveSession([])` rewrites the session to null —
+ *  the restore card disappears mid-scenario. */
 export function setSavedSession(session: SavedSession | null): void {
+  cancelPendingAutosave();
   writeSession(session);
 }
 
 // --- Auto-save: terminal lifecycle → session persistence (decoupled via publisher) ---
-
-let saveTimer: ReturnType<typeof setTimeout> | undefined;
 
 /** Wire up throttled session save from terminal change events. Called once at startup.
  *
@@ -78,7 +119,7 @@ export function initSessionAutoSave(
 ): void {
   void (async () => {
     try {
-      for await (const _ of publisher.subscribe("terminals:dirty")) {
+      for await (const _ of terminalsDirtyChannel.subscribe(undefined)) {
         if (saveTimer) continue;
         saveTimer = setTimeout(() => {
           saveTimer = undefined;

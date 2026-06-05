@@ -25,6 +25,8 @@ import {
 } from "../support/agent-mock-codex.ts";
 import { waitForBufferContains } from "../support/buffer.ts";
 import { clearMockDatabase } from "../support/mock-fs.ts";
+import { nudgeWal } from "../support/nudge.ts";
+import { pollFor } from "../support/poll.ts";
 import { type KoluWorld, POLL_TIMEOUT } from "../support/world.ts";
 
 const getCodexDir = () => process.env.KOLU_CODEX_DIR;
@@ -68,13 +70,21 @@ async function startFakeAgent(world: KoluWorld): Promise<void> {
   // (comm→"sleep"), breaking the foreground-basename check. A compound
   // command forces bash to stay resident so comm stays "codex".
   //
-  // Emitting OSC 2 from inside the body is a stability belt — the
-  // reconcile triggered by bash's preexec OSC 2 fires before the new
-  // process is actually in the foreground (Linux inotify coalescing +
-  // OSC 7 vs title event ordering under parallel-worker load), so we
-  // emit a second title event once the fake agent is definitively the
-  // foreground process. Without this the detection misses in ~5% of
-  // CI runs.
+  // Emit one OSC 2 from inside the subshell body (after the kernel has
+  // moved the foreground process group to the subshell) so the title
+  // event reconcile in `agent.ts` reads a settled foregroundPid and
+  // `readForegroundBasename() === "codex"`. The trailing `:` keeps bash
+  // resident as the foreground after the body's last command — without
+  // it, bash's `-c` optimisation execve-replaces itself with the final
+  // simple command and the kernel basename flips to `sleep`, breaking
+  // the foreground-basename check.
+  //
+  // The complementary server-side bootstrap is `agent.ts`'s
+  // `commandRun` retry chain at [0, 75, 300, 1000] ms — that's the
+  // load-bearing piece for the npm-shimmed-CLI race where the kernel
+  // basename is `node` and detection rides entirely on
+  // `lastAgentCommandName`. The body OSC 2 here is the simpler
+  // foreground-basename path, which production agents would emit too.
   //
   // `terminal/killAll` in hooks.ts:Before tears the pty down between
   // scenarios, which SIGKILLs the whole tree.
@@ -196,45 +206,60 @@ When(
   },
 );
 
+/** Mock-side WAL nudge for the codex `threads` DB. The INSERT/DELETE
+ *  is wrapped in BEGIN/COMMIT so it produces exactly one WAL commit
+ *  frame — without the explicit transaction, individual statements
+ *  could be coalesced or split into different frames depending on
+ *  SQLite's autocommit/journal state. The transient `__kolu_nudge__`
+ *  row is namespaced so production code (which never inserts ids
+ *  starting with `__kolu_`) can't mistake it for a real session row
+ *  if a concurrent reader sees it inside the WAL window. */
+const CODEX_NUDGE_SQL = `BEGIN; INSERT INTO threads (id, rollout_path, cwd, source, archived, updated_at_ms) VALUES ('__kolu_nudge__', '', '', 'cli', 0, 0); DELETE FROM threads WHERE id = '__kolu_nudge__'; COMMIT;`;
+
+const nudgeCodex = () => nudgeWal(mockFixture?.dbPath, CODEX_NUDGE_SQL);
+
 Then(
   "the tile chrome should show a Codex indicator with state {string}",
   async function (this: KoluWorld, expectedState: string) {
-    const start = Date.now();
-    let last: string | null = null;
-    let lastKind: string | null = null;
-    while (Date.now() - start < POLL_TIMEOUT) {
-      const observed = await this.page.evaluate(() => {
-        const el = document.querySelector(
-          '[data-testid="canvas-tile"] [data-testid="agent-indicator"], [data-testid="mobile-tile-titlebar"] [data-testid="agent-indicator"]',
-        );
-        return {
-          state: el?.getAttribute("data-agent-state") ?? null,
-          kind: el?.getAttribute("data-agent-kind") ?? null,
-        };
-      });
-      last = observed.state;
-      lastKind = observed.kind;
-      if (last === expectedState && lastKind === "codex") return;
-      await new Promise((r) => setTimeout(r, 250));
-    }
-    throw new Error(
-      `Expected Codex indicator state "${expectedState}" (kind=codex), got state="${last}" kind="${lastKind}" after ${POLL_TIMEOUT}ms`,
-    );
+    await pollFor({
+      observe: () =>
+        this.page.evaluate(() => {
+          const el = document.querySelector(
+            '[data-testid="canvas-tile"] [data-testid="agent-indicator"], [data-testid="mobile-tile-titlebar"] [data-testid="agent-indicator"]',
+          );
+          return {
+            state: el?.getAttribute("data-agent-state") ?? null,
+            kind: el?.getAttribute("data-agent-kind") ?? null,
+          };
+        }),
+      isDone: (o) => o.state === expectedState && o.kind === "codex",
+      onTick: nudgeCodex,
+      onTimeout: (last, ms) =>
+        new Error(
+          `Expected Codex indicator state "${expectedState}" (kind=codex), got state="${last?.state ?? null}" kind="${last?.kind ?? null}" after ${ms}ms`,
+        ),
+      timeoutMs: POLL_TIMEOUT,
+    });
   },
 );
 
 Then(
   "the tile chrome should show context tokens {string}",
   async function (this: KoluWorld, expected: string) {
-    await this.page.waitForFunction(
-      (txt) => {
-        const el = document.querySelector(
-          '[data-testid="agent-context-tokens"]',
-        );
-        return el?.textContent?.includes(txt) ?? false;
-      },
-      expected,
-      { timeout: POLL_TIMEOUT },
-    );
+    await pollFor({
+      observe: () =>
+        this.page.evaluate(
+          () =>
+            document.querySelector('[data-testid="agent-context-tokens"]')
+              ?.textContent ?? null,
+        ),
+      isDone: (text) => text?.includes(expected) ?? false,
+      onTick: nudgeCodex,
+      onTimeout: (last, ms) =>
+        new Error(
+          `Expected context tokens to contain "${expected}", got "${last}" after ${ms}ms`,
+        ),
+      timeoutMs: POLL_TIMEOUT,
+    });
   },
 );

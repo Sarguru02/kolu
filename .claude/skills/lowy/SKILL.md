@@ -3,6 +3,7 @@ name: lowy
 description: Evaluate architecture and module boundaries for volatility-based decomposition using Juval Lowy's framework (from "Righting Software", building on Parnas 1972). Use when reviewing module splits, service boundaries, new abstractions, or any decomposition decision. Trigger on phrases like "where should this boundary be", "how to split this", "module boundaries", "encapsulate change", "volatility", or references to Lowy, Parnas, or "Righting Software". Complements /hickey (interleaved concerns) with a different lens (change encapsulation).
 context: fork
 agent: Explore
+model: sonnet
 ---
 
 # Lowy: Volatility-Based Decomposition Review
@@ -35,6 +36,16 @@ Conflating these two — putting orchestration logic and activity logic in the s
 
 Not everything that varies is volatile. Lowy makes a critical distinction: adding an attribute to a data model is *variable* but not *volatile* — the architecture won't suffer. **"If you cannot clearly state what the volatility is, why it is volatile, and what risk the volatility poses in terms of likelihood and effect, then you need to look further."** Decomposing around things that merely vary (rather than things that are genuinely volatile) produces over-engineered boundaries that add cost without containing real change.
 
+## Scope of Review
+
+The trigger — "review this boundary", "should we split X", "look at module Y", a `/do` diff inside one component — is a *starting point*, not a frame. Volatility-based decomposition is most legible at module boundaries; reviewing only the lines the user (or upstream issue) pointed at is how a missing volatility seam in the surrounding module gets missed.
+
+**Default to whole-module scope.** When the trigger lives inside a single file or component, read the whole file — not just the cited region. When invoked on a multi-file diff, each touched file is in scope, and cross-file boundary questions (does this volatility actually live in one place, or is it sprayed across modules?) are in scope too. Sibling modules are fair game when the same boundary question recurs there.
+
+**Don't let the user's framing define the scope.** A trigger that says "extract this into a new component" implies the boundary is the right shape and only the placement is wrong; if the surrounding module shows the volatility axis is actually elsewhere — the data model, the consumer pattern, a sequence/activity split — name *that*, even when the implied fix lands at a different layer than the trigger suggests. The reviewer's job is to surface what the evidence says about volatility, not to confirm the trigger's framing.
+
+**Push back when the evidence contradicts the trigger.** If the prompt narrows the question to one boundary but the surrounding code shows the volatility doesn't track that boundary at all, the redirected finding is the headline, not a footnote. *"Issue #N described a UI extraction; the volatility actually splits the data model into two kinds"* is a valid first finding, not an out-of-scope tangent.
+
 ## The Evaluation
 
 For every module boundary, service split, or new abstraction in the code under review:
@@ -49,6 +60,10 @@ What is likely to change behind this boundary? Be specific — not "requirements
 |--------------------|--------------|------------------------------------|------------------------|
 
 Rows in that table are **surviving candidates** after the project's own variable-vs-volatile screen (see §"Variable vs. Volatile" above). They are not findings, and they are not above review. Do two things with each row: (a) re-apply Lowy's bar — _"state what the volatility is, why it is volatile, and what risk the volatility poses in terms of likelihood and effect"_ — and challenge any row that fails it (Lowy: _"It is important to discuss the volatility candidates this way and even challenge them"_); (b) audit whether the boundaries under review actually encapsulate the surviving volatilities in a single component, rather than spraying or leaking them across modules.
+
+**Check for prior encapsulation.** Before declaring this boundary necessary, search the codebase for the canonical receptacle the project already uses for the same volatility axis. The command palette is the receptacle for "pick a thing" volatility; a generic dialog is the receptacle for modal-interaction volatility; an orchestrator module is the receptacle for sequence volatility within a workflow; a strategy registry is the receptacle for activity volatility; a single error type with a tag is the receptacle for failure-mode volatility. **If the diff creates a parallel receptacle for a volatility axis the project has already encapsulated, that is duplicated volatility encapsulation — a first-class finding under this lens.** Surface it before any micro-level boundary critique inside the new abstraction. The implementer's "this is a new kind of [picker / dialog / scheduler / error] for a new domain" framing is the trap: "new domain, same kind" duplicates the receptacle, not the volatility — and a duplicated receptacle maximizes change blast radius exactly the way functional decomposition does.
+
+Budget heuristic: this survey is worth its cost when the diff introduces a new top-level module, component, or boundary — typically signalled by `git diff --diff-filter=A --name-only origin/HEAD...HEAD` being non-empty. Pure refactors that don't add new boundaries are exempt.
 
 **Speculative volatility is not volatility.** A change scenario counts only if it has happened before, is on a roadmap, or is a near-certain consequence of the domain (e.g. "payment providers change" in e-commerce). "What if we swap color spaces" in an app that has never swapped color spaces is speculation, not an axis of change. Lowy's framework is about *observed* or *plausible* volatility — designing for hypothetical change is over-engineering, not encapsulation.
 
@@ -88,6 +103,26 @@ Volatility-based building blocks are reusable because they encapsulate one axis 
 
 Lowy observes that reuse increases downward through layers: infrastructure and data-access components should be highly reusable across contexts, business-logic orchestrators are reusable across multiple clients, and clients/UI are rarely reusable. If a lower-layer component is locked to a single consumer, the boundary likely tracks functionality rather than a genuine axis of change.
 
+**Single in-tree consumer is not disqualifying when the interface is stable under the encapsulated axis.** §5's bar is whether the interface would survive the volatility it claims to encapsulate — not whether it currently has more than one importer. A receptacle with one wire plugged in is still a receptacle. The published precedent: [`@kolu/surface`](https://kolu.dev/blog/surface-framework/) (and its peers `@kolu/solid-pierre`, the seven `@kolu/*` packages graduated from the [kolu#998 ralph loop](https://github.com/juspay/kolu/pull/998)) extracted from single-in-tree-consumer code. Each encapsulates a stable volatility axis its README names explicitly. The reuse-count check would have killed all of them. The interface-stability check admits them — correctly. The shape that disqualifies is *"the interface mirrors the implementation"*, not *"only one place imports it today"*.
+
+### 6.5 Package Coherence
+
+When the extraction crosses a *package* boundary (not just a module within the same package), the reviewer's job is not done after naming one volatility axis. The package as a whole must read as a **coherent library** — one concept, one socket. If the package ships three exports for three internal aspects of what should be one primitive, you have shipped *partial wiring*, not a receptacle.
+
+Run this check whenever the extraction adds a new published-shape package (`@org/foo`):
+
+1. **Read the package's exports list as if you were a new consumer.** Does it suggest one coherent thing or a topic-bundle?
+   - `@kolu/surface` exports `defineSurface` → one entry, one concept (typed reactive layer). Coherent.
+   - `@kolu/solid-xterm@0.1` (kolu#998 cycle 3–5) exported `createXtermWebgl`, `attachXtermStyleSync`, `createScrollLock` → three entries, three internal aspects of "xterm lifecycle" leaked through three exports. Not a coherent SolidJS adapter for xterm; a topic-bundle of three xterm-adjacent helpers. The fix shipped in `@kolu/solid-xterm@0.2.0` (commit [`4af1c647`](https://github.com/juspay/kolu/commit/4af1c647)) is one `createSolidXterm({ container, theme, fontSize, addons, webgl, scrollLock, ... })` primitive that hides WebGL / style / scroll as internal submodules.
+
+2. **Apply §5's atomic-verb rule at the package level.** §5 already warns that an interface exposing `OpenPort` / `ClosePort` / `AdjustBeam` alongside `ReadCode` mixes axes. A package exporting `createX_webgl` / `attachX_style` / `createX_scroll` does the same thing one altitude up: the package's surface is three operations on three axes, not one atomic abstraction.
+
+3. **The Surface test.** If the package's exports list does not resemble Surface's shape — *one entry point per coherent concept, with internal submodules hidden* — the package is shaped around the implementation, not around a stable contract. Even if each individual export passes §5 in isolation, the *package* fails the test.
+
+4. **The "consumer wires it together" smell.** If the only in-tree consumer imports several of the package's exports and then composes them by hand — the way `Terminal.tsx` had to wire `createXtermWebgl` + `attachXtermStyleSync` + `createScrollLock` + a bare `XTerm` constructor + 8 addon imports in v0.1 — the missing primitive is the composition. The package is shipping submodules and asking the consumer to be the integrator. Wrap them.
+
+**Action when this fires.** Re-extract behind a single primitive that owns the integrated lifecycle; demote the current exports to internal submodules of that primitive. The Lowy verdict is not "don't extract" — it's "extract one socket, not three wires."
+
 ### 7. The Almost-Expendable Test
 
 Lowy's litmus test for correct decomposition: when a change request arrives, the response should be *contemplative* — you think through how to adapt. If a module is *expensive* to change, it's too big (functional decomposition has coupled unrelated concerns). If a module is *expendable* (trivially thrown away), it's an unnecessary boundary. If a module is *almost expendable* — it encapsulates just enough to contain one axis of change, and replacing it is straightforward but not trivial — the decomposition is correct.
@@ -109,9 +144,12 @@ After completing all steps, **invoke `/fact-check` on your own output**. The fac
 - _"This module is only used in one place, but that's fine for now"_ — single-use is the reuse signal firing. Investigate.
 - _"The boundary follows the framework's conventions"_ — framework conventions are functional decomposition by default. Convention is not volatility analysis.
 - _"This could theoretically change independently"_ — theoretical independence without a concrete change scenario is wishful thinking.
-- _"Out of scope for this PR" / "pre-existing"_ — process judgment, not a volatility judgment. Defer with an issue link or fix it.
+- _"Out of scope for this PR" / "pre-existing"_ — process judgment, not a volatility judgment. There is no defer; fix it in this PR. The PR's scope expands to absorb the finding.
 - _"The module encapsulates [domain entity]"_ — domain entities are not volatility axes. What *about* the entity changes? Name the specific volatility or it's domain decomposition.
 - _"This is variable, so we should encapsulate it"_ — variable is not volatile. Can you state the risk in terms of likelihood and effect?
+- _"this is a new kind of [picker / dialog / scheduler / error type] for a new domain"_ — "new domain, same kind" duplicates the receptacle, not the volatility axis. Run the prior-encapsulation check from §1: the canonical pattern (command palette, generic dialog, single tagged error, etc.) is already the receptacle for this volatility. A parallel encapsulation is duplicated encapsulation, which maximizes change blast radius the same way functional decomposition does.
+- _"Fails Lowy's reuse test"_ (when based on import count alone) — reuse-count is a symptom, not a diagnosis. The diagnosis is §5's interface-stability check. An interface can have one importer today and a perfectly stable contract; ten importers and still be shaped around its implementation. Cite the axis, not the count.
+- _"Each export passes §5 in isolation"_ (without checking the package surface) — §5 fires per interface; §6.5 fires per package. Three coherent helpers in one package can collectively fail the package-coherence check if their union suggests one thing the package doesn't actually deliver. Read the exports list as a consumer would and ask "what library is this?" — if the answer is a topic-bundle ("xterm-adjacent helpers") rather than a primitive ("SolidJS adapter for xterm"), §6.5 applies.
 
 If fact-check finds issues, revise before presenting to the user.
 
@@ -122,7 +160,11 @@ If fact-check finds issues, revise before presenting to the user.
 3. **Findings** — Boundaries that track functionality rather than volatility, with blast-radius analysis. Include symmetry violations and layering inversions.
 4. **Simplifications** — Concrete restructuring to align boundaries with axes of change.
 5. **Fact-check result** — Output of `/fact-check` on this evaluation, including the phrase-shape check.
-6. **Actions** — One entry per finding, formatted so a downstream step (e.g. `/do`'s PR comment composer) can lift each entry into a table row. Each entry **starts with a short bolded finding label (≤8 words)** naming *what* is wrong, then dispositions it as **Fix in this PR** or **Defer `#<issue>`**. Every finding must appear here — including those labeled "pre-existing" or "orthogonal". A finding that never reaches this section has been dismissed, not deferred.
+6. **Actions** — One entry per finding, formatted so a downstream step (e.g. `/do`'s PR comment composer) can lift each entry into a table row. Each entry **starts with a short bolded finding label (≤8 words)** naming *what* is wrong, then dispositions it as exactly one of:
+   - **Fix in this PR**: one-line description of what the implementation step must do. This is the only forward-action disposition. The PR's scope expands to absorb every finding.
+   - **No-op**: reserved for findings that need no code action — the diff already deletes the offending code, or the finding is subsumed verbatim by another finding in this same review. Treat this as the rare exception.
+
+   **There is no Defer disposition.** "Out of scope", "pre-existing", "follow-up refactor", "should be its own PR" are not dispositions — they are process judgments dressed up as volatility analysis. Every finding must appear here — including those labeled "pre-existing" or "orthogonal" — and every finding either gets fixed in this PR or is a No-op. A finding that never reaches this section has been dismissed.
 
 Example: `**useViewport encapsulates ghost concern** — Fix in this PR: delete the hook, let FitAddon measure per-tile.`
 

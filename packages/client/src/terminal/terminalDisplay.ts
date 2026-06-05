@@ -3,17 +3,26 @@
  *  Identity-and-presentation come from `terminalKey()` in `kolu-common`;
  *  this module only adds the decorations. */
 
+import type { TerminalId, TerminalMetadata } from "kolu-common/surface";
 import {
   computeTerminalKeys,
-  type TerminalId,
   type TerminalKey,
-  type TerminalMetadata,
   terminalKey,
-} from "kolu-common";
+} from "kolu-common/terminalKey";
 
 export type TerminalDisplayInfo = {
-  repoColor?: string;
-  branchColor?: string;
+  /** Deterministic OKLCH hue per repo `group`. Always defined: `group`
+   *  is non-null in `terminalKey` (git repoName or cwd basename) and
+   *  `assignColors` covers every key passed in. */
+  repoColor: string;
+  /** Same OKLCH scheme keyed on the branch `label`. Always defined for
+   *  the same reason. */
+  branchColor: string;
+  /** Color for the supplant-rule annotation slot — currently mirrors
+   *  `branchColor`, but lives behind its own name so a future tint
+   *  policy (theme-aware, intent-vs-branch distinction, …) lands in
+   *  one place instead of touching every render site. */
+  annotationColor: string;
   meta: TerminalMetadata;
   subCount: number;
   /** Collision-aware identity key. `suffix` is set only when another
@@ -55,14 +64,19 @@ export function buildTerminalDisplayInfos(
   const result = new Map<TerminalId, TerminalDisplayInfo>();
   for (const { id, meta, group, label } of entries) {
     const key = keys.get(id);
+    const repoColor = colors.get(group);
+    const branchColor = colors.get(label);
     // `computeTerminalKeys` keys its map by the ids we just passed in,
-    // so every entry has a matching key. The skip is defence-in-depth
-    // for an unreachable case — the consumer simply gets fewer entries.
-    if (!key) continue;
+    // and `assignColors` was just built from these same group/label
+    // strings, so every entry has matching values. The skip is
+    // defence-in-depth for an unreachable case — the consumer simply
+    // gets fewer entries.
+    if (!key || !repoColor || !branchColor) continue;
     result.set(id, {
       meta,
-      repoColor: colors.get(group),
-      branchColor: colors.get(label),
+      repoColor,
+      branchColor,
+      annotationColor: branchColor,
       subCount: getSubTerminalIds(id).length,
       key,
     });

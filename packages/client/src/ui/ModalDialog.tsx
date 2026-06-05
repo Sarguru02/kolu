@@ -10,22 +10,47 @@
 
 import Dialog from "@corvu/dialog";
 import type { Component, JSX } from "solid-js";
+import {
+  getActiveTerminalNode,
+  getFirstTerminalNode,
+} from "../canvas/activeTerminal";
+import { isTouch } from "../useMobile";
+import { withKeyboardDismiss } from "./dismissSoftKeyboard";
 
 /** Click the visible terminal to restore focus after a dialog closes.
  *  If a terminal already has focus (e.g. sub-panel managed its own focus),
  *  skip the click to avoid stealing focus from the sub-terminal.
  */
 export function refocusTerminal() {
+  // On touch the soft keyboard rises only from an explicit terminal tap;
+  // clicking the terminal here to restore "keep typing" focus would summon it
+  // with no user intent (the click lands on the container's focus handler →
+  // term.focus()). Desktop keeps the convenience.
+  if (isTouch()) return;
   if (document.activeElement?.closest("[data-terminal-id]")) return;
-  document
-    .querySelector<HTMLElement>("[data-visible][data-terminal-id]")
-    ?.click();
+  // Prefer the active tile's terminal — clicking the first DOM tile
+  // would fire its onFocus and silently flip activeId to whoever
+  // happens to be first in tileIds order. The accessor scopes to
+  // CanvasTile's data-active convention and won't pick up sub-panel
+  // headers / chrome tabs / mode chips that also set data-active in
+  // their own format (#845).
+  (getActiveTerminalNode() ?? getFirstTerminalNode())?.click();
 }
 
 // Width cap for the dialog. Applied to the flex-item wrapper (not Dialog.Content)
 // so the child's `w-full` resolves against a definite parent width — otherwise
 // `w-full` on a content-auto flex item collapses to min-content on desktop.
-const SIZE_CLASS = { sm: "max-w-sm", md: "max-w-md" } as const;
+const SIZE_CLASS = {
+  sm: "max-w-sm",
+  md: "max-w-md",
+  // `lg` is sized to fit the command palette's workspace-grid body:
+  // 12rem repo facet + 4 agent-state columns + breathing room. The
+  // cap scales with the viewport so a 27" monitor doesn't render a
+  // tiny dialog in the middle of all that space, while a 13"
+  // laptop still gets the 95vw fallback. 80rem = 1280px caps the
+  // upper end on ultrawide displays.
+  lg: "max-w-[min(95vw,80rem)]",
+} as const;
 
 const ModalDialog: Component<{
   open: boolean;
@@ -36,13 +61,21 @@ const ModalDialog: Component<{
   initialFocusEl?: HTMLElement;
   /** Disable Corvu's built-in focus trapping (for custom keyboard navigation). */
   trapFocus?: boolean;
-  /** Max width cap — "sm" (24rem) for confirms/help, "md" (28rem) for command palette. Defaults to "md". */
-  size?: "sm" | "md";
+  /** Max width cap — "sm" (24rem) for confirms/help, "md" (28rem) for
+   *  legacy palette callers, "lg" (min(95vw, 80rem)) for the unified
+   *  command palette whose workspace-grid body needs the extra room.
+   *  Defaults to "md". */
+  size?: "sm" | "md" | "lg";
   children: JSX.Element;
 }> = (props) => (
   <Dialog
     open={props.open}
-    onOpenChange={props.onOpenChange}
+    // withKeyboardDismiss: on close, blur any dialog-hosted input (palette
+    // query, intent editor, …) so closing the dialog on touch leaves the soft
+    // keyboard down — the same overlay-close policy the mobile drawers carry.
+    // restoreFocus={false} + refocusTerminal's touch no-op keep it from coming
+    // back. No-op on desktop.
+    onOpenChange={withKeyboardDismiss(props.onOpenChange)}
     restoreFocus={false}
     onFinalFocus={(e) => e.preventDefault()}
     // terminal.focus() calls (visibility effects, click handlers) emit focusin

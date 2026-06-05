@@ -4,7 +4,7 @@
 // sites in `canvas/CanvasMinimap.tsx` and `canvas/CanvasTile.tsx` keep
 // the rules off via overrides — see the bottom of this file for why.
 {
-  "$schema": "https://biomejs.dev/schemas/2.4.13/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.4.7/schema.json",
   "vcs": {
     "enabled": true,
     "clientKind": "git",
@@ -28,6 +28,10 @@
       "!.codex",
       "!.opencode",
       "!opencode.json",
+      // Claude Code dynamic-workflow scripts use top-level return/await and
+      // runtime-injected globals (agent/phase/log/...) — they aren't valid
+      // standalone ES modules, so biome can't parse them. Authored, not linted.
+      "!**/*.workflow.js",
       "!**/dist",
       "!**/node_modules",
       "!**/.direnv",
@@ -38,7 +42,9 @@
       // and corrupt files. Astro has its own formatter (future: astro fmt).
       "!**/*.astro",
       // One-off heap-snapshot analyzers; not part of the product surface.
-      "!docs/perf-investigations/scripts"
+      "!docs/perf-investigations/scripts",
+      // Top-level HTML files are design / plan artifacts, not shipping code.
+      "!*.html"
     ]
   },
   // Biome is now the sole formatter — Prettier has been retired (#710).
@@ -98,7 +104,12 @@
       "suspicious": {
         // Terminal code legitimately parses ANSI escape sequences —
         // the rule is a permanent false positive against xterm diagnostics.
-        "noControlCharactersInRegex": "off"
+        "noControlCharactersInRegex": "off",
+        // Promoted from the default `warn` after #1005 broke the 9 server
+        // cycles via the `surfaceCtx.ts` holder pattern. As `error`, any
+        // PR that re-introduces a cycle fails `just check` immediately —
+        // the TDZ-on-import-reorder class becomes structurally impossible.
+        "noImportCycles": "error"
       },
       "complexity": {
         // Tailwind `!important` overrides are intentional in kolu's

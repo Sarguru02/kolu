@@ -7,7 +7,12 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { Logger } from "kolu-shared";
-import { classifyGhError, deriveCheckStatus, prResultEqual } from "./github.ts";
+import {
+  classifyGhError,
+  deriveCheckStatus,
+  extractChecks,
+  prResultEqual,
+} from "./github.ts";
 import { GitHubPrStateSchema, type PrResult } from "./schemas.ts";
 
 const execFileAsync = promisify(execFile);
@@ -71,6 +76,7 @@ export async function resolveGitHubPr(
         url: data.url,
         state: GitHubPrStateSchema.parse(data.state.toLowerCase()),
         checks: deriveCheckStatus(data.statusCheckRollup),
+        checkRuns: extractChecks(data.statusCheckRollup),
       },
     };
   } catch (err) {
@@ -140,7 +146,16 @@ export function subscribeGitHubPr(
   function emit(pr: PrResult): void {
     if (stopped || prResultEqual(pr, lastPr)) return;
     lastPr = pr;
-    onChange(pr);
+    // `onChange` is the caller's callback (a metadata write that can throw).
+    // Guard it here — the single funnel every emission path passes through —
+    // so a throwing consumer degrades this terminal's PR metadata instead of
+    // escaping: synchronously out of `setGit` into the git channel's consume
+    // loop, or as an unhandled rejection out of the floated `fetchAndEmit`.
+    try {
+      onChange(pr);
+    } catch (err) {
+      log?.error({ err }, "github pr watcher: emit failed");
+    }
   }
 
   async function fetchAndEmit(repoRoot: string): Promise<void> {

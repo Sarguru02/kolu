@@ -6,8 +6,10 @@
  *  bar via `canvas/TileTitleActions`. The header is intentionally minimal. */
 
 import Dialog from "@corvu/dialog";
-import { Title } from "@solidjs/meta";
-import type { TerminalId } from "kolu-common";
+import { Meta, Title } from "@solidjs/meta";
+import type { ServerIdentity } from "kolu-common/contract";
+import type { TerminalId } from "kolu-common/surface";
+import Commit from "./ui/Commit";
 import {
   type Component,
   createEffect,
@@ -23,29 +25,37 @@ import CloseConfirm, { type CloseConfirmTarget } from "./CloseConfirm";
 import CommandPalette from "./CommandPalette";
 import "kolu-common/test-hooks";
 import CanvasWatermark from "./canvas/CanvasWatermark";
-import PillTree from "./canvas/PillTree";
-import { flatPillOrder, groupByRepo } from "./canvas/pillTreeOrder";
+import { toggleRailCards } from "./canvas/dock/Dock";
+import { useDockOrder } from "./canvas/dock/useDockOrder";
+import { buildWorkspaceEntries } from "./canvas/dockModel";
 import TerminalCanvas from "./canvas/TerminalCanvas";
 import TileTitleActions from "./canvas/TileTitleActions";
-import { useViewPosture } from "./canvas/useViewPosture";
-import { useCanvasViewport } from "./canvas/viewport/useCanvasViewport";
+import { useCanvasArrange } from "./canvas/useCanvasArrange";
+import { showsWorkspaceSwitcher, supportsSpatialCanvas } from "./capabilities";
 import { createCommands } from "./commands";
 import DiagnosticInfo from "./DiagnosticInfo";
 import EmptyState from "./EmptyState";
 import { exportScrollbackAsPdf } from "./exportScrollbackAsPdf";
 import { exportSessionAsHtml } from "./exportSessionAsHtml";
+import { exportSession, importSession } from "./sessionTransfer";
 import type { ActionContext } from "./input/actions";
 import { useShortcuts } from "./input/useShortcuts";
+import IntentEditorDialog from "./intent/IntentEditorDialog";
+import { useIntentEditor } from "./intent/useIntentEditor";
 import MobileKeyBar from "./MobileKeyBar";
 import MobileTileView from "./MobileTileView";
 import { useRecorder } from "./recorder/useRecorder";
 import WebcamOverlay from "./recorder/WebcamOverlay";
-import RightPanelLayout from "./right-panel/RightPanelLayout";
+import Resizable from "@corvu/resizable";
+import RightPanel from "./right-panel/RightPanel";
+import RightPanelDrawer from "./right-panel/RightPanelDrawer";
 import { useRightPanel } from "./right-panel/useRightPanel";
-import { client, serverProcessId, wsStatus } from "./rpc/rpc";
+import { Z_HANDLE_OUTER } from "./ui/stackLayers";
+import { serverProcessId, wsStatus } from "./rpc/rpc";
 import TransportOverlay from "./rpc/TransportOverlay";
 import ShortcutsHelp from "./ShortcutsHelp";
 import { screenshotTerminal } from "./screenshotTerminal";
+import TipBanner from "./settings/TipBanner";
 import { useColorScheme } from "./settings/useColorScheme";
 import { useTips } from "./settings/useTips";
 import TerminalContent from "./terminal/TerminalContent";
@@ -53,8 +63,11 @@ import TerminalMeta from "./terminal/TerminalMeta";
 import { useSubPanel } from "./terminal/useSubPanel";
 import { useTerminals } from "./terminal/useTerminals";
 import ModalDialog, { refocusTerminal } from "./ui/ModalDialog";
+import { surface } from "./ui/Surface";
 import { isMobile } from "./useMobile";
 import { useThemeManager } from "./useThemeManager";
+import { useVisualViewportHeight } from "./useVisualViewportHeight";
+import { client, savedSession as serverSavedSession } from "./wire";
 
 const App: Component = () => {
   const { store, crud, session, worktree, alerts } = useTerminals();
@@ -76,38 +89,46 @@ const App: Component = () => {
   const subPanel = useSubPanel();
   const rightPanel = useRightPanel();
   const { colorScheme } = useColorScheme();
-  const canvasViewport = useCanvasViewport();
-  const posture = useViewPosture();
 
-  // Pill-tree-grouped order — single source for the desktop pill tree AND
-  // the mobile swipe handler so the two views never drift.
-  //
-  // Desktop: pass `getLayout` so the tree mirrors the canvas spatially
-  // (left tile → first pill, right tile → last pill). Reorders live as
-  // tiles are dragged. Mobile has no canvas, so layouts are absent and
-  // the function falls back to the caller's input order — the server's
-  // Map insertion order (terminal creation order).
-  const pillGroups = createMemo(() =>
-    groupByRepo(
+  // `openInCodeTab` (in `right-panel/openInCodeTab.ts`) dispatches both
+  // desktop uncollapse and mobile drawer-open imperatively from the
+  // producer call. There is no `on(pendingOpen, ...)` subscriber here —
+  // the deferred-effect shape lost re-fires under the production Solid
+  // build (see `openInCodeTab.ts`'s header for the canary scenario).
+
+  // Workspace search feeds — the live-terminal source list and recency
+  // accessor consumed by the unified command palette's "Search
+  // workspaces" group. `useDockOrder` is the same singleton memo the
+  // desktop dock and mobile drawer read, so `Cmd+1..9` targets the
+  // exact row the dock paints (group-bucketed, parked rows filtered).
+  const workspaceEntries = createMemo(() =>
+    buildWorkspaceEntries(
       store.terminalIds(),
       store.getDisplayInfo,
       (id) => store.getMetadata(id)?.canvasLayout,
     ),
   );
-  const orderedIds = createMemo(() => flatPillOrder(pillGroups()));
+  const recencyOf = (id: TerminalId): number =>
+    store.getMetadata(id)?.lastActivityAt ?? 0;
+  const dockTree = useDockOrder();
+  // `dockTree` is already a singleton memo and `.flatRows` is a stable
+  // projection per memo run; a second `createMemo` here just adds a
+  // reactive node without any recomputation benefit. The id-only view
+  // is computed at read time so `ActionContext` keeps its narrow
+  // `TerminalId[]` shape — rail and cards still consume the full
+  // `RankedDockRow` list directly via `dockTree().flatRows`.
+  const orderedIds = (): TerminalId[] => dockTree().flatRows.map((r) => r.id);
 
-  // Fetch hostname from server; used in document title and header
-  const [hostname, setHostname] = createSignal<string>();
+  // Fetch server identity for document title, watermark, and PWA chrome color.
+  const [identity, setIdentity] = createSignal<ServerIdentity>();
   void client.server
     .info()
-    .then((info) => setHostname(info.hostname))
-    .catch(() => {
-      // Server info is cosmetic (document title) — safe to ignore on failure
+    .then((info) => setIdentity(info.identity))
+    .catch((err) => {
+      // Server info is cosmetic — safe to ignore on failure.
+      console.warn("Server info fetch failed:", err);
     });
-  const appTitle = () => {
-    const h = hostname();
-    return h ? `kolu@${h}` : "kolu";
-  };
+  const appTitle = () => identity()?.name ?? "kolu";
 
   // Palette state
   const [paletteOpen, setPaletteOpen] = createSignal(false);
@@ -135,6 +156,10 @@ const App: Component = () => {
 
   const { initTipTriggers } = useTips();
   initTipTriggers({ terminalIds: store.terminalIds });
+
+  // Track the soft-keyboard-shrunk visible area on iOS — `--app-h` overrides
+  // the root `h-dvh` so the terminal grid refits into the visible region.
+  useVisualViewportHeight();
 
   /** Toggle sub-panel: create first split if none exist, otherwise toggle visibility. */
   function handleToggleSubPanel(parentId: TerminalId) {
@@ -167,26 +192,38 @@ const App: Component = () => {
   }
 
   function handleCanvasCenterActive() {
-    if (isMobile()) return;
+    if (!supportsSpatialCanvas()) return;
     const id = store.activeId();
-    if (!id) return;
-    const tile = store.getMetadata(id)?.canvasLayout;
-    if (tile) canvasViewport.centerOnTile(tile);
+    if (id) store.activate(id);
   }
+
+  // Intent editor singleton — reads store + RPC directly. The dialog
+  // is mounted at the App root; the chip in TerminalMeta and the palette
+  // command both call `intentEditor.openTerminal(id)` to surface it.
+  const intentEditor = useIntentEditor();
+
+  const arrange = useCanvasArrange({
+    store,
+    crud,
+  });
 
   // Shared between the keyboard dispatcher and the command palette so a single
   // wiring keeps both surfaces in sync. Palette-only deps (theme management,
   // dialog setters, debug, etc.) are added below in the createCommands call.
   const actionContext: ActionContext = {
     terminalIds: store.terminalIds,
+    dockOrderedIds: orderedIds,
     activeId: store.activeId,
-    setActiveId: store.setActiveId,
+    activate: store.activate,
     mruOrder: store.mruOrder,
     activeMeta: store.activeMeta,
     handleCreate: (cwd?: string) => void crud.handleCreate(cwd),
     handleCreateSubTerminal: (parentId, cwd) =>
       void crud.handleCreateSubTerminal(parentId, cwd),
     openNewTerminalMenu: () => openPaletteGroup("New terminal"),
+    openWorkspaceSwitcher: () => {
+      if (showsWorkspaceSwitcher()) openPaletteGroup("Search workspaces");
+    },
     setPaletteOpen,
     setShortcutsHelpOpen,
     setSearchOpen,
@@ -200,7 +237,7 @@ const App: Component = () => {
     handleShuffleTheme,
     handleScreenshotTerminal: () => handleScreenshotTerminal(),
     toggleRightPanel: rightPanel.togglePanel,
-    canvasCenterActive: handleCanvasCenterActive,
+    toggleDock: toggleRailCards,
     toggleRecordingPause: () => useRecorder().togglePause(),
   };
 
@@ -235,7 +272,7 @@ const App: Component = () => {
       void crud.handleKill(id);
       return;
     }
-    const splitCount = store.getSubTerminalIds(id).length;
+    const splitCount = store.getDisplayInfo(id)?.subCount ?? 0;
     const worktreePath = meta.git?.isWorktree
       ? meta.git.worktreePath
       : undefined;
@@ -256,17 +293,29 @@ const App: Component = () => {
     committedThemeName,
     setPreviewThemeName,
     handleSetTheme,
+    handleEditActiveIntent: intentEditor.openActive,
     setAboutOpen,
     setDiagnosticInfoOpen,
-    handleCreateWorktree: (repoPath, initialCommand) =>
-      void worktree.handleCreateWorktree(repoPath, initialCommand),
+    handleCreateWorktree: (repoPath, name, initialCommand) =>
+      void worktree.handleCreateWorktree(repoPath, name, initialCommand),
     handleClose: () => {
       const id = store.activeId();
       if (id) closeTerminal(id);
     },
-    handleCloseAll: () => void crud.handleCloseAll(),
+    handleClearLocalStorage: () => {
+      localStorage.clear();
+      location.reload();
+    },
+    handleExportSession: () => exportSession(serverSavedSession()),
+    handleImportSession: () =>
+      void importSession().then(
+        (s) => s && session.handleRestoreSession({ session: s }),
+      ),
     simulateAlert: alerts.simulateAlert,
-    isMobile,
+    canvasCenterActive: handleCanvasCenterActive,
+    canvasAutoArrange: arrange.handleCanvasAutoArrange,
+    workspaceEntries,
+    recencyOf,
   });
 
   // Reset state on close and return focus to terminal
@@ -303,7 +352,7 @@ const App: Component = () => {
         }
         onCloseTerminal={closeTerminal}
         activeMeta={store.activeMeta()}
-        onFocus={() => store.setActiveId(id)}
+        onFocus={() => store.setActiveSilently(id)}
       />
     );
   }
@@ -333,10 +382,16 @@ const App: Component = () => {
   const showEmpty = () =>
     !session.isLoading() && store.terminalIds().length === 0;
 
+  const aboutChrome = surface({ portalled: true });
+
   return (
     <div
-      class="relative flex flex-col h-dvh bg-surface-0 text-fg font-sans"
+      class="relative flex flex-col bg-surface-0 text-fg font-sans"
       style={{
+        // `var(--app-h)` is set by useVisualViewportHeight to the
+        // soft-keyboard-shrunk visible area; `100dvh` is the fallback for
+        // browsers without VisualViewport (or before mount fires).
+        height: "var(--app-h, 100dvh)",
         "padding-top": "env(safe-area-inset-top)",
         "padding-bottom": "env(safe-area-inset-bottom)",
         "padding-left": "env(safe-area-inset-left)",
@@ -344,8 +399,12 @@ const App: Component = () => {
       }}
     >
       <Title>{appTitle()}</Title>
+      <Show when={identity()?.themeColor}>
+        {(themeColor) => <Meta name="theme-color" content={themeColor()} />}
+      </Show>
       <TransportOverlay />
       <WebcamOverlay />
+      <TipBanner />
       <Toaster
         position="bottom-right"
         theme={colorScheme()}
@@ -385,7 +444,10 @@ const App: Component = () => {
         onOpenChange={withRefocus(setAboutOpen)}
         size="sm"
       >
-        <Dialog.Content class="bg-surface-1 border border-edge rounded-2xl shadow-2xl shadow-black/50 p-6 text-sm">
+        <Dialog.Content
+          class={`${aboutChrome.class} p-6 text-sm`}
+          style={aboutChrome.style}
+        >
           <div class="flex items-center gap-2 mb-3">
             <img src="/favicon.svg" alt="kolu" class="w-6 h-6" />
             <span class="font-semibold text-fg">{appTitle()}</span>
@@ -403,18 +465,10 @@ const App: Component = () => {
             </p>
             <p>
               Commit:{" "}
-              {__KOLU_COMMIT__ !== "dev" ? (
-                <a
-                  href={`https://github.com/juspay/kolu/commit/${__KOLU_COMMIT__}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  class="text-accent hover:underline"
-                >
-                  {__KOLU_COMMIT__}
-                </a>
-              ) : (
-                <span class="text-fg-2">dev</span>
-              )}
+              <Commit
+                sha={__KOLU_COMMIT__}
+                class="text-accent hover:underline"
+              />
             </p>
             <p>
               Server:{" "}
@@ -444,27 +498,13 @@ const App: Component = () => {
           if (target) void worktree.handleKillWorktree(target.id);
         }}
       />
-      {/* Desktop chrome — docked top bar carrying pill tree, identity,
-       *  and global controls. Mobile has its own pull-down sheet (see
-       *  MobileTileView) and does not render this band. */}
+      {/* Desktop chrome — docked top bar carrying identity and global
+       *  controls. The workspace switcher retired in favor of the
+       *  dock's mega level (#903). Mobile has its own
+       *  pull-down sheet (see MobileTileView) and does not render this
+       *  band. */}
       <Show when={!isMobile()}>
-        <ChromeBar
-          status={wsStatus()}
-          onOpenPalette={() => openPalette()}
-          pillTree={
-            <PillTree
-              groups={pillGroups()}
-              onSelect={(id) => {
-                store.setActiveId(id);
-                if (!posture.maximized()) {
-                  const layout = store.getMetadata(id)?.canvasLayout;
-                  if (layout) canvasViewport.centerOnTile(layout);
-                }
-              }}
-              onCreate={() => openPaletteGroup("New terminal")}
-            />
-          }
-        />
+        <ChromeBar status={wsStatus()} onOpenPalette={() => openPalette()} />
       </Show>
       {/* relative: anchor for overlay panels.
        *  --active-terminal-{bg,fg} published here so child components
@@ -496,59 +536,163 @@ const App: Component = () => {
                 <CanvasWatermark text={appTitle()} />
                 <EmptyState
                   savedSession={session.savedSession() ?? undefined}
+                  isRestoring={session.isRestoring()}
                   onRestore={(opts) => void session.handleRestoreSession(opts)}
                 />
               </div>
             }
           >
-            <RightPanelLayout
-              meta={store.activeMeta()}
-              themeName={activeThemeName()}
-              onThemeClick={() => openPaletteGroup("Theme")}
-              contentClass={isMobile() ? "flex-col" : undefined}
-            >
-              {match(isMobile())
-                .with(true, () => (
+            {match(isMobile())
+              .with(true, () => (
+                <RightPanelDrawer
+                  terminalId={store.activeId()}
+                  meta={store.activeMeta()}
+                  themeName={activeThemeName()}
+                  onThemeClick={() => openPaletteGroup("Set theme")}
+                  contentClass="flex-col"
+                >
                   <MobileTileView
                     orderedIds={orderedIds()}
-                    groups={pillGroups()}
                     status={wsStatus()}
                     appTitle={appTitle()}
                     onOpenPalette={() => openPalette()}
                     renderBody={renderMobileTileBody}
                     bottomBar={<MobileKeyBar activeId={store.activeId} />}
                   />
-                ))
-                .with(false, () => (
-                  <TerminalCanvas
-                    tileIds={store.terminalIds()}
-                    watermark={appTitle()}
-                    getLayout={(id) => store.getMetadata(id)?.canvasLayout}
-                    onLayoutChange={(id, layout) =>
-                      crud.setCanvasLayout(id, layout)
-                    }
-                    onSelect={(id) => store.setActiveId(id)}
-                    onClose={(id) => closeTerminal(id)}
-                    renderTileTitle={(id) => (
-                      <TerminalMeta info={store.getDisplayInfo(id)} />
-                    )}
-                    renderTileTitleActions={(id) => (
-                      <TileTitleActions
-                        id={id}
-                        onOpenPaletteGroup={openPaletteGroup}
-                        onToggleSubPanel={handleToggleSubPanel}
-                        onOpenSearch={() => setSearchOpen(true)}
-                        onScreenshot={handleScreenshotTerminal}
-                      />
-                    )}
-                    renderTileBody={renderCanvasTileBody}
-                  />
-                ))
-                .exhaustive()}
-            </RightPanelLayout>
+                </RightPanelDrawer>
+              ))
+              .with(false, () => (
+                // Desktop host: horizontal `@corvu/resizable` split between
+                // the canvas and the right panel. `sizes=[1, 0]` collapses
+                // the panel to zero width while keeping it mounted — this
+                // preserves `CodeTab`'s selectedPath signal and Pierre's
+                // tree expansion across collapse round-trips (#818).
+                //
+                // **This container is expected to span the full viewport
+                // width** — the Dock floats `position: absolute` over the
+                // canvas in tiled mode rather than reflowing alongside it.
+                // `ChromeBar` leans on this invariant for its
+                // `right: panelSize * 100vw` offset; treating the Corvu
+                // fraction as a viewport-width fraction only works while
+                // the assumption holds. If a sibling ever shrinks this
+                // container, the ChromeBar offset must move to a measured
+                // pixel value or a host-published CSS custom property.
+                //
+                // `startIntersection={false}` on the handle opts out of
+                // Corvu's module-level handle-pairing registry (see
+                // `@corvu/resizable/dist/index.js:201-222`). Without the
+                // opt-out, this outer horizontal handle pairs with
+                // `CodeTab`'s inner vertical handle (their rects touch at
+                // the corner) and clicks near the corner land on the
+                // wrong handle. `CodeTab` defends from the inner side
+                // with the same opt-out — both sides need it.
+                <Resizable
+                  orientation="horizontal"
+                  sizes={
+                    rightPanel.collapsed()
+                      ? [1, 0]
+                      : [1 - rightPanel.panelSize(), rightPanel.panelSize()]
+                  }
+                  onSizesChange={(sizes) => {
+                    // The `undefined` guard is just TypeScript narrowing —
+                    // Corvu always emits `sizes.length === 2` here. The
+                    // real load-bearing gate is `MIN_PANEL_SIZE = 0.05`
+                    // inside `useRightPanel.setPanelSize`, which drops the
+                    // collapsed `sizes[1] = 0` case so `preferences.size`
+                    // never persists as zero (which would re-expand into
+                    // an ungrabbable zero-width panel).
+                    if (sizes[1] !== undefined)
+                      rightPanel.setPanelSize(sizes[1]);
+                  }}
+                  class="flex-1 min-h-0 overflow-hidden"
+                >
+                  <Resizable.Panel
+                    as="div"
+                    class="min-w-0 min-h-0 flex"
+                    minSize={0.3}
+                  >
+                    <TerminalCanvas
+                      tileIds={store.terminalIds()}
+                      watermark={appTitle()}
+                      getLayout={(id) => store.getMetadata(id)?.canvasLayout}
+                      onLayoutChange={arrange.applyTileGeometry}
+                      onAutoArrange={arrange.handleCanvasAutoArrange}
+                      onSelect={store.setActiveSilently}
+                      onClose={(id) => closeTerminal(id)}
+                      onOpenWorkspaceSearch={() =>
+                        openPaletteGroup("Search workspaces")
+                      }
+                      onCreate={() => openPaletteGroup("New terminal")}
+                      renderTileTitle={(id) => (
+                        <TerminalMeta
+                          info={store.getDisplayInfo(id)}
+                          unread={store.isUnread(id)}
+                          onOpenIntent={() => intentEditor.openTerminal(id)}
+                        />
+                      )}
+                      renderTileTitleActions={(id) => (
+                        <TileTitleActions
+                          id={id}
+                          onOpenPaletteGroup={openPaletteGroup}
+                          onToggleSubPanel={handleToggleSubPanel}
+                          onOpenSearch={() => setSearchOpen(true)}
+                          onScreenshot={handleScreenshotTerminal}
+                        />
+                      )}
+                      renderTileBody={renderCanvasTileBody}
+                    />
+                  </Resizable.Panel>
+                  <Show when={!rightPanel.collapsed()}>
+                    <Resizable.Handle
+                      data-testid="right-panel-handle"
+                      startIntersection={false}
+                      // `Z_HANDLE_OUTER` lifts the ::before pseudo above
+                      // the canvas tile (`Z_CANVAS_TILE_ACTIVE`). The
+                      // handle's ::before extends 4px left into the
+                      // canvas area (`before:-left-1 before:w-2`); without
+                      // the explicit z-index the tile paints over that
+                      // half of the hit zone wherever its right edge
+                      // meets or passes the right-panel boundary, killing
+                      // both the visual hover indicator and the pointer
+                      // target. See `ui/stackLayers.ts` for the full
+                      // layering contract.
+                      class="shrink-0 w-0 relative before:absolute before:inset-y-0 before:-left-1 before:w-2 before:cursor-col-resize before:hover:bg-accent/30 before:transition-colors"
+                      style={{ "z-index": Z_HANDLE_OUTER }}
+                      aria-label="Resize inspector panel"
+                    />
+                  </Show>
+                  <Resizable.Panel
+                    as="div"
+                    class="min-w-0 min-h-0 overflow-hidden"
+                    classList={{
+                      "border-l border-edge": !rightPanel.collapsed(),
+                    }}
+                    minSize={0.1}
+                  >
+                    <RightPanel
+                      terminalId={store.activeId()}
+                      meta={store.activeMeta()}
+                      onToggle={rightPanel.togglePanel}
+                      themeName={activeThemeName()}
+                      onThemeClick={() => openPaletteGroup("Set theme")}
+                      visible={!rightPanel.collapsed()}
+                    />
+                  </Resizable.Panel>
+                </Resizable>
+              ))
+              .exhaustive()}
           </Show>
         </Show>
       </div>
+      <IntentEditorDialog
+        open={intentEditor.open()}
+        title={intentEditor.title()}
+        value={intentEditor.value()}
+        allowClear={intentEditor.allowClear()}
+        onOpenChange={intentEditor.onOpenChange}
+        onSave={intentEditor.save}
+        onClear={intentEditor.clear}
+      />
     </div>
   );
 };

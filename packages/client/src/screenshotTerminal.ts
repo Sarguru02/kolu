@@ -15,11 +15,8 @@
  *  Chrome, "black image" reports in real Chrome). Painting cells directly
  *  sidesteps that entire surface. */
 
-import {
-  type TerminalId,
-  type TerminalMetadata,
-  terminalKey,
-} from "kolu-common";
+import type { TerminalId, TerminalMetadata } from "kolu-common/surface";
+import { terminalKey } from "kolu-common/terminalKey";
 import { toast } from "solid-sonner";
 import { FONT_FAMILY } from "terminal-themes";
 import { parseColor, type RGB } from "terminal-themes/color";
@@ -390,6 +387,15 @@ export async function screenshotTerminal(
   );
   if (!blob) {
     toast.error("Screenshot failed");
+    return;
+  }
+  // Image writes have no execCommand equivalent — if navigator.clipboard
+  // is undefined (plain-HTTP, non-localhost), the only honest answer is a
+  // diagnostic toast. See `ui/clipboard.ts` for the text-write fallback.
+  if (!navigator.clipboard?.write) {
+    toast.error(
+      "Screenshot-to-clipboard requires HTTPS or localhost — image writes have no fallback in non-secure contexts",
+    );
     return;
   }
   try {

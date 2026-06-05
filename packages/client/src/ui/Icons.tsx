@@ -126,6 +126,39 @@ export const DiffBranchIcon: Component<{ class?: string }> = (props) => (
   </svg>
 );
 
+export const CopyIcon: Component<{ class?: string }> = (props) => (
+  <svg
+    class={props.class ?? "w-3.5 h-3.5"}
+    viewBox="0 0 16 16"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <rect x="5" y="5" width="9" height="9" rx="1.5" />
+    <path d="M3 11V3a1 1 0 0 1 1-1h8" />
+  </svg>
+);
+
+export const OpenIcon: Component<{ class?: string }> = (props) => (
+  <svg
+    class={props.class ?? "w-3.5 h-3.5"}
+    viewBox="0 0 16 16"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M9 2h5v5" />
+    <path d="M14 2L7 9" />
+    <path d="M13 9v4a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h4" />
+  </svg>
+);
+
 export const CloseIcon: Component<{ class?: string }> = (props) => (
   <svg
     class={props.class ?? "w-3.5 h-3.5"}
@@ -188,6 +221,25 @@ export const GridIcon: Component<{ class?: string }> = (props) => (
       stroke-linejoin="round"
       stroke-width="2"
       d="M4 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM14 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1v-4zM14 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z"
+    />
+  </svg>
+);
+
+/** Crescent-moon glyph — represents the "parked" / sleeping state of stale
+ *  terminals. Used as the minimap toggle for hiding parked tiles. */
+export const MoonIcon: Component<{ class?: string }> = (props) => (
+  <svg
+    class={props.class ?? "w-4 h-4"}
+    fill="none"
+    stroke="currentColor"
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+  >
+    <path
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      stroke-width="2"
+      d="M20 14.5A8 8 0 019.5 4 8 8 0 1020 14.5z"
     />
   </svg>
 );
@@ -506,6 +558,26 @@ export const InspectorToggleIcon: Component<{ active?: boolean }> = (props) => (
     <line x1="15" y1="3" x2="15" y2="21" />
     <Show when={props.active}>
       <rect x="15" y="3" width="6" height="18" rx="0" />
+    </Show>
+  </svg>
+);
+
+/** Dock (dock) toggle — mirror of InspectorToggleIcon for the
+ *  left-edge panel. Filled-left when active = dock is expanded (cards
+ *  or mega); empty-left = dock is in rail (collapsed) mode. */
+export const DockToggleIcon: Component<{ active?: boolean }> = (props) => (
+  <svg
+    class="w-3.5 h-3.5"
+    fill="none"
+    stroke="currentColor"
+    viewBox="0 0 24 24"
+    stroke-width="2"
+    aria-hidden="true"
+  >
+    <rect x="3" y="3" width="18" height="18" rx="2" />
+    <line x1="9" y1="3" x2="9" y2="21" />
+    <Show when={props.active}>
+      <rect x="3" y="3" width="6" height="18" rx="0" />
     </Show>
   </svg>
 );

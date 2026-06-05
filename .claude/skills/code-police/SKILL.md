@@ -1,17 +1,29 @@
 ---
 name: code-police
 description: Review code for quality, simplicity, and common mistakes before declaring work complete.
+context: fork
+model: sonnet
 ---
 
 # Code Police
 
-Review the current changes (scoped to the current branch/PR) against the rules below **plus any additional rules from the project**, then run three passes in order.
+Review the current changes (scoped to the current branch/PR) against the rules below **plus any additional rules from the project**. The three passes — rule checklist, fact-check, elegance — run as parallel sub-agents on fresh contexts; the implementer's main context just wrote the diff and is biased to rationalize it, so reviewing inline laundered violations through. Sub-agents start cold, which is the point. After they return, the orchestrator stitches their findings into a single summary.
 
 ## Project rules
 
-Before Pass 1, read `.agency/code-police.md` if it exists. Treat any rules declared there — whether inline or as a pointer to another file (`See ./code-police-rules.md`) — as additions to the built-in rules below. They appear as separate rows in the Pass 1 checklist with the project's chosen rule IDs.
+Before spawning the pass sub-agents, read `.agency/code-police.md` if it exists. Treat any rules declared there — whether inline or as a pointer to another file (`See ./code-police-rules.md`) — as additions to the built-in rules below. They appear as separate rows in the Pass 1 checklist with the project's chosen rule IDs.
 
 If `.agency/code-police.md` is missing, proceed with only the built-in rules. The file is project-defined and free-form (Markdown, no required frontmatter).
+
+## Reviewing principles
+
+These apply to **every** pass — Pass 1, Pass 2, Pass 3 alike. Each sub-agent's prompt restates them, but the burden also sits on the orchestrator: if a sub-agent comes back with prose that violates these, push it back rather than launder its dismissal through the summary.
+
+- **NEVER talk yourself out of a finding.** If you identified a problem, it IS a problem. No "However…" or "acceptable tradeoff."
+- **NEVER use "theoretically X but practically Y"** to dismiss fragility.
+- **NEVER issue "no action needed"** on a finding you just described.
+- **NEVER end with reassurance** ("the logic is sound", "no other issues") unless you genuinely found zero issues.
+- **Assume the code is wrong until proven right.** You are a prosecutor, not a defense attorney.
 
 ## Rules
 
@@ -58,50 +70,75 @@ Collections, buffers, and listeners that grow with usage must have a bound or a 
 
 _Rationale_: LLM-generated code defaults to the simplest correct implementation, which is often O(n) in session lifetime. These patterns silently degrade performance over hours/days and surface as "the app got slow" with no obvious cause. The fix is almost always straightforward (cap, debounce, stream, share) but must be applied at write time — it's rarely caught in review because the code is functionally correct.
 
-### comments-why-not-what
+### comment-the-non-obvious
 
-Add comments where the _why_ isn't obvious from the code. Don't comment the _what_. Also comment where the _what_ isn't obvious — non-obvious guards, CSS workarounds, platform-specific behavior. Non-obvious workarounds (temp files, wrapper scripts, env var shims) must have a comment explaining why they exist.
+Write a comment when a reader who didn't write the code can't tell, at first glance, **what it does** or **why it's structured this way**. The comment supplies whichever is missing — design intent (why this shape over the conventional one), control-flow semantics (what the cascade actually dispatches), or a hidden constraint the type system doesn't carry.
 
-## Pass 1: Rule checklist
+This is a positive prompt, applied per block: at every non-trivial declaration or block, ask the question. A "obvious to me because I just wrote it" reflex is the failure mode — reviewers and writers both pattern-match on what they already understand and skip the question.
 
-Present a table with **every rule above**:
+## Running the passes
 
-| Rule ID | Violation found? | What was identified | Action taken |
-| ------- | ---------------- | ------------------- | ------------ |
+Spawn Pass 1 and Pass 2 as **two parallel sub-agents** via the harness's agent tool. On Claude Code this is the `Agent` tool with `subagent_type: "Explore"` (Pass 1 and Pass 2 are read-only audits — no edits). On opencode this is the `task` tool. On Codex, the sub-agent spawning tool. Emit both `Agent` tool_use blocks in a single response so they run concurrently — sequential spawning halves the parallelism.
 
-If no violation was found for a rule, mark it as "No" with a brief note on what was checked. Every rule must appear in the table — no skipping.
+Each sub-agent inherits no context from the implementer's main thread; the prompts below are self-contained and reference the rules-of-record by file path so a single source of truth stays in this skill.
 
-## Pass 2: Fact-check
+Pass 3 runs **after** Pass 1 and Pass 2 return. It applies fixes (via `/simplify`) and would race against Pass 1/2's grep-and-read work if run in parallel; sequential is the safer ordering. See "Pass 3: Elegance" below.
 
-Audit the changes for **correctness and rigor**. This is not a style review — it's a logic review. Find places where the code lies to itself.
+Once all three pass outputs are in hand, stitch them into the summary table in the **Output** section.
 
-Flag:
+### Pass 1: Rule checklist
 
-- **Silent error swallowing** — bare `try/catch: pass`, empty `catch {}`, `|| true`, errors caught but not propagated, `Result`/`Option` silently defaulted.
-- **Inaccurate fallbacks** — defaults masking misconfiguration, "sensible defaults" that aren't sensible for the failure case, fallback paths that silently degrade correctness.
-- **Wishful thinking** — assumptions about input shape without validation at boundaries, code that "can't fail" but actually can, race conditions papered over with comments.
-- **Logic errors** — always-true/false conditions, off-by-one, wrong operators, shadowed variables.
-- **Slow leaks** — collections that grow without bound, event handlers doing heavy work on every fire without debounce, watchers/listeners registered per-caller instead of shared, buffers sized to the full input when streaming would work.
+Sub-agent prompt:
 
-For each finding: file, line, one-line risk, concrete fix. If no issues, say so — don't invent problems.
+> You are Pass 1 (rule checklist) of the `/code-police` skill on this repo's current diff.
+>
+> Read the "Reviewing principles" and "Rules" sections of `.apm/skills/code-police/SKILL.md` for the built-in rule set. Also read `.agency/code-police.md` if it exists — its rules are additions to the built-in list (separate rows in the table, project-chosen rule IDs).
+>
+> **Scope:** the current diff against the merge base — run `git diff origin/HEAD...HEAD` (or the appropriate base-branch ref if `origin/HEAD` is unset).
+>
+> Produce a single table with **every rule** (built-in + project):
+>
+> | Rule ID | Violation found? | What was identified | Action taken |
+> | ------- | ---------------- | ------------------- | ------------ |
+>
+> Every "No" requires a **`Checked by:`** field whose content is one of:
+>
+> - For purely-negative rules (e.g. `no-dead-code`, `no-silent-error-swallowing`): the grep that confirmed absence — _"grep'd for `head`, `tail`, `fromJust`, `(!!)`, `Map.!`, `error`, `undefined`; zero matches."_
+> - For bidirectional rules (e.g. `comment-the-non-obvious`, `prefer-focused-library`): the enumeration of positive candidates ruled out — _"enumerated `am`, `keep`, guard branches, `G.stars`/`G.reachable` calls; for each, named why a fresh reader decodes the why from code alone."_
+>
+> A "No" without `Checked by:` is malformed and must be rewritten. Every rule must appear in the table — no skipping. Apply the "Reviewing principles" verbatim — do not rationalize a violation away because the diff "needs" it.
+>
+> Return only the table plus any per-finding rationale beneath it. Do not apply fixes; the orchestrator will route them.
 
-**Principles:**
+### Pass 2: Fact-check
 
-- **Fail loud over fail silent**: Code should scream when something is wrong, not quietly do the wrong thing.
-- **Fallbacks must be justified**: Every default/fallback needs a reason why that value is correct for the failure case, not just convenient.
-- **Precision over coverage**: Better to catch 3 real issues than flag 20 maybes.
+Sub-agent prompt:
 
-**Anti-patterns in YOUR review (strictly banned):**
+> You are Pass 2 (fact-check) of the `/code-police` skill on this repo's current diff.
+>
+> Read the "Reviewing principles" section of `.apm/skills/code-police/SKILL.md` and apply them verbatim. This is **not** a style review — it is a logic review. Find places where the code lies to itself.
+>
+> **Scope:** the current diff against the merge base — run `git diff origin/HEAD...HEAD` (or the appropriate base-branch ref if `origin/HEAD` is unset).
+>
+> Flag:
+>
+> - **Silent error swallowing** — bare `try/catch: pass`, empty `catch {}`, `|| true`, errors caught but not propagated, `Result`/`Option` silently defaulted.
+> - **Inaccurate fallbacks** — defaults masking misconfiguration, "sensible defaults" that aren't sensible for the failure case, fallback paths that silently degrade correctness.
+> - **Wishful thinking** — assumptions about input shape without validation at boundaries, code that "can't fail" but actually can, race conditions papered over with comments.
+> - **Logic errors** — always-true/false conditions, off-by-one, wrong operators, shadowed variables.
+> - **Slow leaks** — collections that grow without bound, event handlers doing heavy work on every fire without debounce, watchers/listeners registered per-caller instead of shared, buffers sized to the full input when streaming would work.
+>
+> Operating principles:
+>
+> - **Fail loud over fail silent**: Code should scream when something is wrong, not quietly do the wrong thing.
+> - **Fallbacks must be justified**: Every default/fallback needs a reason why that value is correct for the failure case, not just convenient.
+> - **Precision over coverage**: Better to catch 3 real issues than flag 20 maybes.
+>
+> For each finding: file, line, one-line risk, concrete fix. If no issues, say so — don't invent problems. Do not apply fixes; the orchestrator will route them.
 
-- NEVER talk yourself out of a finding. If you identified a problem, it IS a problem. No "However..." or "acceptable tradeoff."
-- NEVER use "theoretically X but practically Y" to dismiss fragility.
-- NEVER issue "no action needed" on a finding you just described.
-- NEVER end with reassurance. No "the logic is sound" unless you genuinely found zero issues.
-- Assume the code is wrong until proven right. You are a prosecutor, not a defense attorney.
+### Pass 3: Elegance
 
-## Pass 3: Elegance
-
-**Skip on tiny diffs.** Run `git diff origin/HEAD...HEAD --shortstat` (or the appropriate base-branch ref). If the diff is **under 10 lines**, skip this pass and report `Elegance | 0 | Skipped (tiny diff)` in the summary. The elegance pass's three-lens fan-out has overhead that's disproportionate to a few-line change; rules and fact-check still run. If the diff exceeds the threshold, proceed below.
+**Skip on tiny diffs.** Run `git diff origin/HEAD...HEAD --shortstat` (or the appropriate base-branch ref). If the diff is **under 10 lines**, skip this pass and report `Elegance | 0 | Skipped (tiny diff)` in the summary. The elegance pass's three-lens fan-out has overhead that's disproportionate to a few-line change; Pass 1 and Pass 2 still run. If the diff exceeds the threshold, proceed below.
 
 Review the changes for elegance and simplicity.
 
@@ -121,15 +158,19 @@ Principles:
 - **Idiomatic over generic**: Use the language's strengths.
 - **Each iteration builds on the last**: Don't undo previous improvements. Deepen them.
 
+The "Reviewing principles" (prosecutor stance, no talk-out-of-findings) apply here too — `/simplify` and the inline loop both bind to them.
+
 ## Output
 
-After all three passes, present a combined summary:
+Stitch the three pass outputs into a single combined summary:
 
 | Pass       | Issues found | Details                  |
 | ---------- | ------------ | ------------------------ |
 | Rules      | N            | Brief summary or "Clean" |
 | Fact-check | N            | Brief summary or "Clean" |
 | Elegance   | N            | Brief summary or "Clean" |
+
+Below the table, reproduce each sub-agent's full findings (the Pass 1 rule table, Pass 2's per-finding list, Pass 3's `/simplify` log) verbatim so the orchestrator (`/do`'s police step) can commit each violation as its own fix.
 
 If ANY pass found issues, clearly state: **"Violations or issues found"** so the workflow can route to a fix step.
 

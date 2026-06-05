@@ -13,8 +13,8 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { createDirFilenameWatcher } from "kolu-io";
 import { resolveGitDir, WATCHER_DEBOUNCE_MS } from "./git-dir.ts";
-import { createDirFilenameWatcher } from "./shared-dir-filename-watcher.ts";
 
 const reflogWatcher = createDirFilenameWatcher({
   resolveDir: (cwd) => {

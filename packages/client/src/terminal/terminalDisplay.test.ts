@@ -1,4 +1,5 @@
-import type { GitInfo, TerminalMetadata } from "kolu-common";
+import type { TerminalMetadata } from "kolu-common/surface";
+import type { GitInfo } from "kolu-git/schemas";
 import { describe, expect, it } from "vitest";
 import { assignColors, buildTerminalDisplayInfos } from "./terminalDisplay";
 
@@ -9,6 +10,7 @@ function makeMeta(overrides: Partial<TerminalMetadata> = {}): TerminalMetadata {
     pr: { kind: "pending" },
     agent: null,
     foreground: null,
+    lastActivityAt: 0,
     ...overrides,
   };
 }

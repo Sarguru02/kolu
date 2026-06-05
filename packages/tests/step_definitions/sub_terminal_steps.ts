@@ -1,7 +1,12 @@
 import * as assert from "node:assert";
 import { Then, When } from "@cucumber/cucumber";
 import { waitForBufferContains } from "../support/buffer.ts";
-import { type KoluWorld, MOD_KEY, POLL_TIMEOUT } from "../support/world.ts";
+import {
+  COARSE_POINTER_QUERY,
+  type KoluWorld,
+  MOD_KEY,
+  POLL_TIMEOUT,
+} from "../support/world.ts";
 
 const PALETTE = '[data-testid="command-palette"]';
 
@@ -59,9 +64,16 @@ async function paletteCommand(world: KoluWorld, query: string) {
     { timeout: POLL_TIMEOUT },
   );
   // Wait for focus to land in a terminal — Corvu's focus trap release is async
-  // and waitForFrame (2x rAF) is insufficient on loaded CI.
+  // and waitForFrame (2x rAF) is insufficient on loaded CI. On touch the
+  // refocus-terminal-on-dialog-close is intentionally suppressed (it would
+  // summon the soft keyboard with no tap), so the terminal stays unfocused by
+  // design — short-circuit the wait there; the typing steps focus their target
+  // explicitly.
   await world.page.waitForFunction(
-    () => !!document.activeElement?.closest("[data-terminal-id]"),
+    (coarsePointer) =>
+      matchMedia(coarsePointer).matches ||
+      !!document.activeElement?.closest("[data-terminal-id]"),
+    COARSE_POINTER_QUERY,
     { timeout: POLL_TIMEOUT },
   );
 }
@@ -96,11 +108,11 @@ When(
 When(
   "I run {string} in the sub-terminal",
   async function (this: KoluWorld, command: string) {
-    // Wait for focus to be specifically in a sub-terminal, not the main one
-    await this.page.waitForFunction(
-      () => !!document.activeElement?.closest("[data-sub-terminal]"),
-      { timeout: POLL_TIMEOUT },
-    );
+    // Focus the visible sub-terminal before typing — desktop auto-focuses it on
+    // expand, but on touch the sub no longer auto-focuses (the soft keyboard
+    // rises only on a tap), so this stands in for the tap. Either way, typing
+    // lands in the sub-terminal, not the main one.
+    await this.focusForTyping("[data-visible][data-sub-terminal]");
     await this.page.keyboard.type(command);
     await this.page.keyboard.press("Enter");
     await this.waitForFrame();
@@ -121,7 +133,7 @@ Then(
   "the sub-terminal should have keyboard focus",
   async function (this: KoluWorld) {
     // Wait for focus to land inside a [data-sub-terminal] container directly —
-    // no indirect ID comparison with the pill tree's active entry.
+    // no indirect ID comparison with the workspace switcher's active entry.
     await this.page.waitForFunction(
       () => !!document.activeElement?.closest("[data-sub-terminal]"),
       { timeout: POLL_TIMEOUT },
@@ -253,6 +265,50 @@ Then(
     );
     const count = await badge.count();
     assert.strictEqual(count, 0, "Expected no sub-terminal count badge");
+  },
+);
+
+Then(
+  "the active dock row should show sub-terminal count {int}",
+  async function (this: KoluWorld, expected: number) {
+    // Poll until data-sub-count reaches the expected value — the reactive
+    // attribute update is async relative to the sub-terminal DOM mounting.
+    await this.page.waitForFunction(
+      (n) =>
+        document
+          .querySelector('[data-testid="dock-row"][data-active]')
+          ?.getAttribute("data-sub-count") === String(n),
+      expected,
+      { timeout: POLL_TIMEOUT },
+    );
+    const chip = this.page.locator(
+      '[data-testid="dock-row"][data-active] [data-testid="dock-sub-count"]',
+    );
+    await chip.waitFor({ state: "visible", timeout: POLL_TIMEOUT });
+    const text = await chip.textContent();
+    assert.ok(
+      text?.includes(`${expected}`),
+      `Expected dock chip to show "${expected}", got "${text}"`,
+    );
+  },
+);
+
+Then(
+  "the active dock row should not show a sub-terminal count",
+  async function (this: KoluWorld) {
+    // Poll until data-sub-count is absent — reactive removal is async.
+    await this.page.waitForFunction(
+      () =>
+        document
+          .querySelector('[data-testid="dock-row"][data-active]')
+          ?.getAttribute("data-sub-count") === null,
+      { timeout: POLL_TIMEOUT },
+    );
+    const chip = this.page.locator(
+      '[data-testid="dock-row"][data-active] [data-testid="dock-sub-count"]',
+    );
+    const count = await chip.count();
+    assert.strictEqual(count, 0, "Expected no dock-sub-count chip");
   },
 );
 

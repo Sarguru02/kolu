@@ -1,8 +1,11 @@
 Feature: Mobile chrome drawer
-  On mobile the persistent pill tree and chrome bar are replaced by a
-  pull-down drawer (`MobileChromeSheet`). Tapping the pull-handle opens
-  it; tapping a pill switches the active terminal and dismisses the
-  drawer; tapping the backdrop dismisses without switching.
+  On mobile, the persistent chrome bar is replaced by a pull-down
+  drawer (`MobileChromeSheet`) carrying global controls — command
+  palette, settings, inspector toggle. Tapping the top pull-handle
+  opens it; tapping the backdrop dismisses it.
+
+  Terminal navigation lives in a separate left-edge swipe drawer
+  (see `mobile-dock-drawer.feature`).
 
   Background:
     Given the terminal is ready
@@ -14,13 +17,12 @@ Feature: Mobile chrome drawer
     And there should be no page errors
 
   @mobile
-  Scenario: Selecting a pill in the drawer switches active terminal and closes
-    Given I run "echo from-t0"
-    And I create a terminal
-    When I tap the mobile pull handle
-    And I tap the inactive mobile pill branch
-    Then the active terminal should show "from-t0"
-    And the mobile chrome sheet should not be visible
+  Scenario: Clicking the pull handle (mouse path) opens the drawer without errors
+    # Companion regression cover for #977 — the chrome drawer is structurally
+    # exposed to the same Corvu @0.2.4 mouse-click crash as the dock drawer,
+    # and now carries the same `snapPoints={[0, 1]}` workaround.
+    When I click the mobile pull handle
+    Then the mobile chrome sheet should be visible
     And there should be no page errors
 
   @mobile

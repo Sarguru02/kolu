@@ -13,16 +13,6 @@ export interface Tip {
   text: string;
 }
 
-/** Built when the user clicks a pill in the floating tree — surfaces the
- *  numeric switch shortcut so they learn the keyboard path. */
-export function pillTreeSwitchTip(index: number): Tip {
-  const key = (index + 1) as 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
-  return {
-    id: "pill-tree-switch",
-    text: `Tip: ${formatKeybind(ACTIONS[`switchTo${key}`].keybind)} switches directly`,
-  };
-}
-
 export const CONTEXTUAL_TIPS = {
   themeFromPalette: {
     id: "theme-palette",
@@ -44,8 +34,8 @@ export const AMBIENT_TIPS: readonly Tip[] = [
     text: `${formatKeybind(ACTIONS.toggleSubPanel.keybind)} splits your terminal into a bottom pane`,
   },
   {
-    id: "amb-pill-tree",
-    text: "Hover the pill tree at the top of the canvas to switch terminals — click a branch pill to pan to it",
+    id: "amb-workspace-switcher-shortcut",
+    text: `${formatKeybind(ACTIONS.openWorkspaceSwitcher.keybind)} opens the workspace switcher with search focused`,
   },
   {
     id: "amb-mru",
@@ -88,7 +78,31 @@ export const AMBIENT_TIPS: readonly Tip[] = [
     text: "Double-click a tile's title bar to maximize it to the viewport. Double-click again to restore.",
   },
   {
+    id: "amb-chrome-maximize",
+    text: "Use the maximize toggle in the header to switch between the tiled canvas and maximized mode.",
+  },
+  {
     id: "amb-pwa-install",
     text: "Install kolu as a native app from your browser menu — unlocks ⌘T, ⌃Tab and friends",
+  },
+  {
+    id: "amb-file-ref-link",
+    text: "Click a `packages/foo/bar.ts:42` path in any terminal to open it in the right panel at that line",
+  },
+  {
+    id: "amb-minimap-window",
+    text: "Click the `All` chip in the minimap's zoom bar to pick an activity window (4h/12h/24h/48h) — older tiles collapse to small ghost markers so attention stays on what's still in play",
+  },
+  {
+    id: "amb-terminal-intent",
+    text: `Click the annotation slot in a tile's title bar (or ${formatKeybind(ACTIONS.commandPalette.keybind)} → "Edit intent") to attach a note — line 1 supplants the branch name in dock/switcher; the rest renders as markdown`,
+  },
+  {
+    id: "amb-comments-on-files",
+    text: "Select any text in the Code tab (file browse, branch diff, or HTML artifact) to drop a `+ Comment` — your queue copies to the clipboard as Markdown for the agent",
+  },
+  {
+    id: "amb-markdown-preview",
+    text: "Open a `.md` file in the Code tab's browse mode to read it rendered — flip the Source ⇄ Rendered toggle in the file header to see the raw Markdown",
   },
 ];

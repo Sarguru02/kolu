@@ -5,11 +5,11 @@
  *  Terminal grid dimensions are per-instance — each xterm measures its
  *  own container via FitAddon. */
 
-import { makePersisted } from "@solid-primitives/storage";
-import type { TerminalId } from "kolu-common";
+import type { TerminalId } from "kolu-common/surface";
 import { createEffect, createSignal, on } from "solid-js";
 import { createStore, produce, reconcile } from "solid-js/store";
-import { client } from "./rpc/rpc";
+import { persistedPref } from "./persistedPref";
+import { client } from "./wire";
 
 type TerminalAttention = "unread" | "badge-only";
 
@@ -22,10 +22,18 @@ export function useViewState() {
    *  it's a per-tab view preference, not session state, so it lives
    *  alongside other view prefs (e.g. minimap-expanded), not in the
    *  server's SavedSession. */
-  const [canvasMaximized, setCanvasMaximizedSignal] = makePersisted(
-    createSignal(false),
-    { name: "kolu-canvas-maximized" },
-  );
+  const [canvasMaximized, setCanvasMaximizedSignal] = persistedPref<boolean>({
+    name: "kolu-canvas-maximized",
+    fallback: false,
+    // Strict: the default coercion read the stored string `"false"` as
+    // truthy, so the posture latched on once persisted. Only literal
+    // `"true"`/`"false"` are valid; anything else throws and falls back.
+    parse: (raw) => {
+      if (raw === "true") return true;
+      if (raw === "false") return false;
+      throw new Error(`unrecognized maximized flag: ${raw}`);
+    },
+  });
 
   /** Terminals needing attention. `unread` drives in-app dots and badges;
    *  `badge-only` is for OS/PWA attention that should not show an in-app dot. */
@@ -34,6 +42,36 @@ export function useViewState() {
   >({});
 
   const [mruOrder, setMruOrder] = createSignal<TerminalId[]>([]);
+
+  /** Canvas "pan to this tile" intent — see `canvas/useCanvasFocus.ts`
+   *  for the consumer seam. `equals: false` so back-to-back requests for
+   *  the same id still fire the listener. Public reads only; the writer
+   *  is private — external callers go through `activate(id)` instead, so
+   *  there is no two-call dance to forget. */
+  const [centerActiveRequest, setCenterActiveRequest] =
+    createSignal<TerminalId | null>(null, { equals: false });
+
+  /** Make `id` the active terminal AND ask the canvas viewport to pan to
+   *  it. The single public writer for system-driven activation — close
+   *  auto-switch, post-create centering, palette / switcher / keyboard
+   *  navigation, post-arrange recenter. Adding a new activation path
+   *  means calling this; there is no separate "request centering" the
+   *  caller can forget.
+   *
+   *  Use {@link setActiveSilently} only for the small set of callers
+   *  where the tile is already on screen by construction (in-canvas tile
+   *  click, focus events, title-bar buttons, mobile pager) or where there
+   *  is no canvas to pan (mobile, session restore — initial-mount
+   *  fallback handles centering). */
+  function activate(id: TerminalId | null) {
+    setActiveId(id);
+    if (id !== null) setCenterActiveRequest(id);
+  }
+
+  /** Set the active terminal without panning the canvas. Reserve for
+   *  callers that have a domain reason not to pan; use {@link activate}
+   *  by default. */
+  const setActiveSilently = setActiveId;
   createEffect(
     on(activeId, (id) => {
       if (id === null) return;
@@ -91,11 +129,13 @@ export function useViewState() {
 
   return {
     activeId,
-    setActiveId,
+    activate,
+    setActiveSilently,
     canvasMaximized,
     toggleCanvasMaximized,
     mruOrder,
     setMruOrder,
+    centerActiveRequest,
     markUnread,
     markBadgeAttention,
     clearBadgeAttention,

@@ -32,6 +32,25 @@ When(
   },
 );
 
+When(
+  "a git repo is initialized externally in {string}",
+  async function (this: KoluWorld, repoPath: string) {
+    // Run `git init` from the test process, not the terminal's shell —
+    // no OSC 7 fires, so the provider only has the cwd-entry watcher to
+    // notice `.git`. Mirrors the user's bug in #813.
+    execFileSync("git", ["init", repoPath], { stdio: "ignore" });
+    // Belt-and-braces: the cwd-entry `fs.watch` can drop the single
+    // `.git` create event under 4-worker parallel-test load (Linux
+    // inotify queue overflow). Press Enter at the shell to drive a
+    // fresh OSC 7; the cwd-channel publish triggers `setCwd(samePath)`
+    // in `subscribeGitInfo`, which has a built-in re-resolve when
+    // `currentInfo === null && hasGitDir(next)` — the resolve sees the
+    // newly-created `.git` and emits the GitInfo even when the watcher
+    // event was lost. Test-side recovery only; no app behaviour change.
+    await this.page.keyboard.press("Enter");
+  },
+);
+
 Then("the header should show a branch name", async function (this: KoluWorld) {
   await waitForTestIdText(this, "inspector-branch");
 });
@@ -44,7 +63,7 @@ Then(
 );
 
 Then(
-  "the pill tree branch should contain {string}",
+  "the workspace switcher branch should contain {string}",
   async function (this: KoluWorld, expected: string) {
     await waitForTestIdText(this, "terminal-meta-branch", expected);
   },
@@ -71,7 +90,7 @@ When(
 );
 
 Then(
-  "the pill tree should show a branch name",
+  "the workspace switcher should show a branch name",
   async function (this: KoluWorld) {
     await waitForTestIdText(this, "terminal-meta-branch");
   },
@@ -92,14 +111,14 @@ Then(
 );
 
 Then(
-  "the pill tree label should show {string}",
+  "the workspace switcher label should show {string}",
   async function (this: KoluWorld, expected: string) {
     await waitForTestIdText(this, "terminal-meta-name", expected);
   },
 );
 
 Then(
-  "the pill tree should show a worktree indicator",
+  "the workspace switcher should show a worktree indicator",
   async function (this: KoluWorld) {
     await this.page
       .locator('[data-testid="worktree-indicator"]')
@@ -109,7 +128,7 @@ Then(
 );
 
 Then(
-  "the pill tree should not show a worktree indicator",
+  "the workspace switcher should not show a worktree indicator",
   async function (this: KoluWorld) {
     const count = await this.page
       .locator('[data-testid="worktree-indicator"]')
@@ -122,30 +141,38 @@ Then(
   },
 );
 
-Then("the pill tree should not show PR info", async function (this: KoluWorld) {
-  const count = await this.page
-    .locator('[data-testid="terminal-meta-pr"]')
-    .count();
-  assert.strictEqual(
-    count,
-    0,
-    `Expected no PR info in pill tree but found ${count} PR elements`,
-  );
-});
+Then(
+  "the workspace switcher should not show PR info",
+  async function (this: KoluWorld) {
+    const count = await this.page
+      .locator('[data-testid="terminal-meta-pr"]')
+      .count();
+    assert.strictEqual(
+      count,
+      0,
+      `Expected no PR info in workspace switcher but found ${count} PR elements`,
+    );
+  },
+);
 
 Then(
-  "the pill tree should not show git context",
+  "the workspace switcher should not show git context",
   async function (this: KoluWorld) {
-    const text = (
-      await this.page
-        .locator('[data-testid="terminal-meta-branch"]')
-        .first()
-        .textContent()
-    )?.trim();
-    assert.strictEqual(
-      text ?? "",
-      "",
-      `Expected empty branch in pill tree but found "${text}"`,
+    // Under the supplant rule the title-bar annotation slot shows the
+    // intent line-1 if set, else the branch, else an em-dash placeholder.
+    // "No git context" means no branch — the slot is either empty (old
+    // behavior, no longer reachable on non-git terminals) or shows the
+    // placeholder. Poll until the reactive update settles.
+    await this.page.waitForFunction(
+      () => {
+        const text = (
+          document.querySelector('[data-testid="terminal-meta-branch"]')
+            ?.textContent ?? ""
+        ).trim();
+        return text === "" || text === "—";
+      },
+      undefined,
+      { timeout: POLL_TIMEOUT },
     );
   },
 );

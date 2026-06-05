@@ -1,8 +1,22 @@
 /** RightPanel — right panel shell with tabbed navigation.
- *  Routes between Inspector and Code tabs via a discriminated union so
- *  illegal pairings (e.g. Inspector-with-a-code-mode) can't be represented. */
+ *  Routes between Inspector and Code tabs via the DU view exposed by
+ *  `useRightPanel().activeTab()`.
+ *
+ *  Pure presenter — no shell positioning, no resize handle. The desktop
+ *  host wraps this in a `@corvu/resizable` `Resizable` (in `App.tsx`)
+ *  for the horizontal split + drag-to-resize; the mobile host wraps
+ *  this in a `@corvu/drawer` (`RightPanelDrawer.tsx`). Both hosts thread
+ *  the same `visible` accessor — desktop reads `collapsed()`, mobile
+ *  reads `drawerOpen()` — so `inert` (and the `data-collapsed` marker)
+ *  reflect actual visibility on both surfaces. `data-collapsed` is emitted
+ *  when `!visible` so e2e selectors can assert collapse state without
+ *  inspecting widths. */
 
-import type { RightPanelTabKind, TerminalMetadata } from "kolu-common";
+import type {
+  RightPanelTabKind,
+  TerminalId,
+  TerminalMetadata,
+} from "kolu-common/surface";
 import { type Component, For } from "solid-js";
 import { match } from "ts-pattern";
 import { CHROME_ICON_BUTTON_CLASS } from "../ui/chromeSpacing";
@@ -13,8 +27,12 @@ import MetadataInspector from "./MetadataInspector";
 import { useRightPanel } from "./useRightPanel";
 
 /** Ordered tab kinds shown in the tab bar. Adding a new kind to the
- *  discriminated union requires a corresponding entry here AND a branch
- *  in the `match(tab)` below — both will fail-compile if you miss one. */
+ *  discriminated union requires a corresponding entry here AND in
+ *  `TAB_LABEL` below — both are typed `Record<RightPanelTabKind, …>` and
+ *  fail-compile on missing keys. The body renderer further down dispatches
+ *  via `match(kind).exhaustive()`, which also fails-compile on a missing
+ *  variant — so adding a new kind is a three-place change that the
+ *  compiler enforces end-to-end. */
 const TAB_KINDS: readonly RightPanelTabKind[] = ["inspector", "code"] as const;
 
 const TAB_LABEL: Record<RightPanelTabKind, string> = {
@@ -23,10 +41,14 @@ const TAB_LABEL: Record<RightPanelTabKind, string> = {
 };
 
 const RightPanel: Component<{
+  terminalId: TerminalId | null;
   meta: TerminalMetadata | null;
   onToggle: () => void;
   themeName?: string;
   onThemeClick?: () => void;
+  /** Whether this `RightPanel` instance is visible to the user. The host
+   *  decides — desktop reads `collapsed()`, mobile reads `drawerOpen()`. */
+  visible: boolean;
 }> = (props) => {
   const rightPanel = useRightPanel();
 
@@ -36,7 +58,19 @@ const RightPanel: Component<{
   return (
     <div
       data-testid="right-panel"
-      class="flex flex-col h-full min-w-0 overflow-hidden bg-surface-0 border-l border-edge"
+      data-collapsed={props.visible ? undefined : ""}
+      class="flex flex-col h-full min-w-0 overflow-hidden bg-surface-0"
+      // Panel stays mounted across collapse on desktop so CodeTab's local
+      // state survives (#818); the desktop Resizable shrinks it to ~0 width
+      // via `sizes=[1, 0]`. `inert` alone makes "not visible" mean "not
+      // interactive": it both drops the subtree from the accessibility tree
+      // and removes the Collapse button, tab buttons, and CodeTab inputs
+      // from the Tab focus order (an invisible focus trap otherwise). We
+      // deliberately omit a paired `aria-hidden`: the browser blocks
+      // `aria-hidden` on an ancestor of a focused element (a focused
+      // Collapse/tab button or CodeTab input when the panel collapses) and
+      // logs a WAI-ARIA console warning — `inert` covers both concerns.
+      inert={!props.visible}
     >
       {/* Tab bar */}
       <div class="flex items-center h-8 shrink-0 bg-surface-1 border-b border-edge">
@@ -77,17 +111,40 @@ const RightPanel: Component<{
           </button>
         </div>
       </div>
+      {/* Both tabs are always rendered; the inactive one is display:none.
+       *  Mounting both keeps each tab's local state (CodeTab's selected file,
+       *  Pierre's tree expansion, scroll position) alive across tab switches
+       *  — wrapping a single `match(...).exhaustive()` over `activeTab()`
+       *  would unmount the inactive sibling and discard that state. The
+       *  shape below iterates `TAB_KINDS` (already compile-exhaustive over
+       *  RightPanelTabKind via the `Record<RightPanelTabKind, …>` typings
+       *  on TAB_LABEL) so both bodies mount once, then `match(kind)` picks
+       *  which component to render per slot — exhaustive *and* both-mounted. */}
       <div class="flex-1 min-h-0 overflow-hidden">
-        {match(rightPanel.activeTab())
-          .with({ kind: "inspector" }, () => (
-            <MetadataInspector
-              meta={props.meta}
-              themeName={props.themeName}
-              onThemeClick={props.onThemeClick}
-            />
-          ))
-          .with({ kind: "code" }, () => <CodeTab meta={props.meta} />)
-          .exhaustive()}
+        <For each={TAB_KINDS}>
+          {(kind) => {
+            const isActive = () => rightPanel.activeTab().kind === kind;
+            return (
+              <div
+                class={isActive() ? "h-full" : "hidden"}
+                aria-hidden={!isActive()}
+              >
+                {match(kind)
+                  .with("inspector", () => (
+                    <MetadataInspector
+                      meta={props.meta}
+                      themeName={props.themeName}
+                      onThemeClick={props.onThemeClick}
+                    />
+                  ))
+                  .with("code", () => (
+                    <CodeTab terminalId={props.terminalId} meta={props.meta} />
+                  ))
+                  .exhaustive()}
+              </div>
+            );
+          }}
+        </For>
       </div>
     </div>
   );

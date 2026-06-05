@@ -2,6 +2,7 @@ import { createServer as createHttpsServer } from "node:https";
 import { resolve } from "node:path";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
+import { mountArtifactSdk } from "@kolu/artifact-sdk/server";
 import { LoggingHandlerPlugin } from "@orpc/experimental-pino";
 import { RPCHandler } from "@orpc/server/fetch";
 import { RPCHandler as WsRPCHandler } from "@orpc/server/ws";
@@ -9,16 +10,29 @@ import { cli } from "cleye";
 import { Hono } from "hono";
 import { pinoLogger } from "hono-pino";
 import { DEFAULT_PORT } from "kolu-common/config";
+import { configureNixShellEnv } from "kolu-pty";
 import { WebSocketServer } from "ws";
 import pkg from "../package.json" with { type: "json" };
-import { getCacheControlHeader } from "./cacheControl.ts";
+import {
+  ASSET_MISS_CACHE_CONTROL,
+  getCacheControlHeader,
+  isImmutableAssetPath,
+  SHELL_CACHE_CONTROL,
+} from "./cacheControl.ts";
 import { startDiagnostics } from "./diagnostics.ts";
 import { serverHostname } from "./hostname.ts";
+import {
+  resolvePreviewPath,
+  serveResolvedFile,
+  TERMINAL_FILE_ROUTE_BASE,
+  TERMINAL_FILE_ROUTE_FILE_SEGMENT,
+} from "./iframePreviewRoute.ts";
 import { ensureKoluRoot, shutdownCleanup } from "./koluRoot.ts";
 import { log } from "./log.ts";
+import { pwaIdentityForHostname } from "./pwaIdentity.ts";
 import { appRouter } from "./router.ts";
 import { initSessionAutoSave } from "./session.ts";
-import { configureNixShellEnv } from "./shell.ts";
+import { getTerminal } from "./terminal-registry.ts";
 import { snapshotSession } from "./terminals.ts";
 import { resolveTlsOptions } from "./tls.ts";
 
@@ -63,6 +77,8 @@ const argv = cli({
   strictFlags: true,
 });
 
+const PWA_BACKGROUND_COLOR = "#0c0c0e";
+
 configureNixShellEnv(argv.flags.allowNixShellWithEnvWhitelist);
 ensureKoluRoot();
 initSessionAutoSave(snapshotSession);
@@ -106,7 +122,11 @@ const rpcPlugins = [
 ];
 
 // --- oRPC HTTP handler (non-streaming calls) ---
-const rpcHandler = new RPCHandler(appRouter, { plugins: rpcPlugins });
+// appRouter mixes implementSurface's Lazy<Router> spread with
+// hand-listed namespaces; oRPC's RPCHandler input type doesn't accept
+// that union. The runtime shape is a valid router.
+// biome-ignore lint/suspicious/noExplicitAny: see comment above
+const rpcHandler = new RPCHandler(appRouter as any, { plugins: rpcPlugins });
 app.use("/rpc/*", async (c, next) => {
   const { matched, response } = await rpcHandler.handle(c.req.raw, {
     prefix: "/rpc",
@@ -135,25 +155,80 @@ process.on("uncaughtException", (err) => {
   process.exit(1);
 });
 process.on("unhandledRejection", (reason) => {
-  log.fatal({ reason }, "unhandled rejection");
+  // Deliberately fatal — same as an uncaught exception. A floating promise
+  // is as corrupting as a sync throw, and a context-free global handler is
+  // the wrong place to make a recover-or-die call (per-task error boundaries
+  // own that; see the provider DAG). If this fires, a background task is
+  // missing its boundary — fix the source, don't soften the net. The
+  // supervisor (systemd `Restart=on-failure` / launchd) restarts clean.
+  log.fatal(
+    { reason },
+    "unhandled rejection — a background task is missing its error boundary",
+  );
   process.exit(1);
 });
 
 // --- Health endpoint ---
 app.get("/api/health", (c) => c.text("kolu"));
 
+// --- Artifact-SDK (comments-on-files) mount ---
+// Self-contained — registers the SDK bundle route and a middleware that
+// splices the SDK <script> into text/html responses on the iframe-preview
+// route. The byte-streaming `iframePreviewRoute` below stays untouched.
+mountArtifactSdk(app, {
+  sdkScriptPath: "/api/artifact-sdk.js",
+  htmlRoutePrefix: `${TERMINAL_FILE_ROUTE_BASE}/:terminalId/${TERMINAL_FILE_ROUTE_FILE_SEGMENT}/*`,
+});
+
+// --- Iframe preview file route ---
+// Serves repo files referenced by `FsReadFileOutput.kind === "binary"`.
+// URL contract (base + builder + parser) all lives in `iframePreviewRoute.ts`.
+// Registered before the static-serve catch-all so production builds don't
+// shadow this route with `serveStatic`'s `/*` matcher.
+app.get(
+  `${TERMINAL_FILE_ROUTE_BASE}/:terminalId/${TERMINAL_FILE_ROUTE_FILE_SEGMENT}/*`,
+  async (c) => {
+    const terminalId = c.req.param("terminalId");
+    const prefix = `${TERMINAL_FILE_ROUTE_BASE}/${terminalId}/${TERMINAL_FILE_ROUTE_FILE_SEGMENT}/`;
+    // Slice the tail off `c.req.path` (Hono applies `decodeURI` here, so
+    // `%2f` stays encoded) rather than read `c.req.param("*")` (which
+    // applies `decodeURIComponent` — that would decode `%2f` → `/` and
+    // destroy segment boundaries before `resolvePreviewPath`'s split
+    // could see them, letting `foo%2f..%2fpasswd` through the guard).
+    const rawTail = c.req.path.startsWith(prefix)
+      ? c.req.path.slice(prefix.length)
+      : "";
+
+    const term = getTerminal(terminalId);
+    const repoRoot = term?.meta.git?.repoRoot;
+    if (!repoRoot) return c.text("terminal has no repo", 404);
+
+    const res = await serveResolvedFile(
+      resolvePreviewPath(repoRoot, rawTail),
+      repoRoot,
+    );
+    // `Buffer` (subclass of `Uint8Array<ArrayBufferLike>`) is a runtime-valid
+    // `BodyInit` but the DOM-typed lib.dom.d.ts narrows `BodyInit` to
+    // `Uint8Array<ArrayBuffer>` — the unions don't align in TS even though
+    // node-server forwards the buffer unchanged. Cast at the boundary.
+    return new Response(res.body as BodyInit, {
+      status: res.status,
+      headers: res.headers,
+    });
+  },
+);
+
 // --- Dynamic PWA manifest (includes hostname) ---
-// theme_color must match <meta name="theme-color"> in client/index.html
 app.get("/manifest.webmanifest", (c) => {
-  const name = `kolu@${serverHostname}`;
+  const identity = pwaIdentityForHostname(serverHostname);
   return c.json(
     {
-      name,
-      short_name: name,
+      name: identity.name,
+      short_name: identity.name,
       start_url: "/",
       display: "standalone",
-      background_color: "#292c33",
-      theme_color: "#292c33",
+      background_color: PWA_BACKGROUND_COLOR,
+      theme_color: identity.themeColor,
       icons: [
         { src: "/icon-192.png", sizes: "192x192", type: "image/png" },
         { src: "/icon-512.png", sizes: "512x512", type: "image/png" },
@@ -173,7 +248,25 @@ if (clientDist) {
     return next();
   });
   app.use("/*", serveStatic({ root }));
-  app.get("/*", serveStatic({ root, path: "index.html" }));
+  // SPA fallback. A `/assets/*` request reaching here MISSED a real file — a
+  // stale/bogus content hash — so 404 it rather than serve the HTML shell:
+  // index.html under a `.js` URL is the wrong MIME and would be cached
+  // `immutable` for a year (see isImmutableAssetPath), poisoning the next load.
+  // Any other unmatched path is a client-side route → serve the shell under
+  // `SHELL_CACHE_CONTROL` (the same directive cacheControl.ts pins on `/`) so a
+  // normal reload can never replay a stale shell.
+  app.get(
+    "/*",
+    (c, next) => {
+      if (isImmutableAssetPath(c.req.path)) {
+        c.header("Cache-Control", ASSET_MISS_CACHE_CONTROL);
+        return c.notFound();
+      }
+      c.header("Cache-Control", SHELL_CACHE_CONTROL);
+      return next();
+    },
+    serveStatic({ root, path: "index.html" }),
+  );
 }
 
 // --- TLS setup ---
@@ -209,7 +302,10 @@ const server = serve(
 
 // --- oRPC WebSocket handler (streaming) ---
 const wss = new WebSocketServer({ noServer: true });
-const wsRpcHandler = new WsRPCHandler(appRouter, { plugins: rpcPlugins });
+// biome-ignore lint/suspicious/noExplicitAny: see RPCHandler comment above
+const wsRpcHandler = new WsRPCHandler(appRouter as any, {
+  plugins: rpcPlugins,
+});
 
 let nextConnId = 0;
 wss.on("connection", (ws) => {

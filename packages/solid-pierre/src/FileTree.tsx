@@ -1,0 +1,324 @@
+/** SolidJS wrapper over `@pierre/trees`' vanilla `FileTree` class.
+ *
+ *  Pierre's `FileTree` owns its DOM (shadow-root rendered). Mount once,
+ *  push updates via the class's setters (`resetPaths`, `setGitStatus`)
+ *  inside reactive effects, and call `cleanUp()` on disposal.
+ *  Construction throws are routed to the `onError` prop so consumers can
+ *  show a fallback panel instead of letting the exception escape Solid's
+ *  `<ErrorBoundary>` (which only catches errors during *Solid* render). */
+
+import {
+  FileTree as FileTreeClass,
+  type FileTreeIconConfig,
+  type FileTreeInitialExpansion,
+  type GitStatusEntry,
+} from "@pierre/trees";
+import {
+  type Component,
+  createEffect,
+  createMemo,
+  type JSX,
+  on,
+  onCleanup,
+  onMount,
+} from "solid-js";
+import { safeApply } from "./safeApply";
+import {
+  ancestorDirectoryPaths,
+  directoryRemovalOps,
+  type FileTreeRemoveOperation,
+  pathDiffOperations,
+} from "./pathReconcile";
+
+type FileTreeOptions = ConstructorParameters<typeof FileTreeClass>[0];
+type Composition = NonNullable<FileTreeOptions["composition"]>;
+type FileTreeContextMenu = NonNullable<Composition["contextMenu"]>;
+
+export type FileTreeProps = {
+  paths: string[];
+  gitStatus?: GitStatusEntry[];
+  selectedPath?: string | null;
+  onSelect?: (path: string | null) => void;
+  /** Enable Pierre's built-in header search affordance. Default `true`.
+   *  Set to `false` when the host renders its own search input and
+   *  drives the tree by projecting `paths` directly. */
+  search?: boolean;
+  /** Directories Pierre should open whenever the path projection
+   *  resets — forwarded as `initialExpandedPaths` to the constructor
+   *  and to each `resetPaths` call. Pierre opens these atomically with
+   *  the rebuild; expansion never falls out of sync with a path swap,
+   *  and the wrapper holds no separate per-path expansion state. */
+  expandPaths?: readonly string[];
+  /** Initial folder expansion — captured at construction and **not
+   *  reactive**. Pierre takes this once in its constructor; later prop
+   *  changes are silently ignored. Re-mount the component (e.g. by
+   *  toggling its parent `<Show when>`) to apply a new value. Defaults to
+   *  `"closed"`. */
+  initialExpansion?: FileTreeInitialExpansion;
+  /** Collapse single-child directory chains (e.g. `packages/client/src` →
+   *  one row). Default `true`. */
+  flattenEmptyDirectories?: boolean;
+  /** Row density — a Pierre preset (`compact` 24px / `default` 30px /
+   *  `relaxed` 36px rows) or a numeric scale factor. Drives both the CSS row
+   *  height and the virtualizer's row math, so it's the correct lever for
+   *  touch-friendly rows (a CSS-only `--trees-item-height` override would
+   *  desync the virtualizer). Snapshot at construction — **not reactive**;
+   *  re-mount to change it (matches `initialExpansion`). Defaults to
+   *  Pierre's `default`. */
+  density?: FileTreeOptions["density"];
+  /** Pin parent directory headers to the top of the scroll viewport.
+   *  Default `true`. */
+  stickyFolders?: boolean;
+  /** Pierre's icon configuration — pass `{ set: "complete", ... }` plus
+   *  any custom sprites. */
+  icons?: FileTreeIconConfig;
+  /** Pierre's typed contextmenu hook. */
+  contextMenu?: FileTreeContextMenu;
+  /** Extra CSS injected into Pierre's shadow root, for styling Pierre
+   *  exposes no `--trees-*` theme variable for — e.g. tinting a directory
+   *  that contains a change, which Pierre only renders as a half-opacity dot.
+   *  Pierre owns its shadow DOM, so a host stylesheet can't reach inside;
+   *  this is the escape hatch. Snapshot at mount via a constructable sheet
+   *  appended to the shadow root's `adoptedStyleSheets` (so Pierre's own row
+   *  re-renders never wipe it) — **not reactive**, re-mount to change it. The
+   *  rule's selectors are Pierre's internal row anatomy, so the rule belongs
+   *  to the host theme, not here. */
+  shadowCss?: string;
+  /** Surface construction or render throws to the host. Required because
+   *  silent failure produces a blank pane indistinguishable from "no
+   *  files" — bad UX, hard to debug. */
+  onError: (err: Error) => void;
+  /** Forwarded to the container `<div>`. */
+  class?: string;
+  /** Forwarded to the container `<div>` — host theming lives here. */
+  style?: JSX.CSSProperties;
+};
+
+/** Pierre renders its rows under an open shadow root nested somewhere in the
+ *  host container. Find the first shadow root in that subtree so the host can
+ *  reach Pierre's internal styles. */
+function findShadowRoot(el: Element): ShadowRoot | null {
+  if (el.shadowRoot) return el.shadowRoot;
+  for (const child of el.children) {
+    const found = findShadowRoot(child);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Append `css` to Pierre's shadow root as a constructable stylesheet —
+ *  `adoptedStyleSheets` survives Pierre's row re-renders (a `<style>` child
+ *  could be cleared by a virtualizer pass) and stacks after Pierre's own
+ *  sheet, so the host rule wins on equal specificity. No-op if the shadow
+ *  root isn't found (defensive — Pierre always mounts one). */
+function injectShadowCss(container: HTMLElement, css: string): void {
+  const shadowRoot = findShadowRoot(container);
+  if (!shadowRoot) return;
+  const sheet = new CSSStyleSheet();
+  sheet.replaceSync(css);
+  shadowRoot.adoptedStyleSheets = [...shadowRoot.adoptedStyleSheets, sheet];
+}
+
+export const FileTree: Component<FileTreeProps> = (props) => {
+  let container!: HTMLDivElement;
+  let tree: FileTreeClass | undefined;
+  // The path inventory Pierre's tree currently holds. Seeded at mount and
+  // updated after every `batch`, so the next path change can be applied as
+  // an in-place delta. Tracked here rather than via `on`'s `prevInput`
+  // because that arg is `undefined` on the first post-`defer` run — which
+  // would drop the very first delta's removals.
+  let appliedPaths: readonly string[] = [];
+
+  // Pierre fires `onSelectionChange` for directory clicks too, which would
+  // produce an EISDIR if the consumer reads the path as a file. Directories
+  // don't appear in `paths` (Pierre infers them from path prefixes), so
+  // membership in this set is a reliable file-vs-folder discriminator.
+  const fileSet = createMemo(() => new Set(props.paths));
+
+  onMount(() => {
+    safeApply(() => {
+      // Snapshot read of `props.selectedPath` for `initialExpandedPaths`.
+      // The deferred resetPaths effect below reads it reactively for
+      // subsequent changes — Pierre doesn't expose a hook to re-feed
+      // `initialExpandedPaths` after the constructor, so initial and
+      // reactive paths are unavoidably two sites.
+      const selectedAncestors = props.selectedPath
+        ? ancestorDirectoryPaths(props.selectedPath)
+        : [];
+      tree = new FileTreeClass({
+        paths: props.paths,
+        initialExpansion: props.initialExpansion ?? "closed",
+        initialExpandedPaths: [
+          ...(props.expandPaths ?? []),
+          ...selectedAncestors,
+        ],
+        flattenEmptyDirectories: props.flattenEmptyDirectories ?? true,
+        density: props.density,
+        stickyFolders: props.stickyFolders ?? true,
+        icons: props.icons,
+        search: props.search ?? true,
+        gitStatus: props.gitStatus,
+        initialSelectedPaths: props.selectedPath ? [props.selectedPath] : [],
+        composition: props.contextMenu
+          ? { contextMenu: props.contextMenu }
+          : undefined,
+        onSelectionChange: (paths) => {
+          // Pierre fires with all selected paths; we model single-select.
+          const p = paths[0] ?? null;
+          if (p !== null && !fileSet().has(p)) return;
+          props.onSelect?.(p);
+        },
+      });
+      tree.render({ containerWrapper: container });
+      // Mirror the reactive selection effect: pin the "selected row is
+      // visible" invariant to this wrapper at both write sites instead
+      // of relying on Pierre's mount-time auto-scroll
+      // (`initialFocusedScrollAppliedRef`) to cover the constructor
+      // path. Idempotent — Pierre's view processes the explicit scroll
+      // request in the same render tick as its own first-mount scroll.
+      if (props.selectedPath) tree.scrollToPath(props.selectedPath);
+      appliedPaths = props.paths;
+      if (props.shadowCss) injectShadowCss(container, props.shadowCss);
+    }, props.onError);
+  });
+
+  // Push path-inventory changes into Pierre as in-place mutations, not a
+  // `resetPaths` rebuild. `resetPaths` throws the tree's store away and
+  // reopens only the directories it's handed, so it can't preserve the
+  // folders the user expanded by hand; `batch(add/remove)` touches only the
+  // changed nodes and leaves every other node's expansion/selection/scroll
+  // intact. We diff the new inventory against `appliedPaths` (what the tree
+  // currently holds), apply the delta, then record the new inventory. After
+  // the delta we additively open the directories the projection wants
+  // visible: the search-projected ancestors (`expandPaths`) and the selected
+  // file's ancestors, so a freshly-added nested file or a filter match is
+  // revealed. Expanding an already-open folder is a no-op, so this never
+  // collapses anything.
+  //
+  // `selectedPath` is deliberately *not* a dependency — routing selection
+  // through here would re-run on every file click. The selection effect
+  // below reveals the picked row imperatively instead; we read `selectedPath`
+  // untracked only so a genuine paths/expandPaths change reveals the current
+  // selection.
+  createEffect(
+    on(
+      [() => props.paths, () => props.expandPaths],
+      ([paths, expandPaths]) => {
+        safeApply(() => {
+          if (!tree) return;
+          const fileOps = pathDiffOperations(appliedPaths, paths);
+          if (fileOps.length > 0) tree.batch(fileOps);
+          // Pierre's `remove` promotes an emptied directory to an explicit
+          // empty folder instead of deleting it (see `directoryRemovalOps`),
+          // so the file removals above would otherwise strand a filter's
+          // emptied directories as hollow rows. Prune them in one batch,
+          // mirroring the file pass: the ops are disjoint maximal subtrees,
+          // each removed recursively. The `getItem` guard is defensive — every
+          // root still resolves after the file batch — and pruning never
+          // touches a surviving directory's expansion, so a hand-collapsed
+          // match folder stays collapsed.
+          const dirOps: FileTreeRemoveOperation[] = [];
+          for (const op of directoryRemovalOps(appliedPaths, paths)) {
+            if (tree.getItem(op.path)) dirOps.push(op);
+          }
+          if (dirOps.length > 0) tree.batch(dirOps);
+          appliedPaths = paths;
+          const selectedPath = props.selectedPath ?? null;
+          const toOpen = [
+            ...(expandPaths ?? []),
+            ...(selectedPath ? ancestorDirectoryPaths(selectedPath) : []),
+          ];
+          for (const dir of toOpen) {
+            const item = tree.getItem(dir);
+            if (item && "expand" in item) item.expand();
+          }
+        }, props.onError);
+      },
+      { defer: true },
+    ),
+  );
+
+  createEffect(
+    on(
+      () => props.gitStatus,
+      (g) => {
+        safeApply(() => tree?.setGitStatus(g), props.onError);
+      },
+      { defer: true },
+    ),
+  );
+
+  // Push post-mount `props.selectedPath` changes into Pierre's
+  // selection state. Pierre's `initialSelectedPaths` is snapshot-only
+  // at construction; reactive prop changes after mount must be applied
+  // via `getItem(path)?.select()` / `deselect()` to mark
+  // `aria-selected="true"`. Without this, a host that drives selection
+  // through a reactive accessor (e.g. CodeTab's per-(repoRoot,view)
+  // slot map) leaves the tree out of sync whenever selection arrives
+  // after FileTree mount — the `Open path:N` flow from a diff is the
+  // canonical case. `onSelectionChange` re-fires when we call
+  // `select()`, so the host's `onSelect` handler must be idempotent on
+  // same-value writes (which it already is, as a SolidJS reactive
+  // setter on an equal value is a no-op).
+  createEffect(
+    on(
+      () => props.selectedPath ?? null,
+      (path) => {
+        safeApply(() => {
+          const current = tree?.getSelectedPaths()[0] ?? null;
+          if (current === path) return;
+          // Drop every selected row except `keep` (pass null to clear
+          // all). Pierre's `select()` is additive — it never clears the
+          // prior pick — so a switch must deselect the old row first or
+          // the tree holds both, fires `onSelectionChange` with the stale
+          // path at `paths[0]`, and the host reads that back as a
+          // selection revert (the "first click after a file is already
+          // open does nothing, second click works" bug).
+          const deselectOthers = (keep: string | null) => {
+            for (const p of tree?.getSelectedPaths() ?? []) {
+              if (p !== keep) tree?.getItem(p)?.deselect();
+            }
+          };
+          deselectOthers(path);
+          if (path !== null) {
+            // Open the picked file's ancestors so the row is visible —
+            // an external caller can drive selection into a collapsed
+            // subtree (e.g. a terminal `path:line` click resolving into a
+            // nested file). Expanding each directory handle in place
+            // preserves every other open folder; routing this through
+            // `resetPaths` would rebuild the tree and collapse the user's
+            // hand-expanded siblings. `getItem` returns a directory-or-file
+            // handle union: `"expand" in item` is the narrowing — Pierre's
+            // `isDirectory()` returns a `true`/`false` literal but isn't a
+            // `this is` predicate, so it can't narrow, whereas the `in`
+            // check both compiles and probes for the exact capability we're
+            // about to call. Re-expanding an open folder is a no-op; a file
+            // or a missing path narrows away and is skipped.
+            for (const ancestor of ancestorDirectoryPaths(path)) {
+              const item = tree?.getItem(ancestor);
+              if (item && "expand" in item) item.expand();
+            }
+            tree?.getItem(path)?.select();
+            // `select()` marks aria-selected but doesn't move the
+            // virtualizer; deep paths in large worktrees would stay
+            // off-screen until the user scrolled. `scrollToPath`
+            // reveals the row.
+            tree?.scrollToPath(path);
+          }
+        }, props.onError);
+      },
+      { defer: true },
+    ),
+  );
+
+  onCleanup(() => tree?.cleanUp());
+
+  return (
+    <div
+      ref={container}
+      class={props.class}
+      style={props.style}
+      data-testid="pierre-file-tree"
+    />
+  );
+};

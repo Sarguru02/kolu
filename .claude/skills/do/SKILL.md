@@ -1,7 +1,7 @@
 ---
 name: do
-description: Do a task end-to-end — implement, PR, CI loop, ship
-argument-hint: "<issue-url | prompt> [--review] [--no-git] [--minimal] [--from <step>] [--review-model=<opus|sonnet|haiku>]"
+description: Do a task end-to-end — implement, PR, CI loop, ship. ONLY invoke when the user explicitly types `/do` or `$do`; never auto-select from a natural-language request, even one that sounds like an end-to-end task.
+argument-hint: "<issue-url | prompt> [--review] [--no-git] [--minimal] [--from <step>]"
 ---
 
 # Do Workflow
@@ -12,7 +12,7 @@ Take a task and do it top-to-bottom: research, branch, implement, pass CI, open 
 
 ## Arguments
 
-Parse the arguments string: `[--review] [--no-git] [--minimal] [--from <step-id>] [--review-model=<opus|sonnet|haiku>] <task description or issue-url>`
+Parse the arguments string: `[--review] [--no-git] [--minimal] [--from <step-id>] <task description or issue-url>`
 
 The workflow is **forge-aware**: it auto-detects whether the repo lives on GitHub or elsewhere during the **sync** step (see Forge Detection). Only GitHub has an active code path today — Bitbucket/other forges gracefully skip PR-related steps. Tracking: [srid/agency#10](https://github.com/srid/agency/issues/10).
 
@@ -20,7 +20,6 @@ The workflow is **forge-aware**: it auto-detects whether the repo lives on GitHu
 - `--no-git`: Extend the working tree **in place** — do not create a branch, commit, push, or touch any PR. Research, implement, check, docs, police, fmt, and test all run; git-mutating steps (**branch**, **commit**, **create-pr**) are skipped. Use this when you have uncommitted local work and want the agent to build on it without taking over git state. Feedback from a Bitbucket user in [#26](https://github.com/srid/agency/issues/26).
 - `--minimal`: Skip the steps whose value is disproportionate on trivially-scoped diffs: **docs**, **hickey+lowy**, **police**, and **evidence**. The remaining flow runs in order: sync → research → branch → implement → check → fmt → commit → test → create-pr → ci → done. Use this when the change is obviously confined (one-line bug fix, typo, config tweak) and structural review / docs sync / quality gate / PR evidence are overkill — PR comments on small `/do` runs frequently note this. The four skipped steps each record `status="skipped"` with `reason="--minimal"`.
 - `--from <step-id>`: Start from a specific step (see entry points below)
-- `--review-model=<model>`: Model to use for the **hickey+lowy** sub-agent invocations. Accepts `opus`, `sonnet`, or `haiku`. Defaults to `sonnet` — cheap enough to run on every task without thinking about cost. Pass `opus` when the task warrants deeper structural critique (large or architecturally significant diffs, refactors that cross module boundaries, work the user wants an extra-careful second pair of eyes on). Takes precedence over the `model: sonnet` in the hickey/lowy agent frontmatter via the `Agent` tool's `model` parameter. Has no effect under `--minimal` since hickey+lowy is skipped.
 
 ## Results Tracking
 
@@ -59,6 +58,8 @@ Drive Claude Code's native todo UI via the `TaskCreate` tool so the user sees a 
 ```
 sync, research, branch, implement, check, docs, fmt, commit, hickey+lowy, police, test, create-pr, ci, evidence, done
 ```
+
+**Emit all `TaskCreate` calls as parallel `tool_use` blocks in a single assistant turn** — one model round-trip, not one per task. The seeded steps have no `addBlocks` / `addBlockedBy` dependencies, so there is nothing to serialize on. Sequential seeding (15 round-trips before any real work) is a regression: it adds latency to every `/do` invocation and clutters the transcript with 15 wrapper turns of "Task #N created successfully" before `sync` even starts.
 
 **Under `--minimal`, omit the four steps the flag skips** (`docs`, `hickey+lowy`, `police`, `evidence`) from the seeded list — the user explicitly opted out of them, so they shouldn't clutter the human-facing checklist. The seeded list becomes 11 items in `--minimal` runs. (Run-inherent skips like `--no-git` and forge skips stay in the list — see the Skipped steps rule below.)
 
@@ -145,13 +146,19 @@ That's it — just the local branch. No commit, no push, no PR. The branch is pu
 
 ### implement
 
-If the task is a bug fix: write a failing test first (e2e or unit, whichever is appropriate), then fix the bug.
+The test-first rule depends on what the change is:
 
-Otherwise: implement the planned changes. Prefer simplicity. Do the boring obvious thing.
+- **Bug fix**: write a failing test first (e2e or unit, whichever is appropriate), then fix the bug.
+- **New behavior** — anything that fails at runtime if it's wrong: new endpoints or routes, new services or modules, configuration paths, environment variables, secrets wiring, network connectivity, data persistence (migrations, preStart scripts, schema changes), auth/OIDC flows. Write an integration or unit test covering the new behavior **before** implementing. NixOS service modules need a VM test; new HTTP endpoints need an e2e or integration test; new modules with logic need at least a unit test.
+- **Otherwise** — documentation, refactors with no behavioral change, purely internal cleanups, dependency bumps that don't change behavior. Just implement the planned changes; no test-first requirement.
+
+If you're not sure which bucket the change falls into, treat it as new behavior. The cost of an unnecessary test is small; the cost of a silent deployment failure is not.
+
+Prefer simplicity. Do the boring obvious thing.
 
 **E2E coverage**: When the change introduces multiple user-facing paths (e.g., a dialog that appears under different conditions), write e2e scenarios for **each distinct path**. Enumerate the user-visible paths, then check that every one has a corresponding test.
 
-**Verify**: Code changes match the planned approach. All distinct user-facing paths have test coverage.
+**Verify**: Code changes match the planned approach. For bug fixes and new-behavior changes, at least one test exercises the changed behavior; multi-path changes have one test per distinct user-visible path. Refactor/docs/cleanup diffs are exempt.
 
 ---
 
@@ -205,9 +212,9 @@ This is the **primary feature commit**. Downstream **hickey+lowy** and **police*
 
 **If `--minimal`**: Skip with status `skipped` and reason `"--minimal"`. Move to **police** (which will also skip under `--minimal`). Do not spawn either sub-agent.
 
-Invoke `hickey` and `lowy` as two **parallel sub-agents** via the harness's agent tool (`subagent_type: "hickey"` and `subagent_type: "lowy"`). On Claude Code this is the `Agent` tool. On Codex this is the sub-agent spawning tool for delegated work. Invoking `/do` is explicit authorization to run these two review agents; do not wait for a second user prompt before spawning them.
+Invoke `hickey` and `lowy` as two **parallel sub-agents** via the harness's agent tool (`subagent_type: "hickey"` and `subagent_type: "lowy"`). On Claude Code this is the `Agent` tool. On opencode this is the `task` tool (with `subagent_type` parameter). On Codex this is the sub-agent spawning tool for delegated work. Invoking `/do` is explicit authorization to run these two review agents; do not wait for a second user prompt before spawning them.
 
-**Fallback, never skip.** If the harness cannot honor the requested review model in sub-agents, run hickey and lowy as sub-agents on the available model instead. If a sub-agent invocation fails for harness/tooling reasons before producing a review, retry that reviewer once; if it still cannot produce a sub-agent review, run that review in the main model by loading the reviewer skill against the same diff. This fallback is slower and uses more main-context budget, but it is still the `/do` hickey+lowy step. Do not replace it with an informal/manual review, and do not mark the step `skipped` because the requested model was unavailable.
+**Fallback, never skip.** If the harness cannot honor the model declared in the reviewer skill's frontmatter, run hickey and lowy as sub-agents on the available model instead — this is the expected path on harnesses that ignore Claude Code's `model:` skill extension (opencode, Codex, etc.). If a sub-agent invocation fails for harness/tooling reasons before producing a review, retry that reviewer once; if it still cannot produce a sub-agent review, run that review in the main model by loading the reviewer skill against the same diff. This fallback is slower and uses more main-context budget, but it is still the `/do` hickey+lowy step. Do not replace it with an informal/manual review, and do not mark the step `skipped` because a preferred model was unavailable.
 
 **Why post-implement, not pre-implement.** Hickey's complecting critique and Lowy's volatility lens both bite harder on a concrete diff than on a plan sketch. Reviewing a plan tends to surface generic concerns; reviewing a real diff surfaces the specific interleavings and boundary misalignments that matter. Running here also means the review covers *everything* the diff contains — including whatever the plan glossed over and whatever drifted during implementation.
 
@@ -219,27 +226,35 @@ Each `Agent` prompt must be self-contained (sub-agents do not inherit this conve
 
 - The full task prompt plus anything relevant that **research** uncovered (file paths, intended approach, key constraints)
 - The scope to analyze: the actual diff, `git diff origin/HEAD...HEAD` — this is the same scope regardless of entry point (default or followup), since the branch at this point holds the primary feature commit (plus any cumulative followup commits) and no further work is pending
+- **Duplication-audit hint**, when the diff adds new files — check with `git diff --diff-filter=A --name-only origin/HEAD...HEAD` and only include the hint if the output is non-empty. The hint tells the reviewer to start with the codebase survey their skill describes (`hickey` Layer 3, `lowy` §1 "Check for prior encapsulation"): find the canonical in-repo pattern for the same *kind* of operation (picker, dialog, popover, list view, list-edit primitive, scheduler, error type, config loader, fetcher, …) and flag it as the headline finding if the diff reinvents rather than extends it. Skip the hint entirely when the diff has no new files — pure refactors and bug fixes inside existing abstractions don't benefit from the survey and the audit budget isn't worth it there.
 
 The sub-agent already knows to read its skill file and follow that methodology; don't re-state it in the prompt.
 
-**Model override.** If the user passed `--review-model=<model>`, pass `model: "<model>"` in **both** `Agent` tool calls — this overrides the `model: sonnet` in the agents' frontmatter via the `Agent` tool's built-in `model` parameter. If the flag was not passed, omit the `model` parameter entirely so the agent definition's default (sonnet) applies. Accept only `opus`, `sonnet`, and `haiku`; reject anything else at argument-parse time with a one-line error, since a typo silently falling back to sonnet would hide a budget decision the user was trying to express.
+**Do not seed structural questions.** The implementer's prompt must NOT include pre-formed questions like _"Is module X the right home for function Y?"_, _"Does the new field complect concerns A and B?"_, or _"Should constructor C be a sum?"_ — that framing shopping-lists the answer and produces circular reasoning at the reviewer (e.g. "primary consumer of `logPathFor` is `CommitStatus`" — true only because the implementer placed it there). Hickey and Lowy each have their own methodologies for generating findings; the reviewer reads the diff cold and surfaces what its lens shows. Anything beyond "here's the diff and the change rationale" is implementer bias bleeding into the review. If a specific concern feels worth flagging to the reviewer, that's evidence the implementer already smelled the problem — fix it in the diff before sending it to review, not by routing the question through a sub-agent for permission.
 
-After both reviewers return, **audit every `Defer` disposition before acting**. `/do` is not optimizing for minimal diff — it is optimizing for the simpler artifact landing in `master`. A PR that grows from 50 lines to 400 because hickey caught a real fragmentation bug is a *better* PR, not a worse one; the alternative is shipping the complected version and trusting a "broader refactor" follow-up that statistically never happens. **The default disposition is "Fix in this PR" — even when the fix grows the diff substantially.**
+The **duplication-audit hint** above is the one allowed exception: it's a meta-process reminder (run the survey your skill describes), not a seeded finding about *this* diff. It points the reviewer at the codebase, not at a specific concern within the diff — that's the line. If the diff doesn't add new files, drop the hint and let the lens run unprimed.
 
-For every `Defer` the sub-agents returned, check the stated reason. Acceptable defers are narrow:
+**Model selection lives in the skill, not here.** Both `hickey/SKILL.md` and `lowy/SKILL.md` declare `model: sonnet` in their frontmatter — Claude Code honors this and runs the review on Sonnet to keep the per-task cost cheap; opencode/Codex ignore the field (it isn't part of the Agent Skills standard) and fall through to the active model, which is the right behavior for harnesses that don't have Sonnet. Don't pass `model:` at the `Agent` tool level — the skill frontmatter is the single source of truth.
 
-- The fix requires a change outside this repository's control (upstream library, sister repo, external API).
-- The fix conflicts with concurrent in-flight work in another open PR on the same files.
-- The fix requires a coordinated migration (data, schema, dependency upgrade) that must not be coupled to this PR's release timeline.
+**No deferrals.** The hickey and lowy skills emit two dispositions: **Fix in this PR** and **No-op**. There is no Defer. `/do` is not optimizing for minimal diff — it is optimizing for the simpler artifact landing in `master`. A PR that grows from 50 lines to 400 because hickey caught a real fragmentation bug is a *better* PR, not a worse one; the alternative is shipping the complected version and trusting a "broader refactor" follow-up that statistically never happens.
 
-Reasons that are **never** acceptable — flip the disposition to "Fix in this PR" and apply:
+If a sub-agent emits anything resembling a defer — `Defer #N`, "out of scope", "follow-up", "pre-existing, separate PR", "should be its own change", any phrasing that punts a finding to a future issue — treat it as a sub-agent rule violation. Flip the disposition to **Fix in this PR** unconditionally and apply the fix here. Do not create a follow-up issue, do not record the finding as deferred in the PR body, do not surface it as outstanding structural debt. The only way out of a finding is through it.
 
-- "Broader refactor", "wider scope", "out of scope", "follow-up refactor", "separate PR" — restatements of "the diff would grow," not reasons.
-- "PR is getting big", "keep diff minimal" — `/do` does not constrain on diff size.
-- "Pre-existing", "not introduced by this PR" — only acceptable when paired with one of the three narrow reasons above; otherwise the cleanup belongs at the lines this branch is already touching.
-- Any `Defer` missing an issue link (e.g. "Defer — broader refactor" with no `#<issue>`) — the hickey/lowy skill files require issue links on defers, so a missing link means the sub-agent skipped the rule. Flip it unconditionally.
+(`No-op` survives without code action — but it is narrow: the diff already deletes the offending code, or the finding is subsumed verbatim by another entry in the same review. Anything resembling deferred-work-for-later is a Fix, not a No-op.)
 
-For each flipped finding, apply it in this PR using the per-commit rules below. After the audit, only **No-op** and surviving (genuinely-narrow) `Defer #issue` entries are surfaced in the PR comment (see **create-pr**) without code action — every other finding lands as a commit.
+Findings that genuinely require coordination outside this repo (upstream library bug, breaking dep upgrade, schema migration that must ship separately) shouldn't have surfaced as findings of this structural review in the first place; if one did, apply a local workaround or interface boundary in this PR rather than punt — and flag the upstream dependency in the PR description as a strategic note, not as a deferred finding.
+
+**Cross-validate the parallel findings.** Hickey and Lowy ran in parallel without seeing each other's output. Each reviewer's local-optimum call can produce a problem the other lens should have caught — a Lowy "consolidate `helper` into module X" can land in a destination that Hickey would have flagged as two volatility axes braided into one module, and a Hickey "decompose interleaved roles" split can land both halves into modules whose imports Lowy would have called fragmentation. Neither lens, running alone, sees the cross-effect.
+
+Skip this phase if **both** reviewers returned zero findings — there is nothing for the other lens to second-guess. Otherwise, for each reviewer that produced findings, spawn a second invocation of *that same skill* (`subagent_type: "hickey"` or `subagent_type: "lowy"`) with a self-contained prompt containing:
+
+- The actual diff (`git diff origin/HEAD...HEAD`).
+- The other reviewer's full findings output (paste it verbatim — the cross-validator must see the recommendations being audited, not a summary).
+- The question, phrased neutrally: _"Apply your lens to the diff **and** to the other reviewer's recommendations. Does any recommendation, if applied, create a problem your lens would flag? If yes, surface it as a new finding with the same Actions disposition rules (Fix in this PR / No-op, no Defer)."_
+
+Run the two cross-validation calls in parallel (single message, both `Agent` blocks). Each call is cheap because the diff and the other-side findings fit in one prompt. If either cross-validator surfaces a new finding, treat it identically to a first-pass finding — apply as its own commit per the rules below, with commit prefix `refactor(hickey)`/`refactor(lowy)` and a short label indicating it came from cross-validation (e.g. `refactor(hickey): cross-validate — placement audit on logPathFor`).
+
+After the audit (and cross-validation, when run), every finding lands as a commit, except entries dispositioned **No-op**.
 
 **Apply each "Fix in this PR" finding as its own commit** — do not batch multiple findings into one commit. A reviewer reading the PR's commit history should be able to read one "address hickey finding: decomplect viewportDimensions" commit at a time and follow the structural refinement as a sequence, not decode a grab-bag diff. For each finding in turn:
 
@@ -251,7 +266,7 @@ For each flipped finding, apply it in this PR using the per-commit rules below. 
 
 **Under `--no-git`**: Skip the commit/push steps entirely. Apply fixes to the working tree and move on — the user will review the combined working-tree delta themselves. Record the step as passed with verification noting "--no-git: fixes applied to working tree, not committed."
 
-**Verify**: Both hickey and lowy produced review output using their respective skills, either through sub-agents or the main-model fallback. Every finding has an action recorded (fix, defer, or no-op). Every "Fix in this PR" finding has a corresponding commit on the feature branch (check via `git log origin/HEAD..HEAD --oneline`), except under `--no-git`. No unactioned findings.
+**Verify**: Both hickey and lowy produced review output using their respective skills, either through sub-agents or the main-model fallback. Cross-validation ran (or was correctly skipped because both reviewers returned zero findings). Every finding — first-pass or cross-validation — has an action recorded, either **Fix in this PR** or **No-op** (no defers; if the sub-agent emitted one, the audit step above flipped it to Fix in this PR). Every "Fix in this PR" finding has a corresponding commit on the feature branch (check via `git log origin/HEAD..HEAD --oneline`), except under `--no-git`. No unactioned findings; no deferred findings.
 
 ---
 
@@ -295,7 +310,9 @@ Use `git diff origin/HEAD...HEAD --name-only` to identify changed files and dete
 
 If changes are purely internal with no user-facing impact, unit tests may suffice — skip e2e if no relevant scenarios exist. If no test command is documented, skip with a note.
 
-**Verify**: Tests pass (exit code 0), or no relevant tests to run.
+**Coverage gap check**: After the test command exits 0, confirm at least one of the tests run actually exercised the new behavior (per the **implement** step's classification). A green run that didn't touch the changed code paths — e.g. a new NixOS service module with no corresponding VM test, or a new endpoint with no integration test — is a coverage gap, not a pass. Refactor/docs/internal-cleanup diffs are exempt. The implement step should have caught this; if it didn't, treat it as a real failure: write the missing test, then loop through **fmt** → **commit** → **test** as below.
+
+**Verify**: Tests pass (exit code 0) **and** the new behavior is covered, or the diff is exempt from the coverage check, or no relevant tests to run.
 **If failed** (max 4 attempts): Analyze the failure. If flaky, re-run. If real: fix → go to **fmt**, then retry.
 
 ---
@@ -316,17 +333,18 @@ Check whether a PR already exists for this branch (`gh pr view`).
 
    **MANDATORY**: Load the `forge-pr` skill (via Skill tool) BEFORE writing the PR title/body.
 
-2. **Post hickey/lowy results**: Post the hickey and lowy analysis as a PR comment using `gh pr comment` with a `## [Hickey/Lowy](https://kolu.dev/blog/hickey-lowy/) Analysis` header (the heading links to the blog post explaining the two lenses, mirroring how the final step status comment links `/do` to the agency repo). Always post when the steps ran, even if all findings are deferred or out of scope — reviewers should see the structural analysis.
+2. **Post hickey/lowy results**: Post the hickey and lowy analysis as a PR comment using `gh pr comment` with a `## [Hickey/Lowy](https://kolu.dev/blog/hickey-lowy/) Analysis` header (the heading links to the blog post explaining the two lenses, mirroring how the final step status comment links `/do` to the agency repo). Always post when the steps ran — reviewers should see the structural analysis even if every finding was a No-op.
 
    **Format the comment with a leading findings ledger.** Compose a single table from both sub-agents' Actions sections — one row per finding — so a reviewer can see disposition at a glance without parsing paragraphs. Put each lens's prose underneath as rationale:
 
    ```md
    ## [Hickey/Lowy](https://kolu.dev/blog/hickey-lowy/) Analysis
 
-   | # | Lens   | Finding                                  | Disposition       |
-   |---|--------|------------------------------------------|-------------------|
-   | 1 | Hickey | viewportDimensions complects two roles   | Fixed in this PR  |
-   | 2 | Lowy   | useViewport encapsulates ghost concern   | Deferred [#123]   |
+   | # | Lens   | Finding                                  | Disposition         |
+   |---|--------|------------------------------------------|---------------------|
+   | 1 | Hickey | viewportDimensions complects two roles   | Fixed in this PR    |
+   | 2 | Lowy   | useViewport encapsulates ghost concern   | Fixed in this PR    |
+   | 3 | Lowy   | clipboard.ts named after a consumer      | ⚠️ **No-op**        |
 
    ### Hickey rationale
    <prose from the hickey sub-agent>
@@ -335,17 +353,15 @@ Check whether a PR already exists for this branch (`gh pr view`).
    <prose from the lowy sub-agent>
    ```
 
-   The Disposition cell mirrors the sub-agent's Actions disposition verbatim — **Fixed in this PR**, **Deferred [#N]** (linked), or **No-op** (deletion-only / subsumed by another finding). The Finding cell is the short bolded label the sub-agent emits at the start of each Actions entry. If both lenses produced zero findings, write a one-line "No findings — analysis below" instead of an empty table.
+   The Disposition cell mirrors the sub-agent's Actions disposition verbatim — **Fixed in this PR** or **No-op** (deletion-only / subsumed by another finding). **Render every No-op as `⚠️ **No-op**`** (warning emoji + bold) so the reviewer's eye lands on it; No-op rows are the ones a human most needs to scrutinize (a finding the reviewer acknowledged but didn't fix), and plain text lets them blend into the Fixed-in-this-PR rows above. There is no Deferred disposition; if a sub-agent emitted one, the audit step above flipped it to Fixed in this PR. The Finding cell is the short bolded label the sub-agent emits at the start of each Actions entry. If both lenses produced zero findings, write a one-line "No findings — analysis below" instead of an empty table.
 
 **If PR already exists** (followup runs, `--from` entry points):
 
 Re-check the PR title/body against current scope. If scope changed, update via `gh pr edit` per the `forge-pr` skill.
 
-**Surface deferred hickey/lowy findings**: If the hickey or lowy steps produced any **"Defer `#issue`"** actions, append a `> **Deferred:** #123, #124` line to the PR body (via `gh pr edit`) so reviewers see the outstanding structural debt. These are easy to miss in a PR comment — the description is what reviewers actually read.
-
 **Why this runs before `ci`**: The draft PR is the canonical home for CI status. Opening it before CI runs means CI checks land directly on the PR, reviewers see the run history as it happens, and a failing run doesn't leave an orphaned branch with red statuses and no PR to explain them. If retries exhaust in **ci**, the draft PR remains as the artifact of the failed attempt — visible, reviewable, and ready to resume via `--from ci-only`.
 
-**Verify**: Draft PR exists (`gh pr view` succeeds), PR title/body matches the delivered scope, hickey/lowy findings posted if any, and any deferred issues are linked in the body.
+**Verify**: Draft PR exists (`gh pr view` succeeds), PR title/body matches the delivered scope, hickey/lowy findings posted if any.
 
 ---
 
@@ -373,7 +389,13 @@ CI commands are typically local (e.g. `nix flake check`, `just ci`, `make ci`) a
 
 ### evidence
 
-**Opt-in step.** Most projects skip this. The step exists so projects with empirical "did the feature actually work" needs — UI screenshots, performance benchmarks, demo recordings, output transcripts — can attach that evidence to the PR without baking the mechanism into agency.
+**Opt-in step.** Most projects skip this. The step exists so projects with empirical "did this actually work" needs can attach proof to the PR without baking the mechanism into agency. That proof is **visual** _or_ **behavioral** — and the second kind is easy to under-fire on, because it often has zero visual diff:
+
+- **Visual** — UI screenshots, before/after stills, demo recordings; **video** when the change is about motion (an animation, a transition).
+- **Behavioral** — proof that _state survives an interaction or a restart_. When the diff touches a persistence, restore, session, autosave, debounce/coalesce, or reconnect path, the evidence that matters is "does the round-trip still hold?", not a pixel change. These changes routinely have **no visual diff** yet are exactly where a survives-restart capture proves the fix didn't break recoverability (e.g. resize → stop the app → restart → restore session → panel returns at the resized width).
+- **Other empirical** — performance benchmarks, output transcripts.
+
+**Bug fixes default to "demonstrate the fixed behavior."** The bug was usually invisible — a lost write, a storm, a hang, a broken round-trip — so a before→after or survives-restart clip is the evidence even when nothing _looks_ different. Don't gate evidence on a pixel changing; gate it on "is there a behavior worth proving."
 
 **If `--minimal`**: Skip with status `skipped` and reason `"--minimal"`. Move to **done**.
 
@@ -386,6 +408,8 @@ CI commands are typically local (e.g. `nix flake check`, `just ci`, `make ci`) a
 **If the section is present**:
 
 The section is project-specific and free-form: it can be inline prose describing the capture procedure, a pointer to another file (`See ./scripts/capture-evidence.md`), a script reference (`Run ./scripts/capture-pr-evidence.sh and use its stdout`), or any combination. Don't second-guess the form — read it, then **spawn a sub-agent** (`Agent(subagent_type: "general-purpose", ...)`) so the capture work (MCP calls, screenshot uploads, gh API requests) doesn't pollute `/do`'s main context.
+
+**Read the trigger broadly.** A project's section supplies the _capture mechanism_; the criterion for _when to fire_ is the visual-or-behavioral framing above. If the section's wording leans visual ("when the change has visible UI impact") but the diff is a behavioral fix on a persistence/restore/round-trip/debounce/reconnect path, capture the **behavior** anyway — the absence of a visual diff is not a reason to skip. Only skip when there is genuinely no behavior worth proving (a pure refactor, a docs change, an internal cleanup with no observable before→after).
 
 The sub-agent prompt should include:
 

@@ -15,8 +15,54 @@ Feature: Git worktree management
     When I open the command palette
     And I select "New terminal" in the palette
     And I select "kolu-wt-test" in the palette
+    Then the palette name input should be prefilled
+    When I press Enter
     Then the header CWD should show ".worktrees/"
-    And the pill tree should show a worktree indicator
+    And the workspace switcher should show a worktree indicator
+    And there should be no page errors
+
+  Scenario: User types a custom worktree name and it appears on the pill
+    When I set up a git repo at "/tmp/kolu-wt-named"
+    And I run "cd /tmp/kolu-wt-named"
+    Then the header should show a branch name
+    When I open the command palette
+    And I select "New terminal" in the palette
+    And I select "kolu-wt-named" in the palette
+    And I type "fix-login-bug" in the palette
+    And I press Enter
+    Then the header CWD should show ".worktrees/fix-login-bug"
+    And a workspace switcher pill should show "fix-login-bug"
+    And there should be no page errors
+
+  Scenario: Invalid worktree name surfaces inline error and blocks Enter
+    When I set up a git repo at "/tmp/kolu-wt-validate"
+    And I run "cd /tmp/kolu-wt-validate"
+    Then the header should show a branch name
+    When I open the command palette
+    And I select "New terminal" in the palette
+    And I select "kolu-wt-validate" in the palette
+    And I type "fix login bug" in the palette
+    Then the palette name input should show error "whitespace"
+    When I press Enter
+    Then the command palette should be visible
+    And there should be no page errors
+
+  Scenario: Reusing an existing worktree name surfaces a collision toast
+    When I set up a git repo at "/tmp/kolu-wt-collide"
+    And I run "cd /tmp/kolu-wt-collide"
+    Then the header should show a branch name
+    When I open the command palette
+    And I select "New terminal" in the palette
+    And I select "kolu-wt-collide" in the palette
+    And I type "duplicate-name" in the palette
+    And I press Enter
+    Then the header CWD should show ".worktrees/duplicate-name"
+    When I open the command palette
+    And I select "New terminal" in the palette
+    And I select "kolu-wt-collide" in the palette
+    And I type "duplicate-name" in the palette
+    And I press Enter
+    Then a toast should appear with text "already exists"
     And there should be no page errors
 
   Scenario: Close terminal on worktree shows confirmation and removes worktree
@@ -26,13 +72,15 @@ Feature: Git worktree management
     When I open the command palette
     And I select "New terminal" in the palette
     And I select "kolu-wt-remove" in the palette
+    And I press Enter
     Then the header CWD should show ".worktrees/"
-    Given I note the pill tree entry count
+    And the workspace switcher should show a worktree indicator
+    Given I note the workspace switcher entry count
     When I open the command palette
     And I select "Close terminal" in the palette
     Then the close confirmation should be visible
     When I confirm worktree removal
-    Then the pill tree should have 1 fewer terminal entry
+    Then the workspace switcher should have 1 fewer terminal entry
     And there should be no page errors
 
   Scenario: Cancel worktree removal keeps the terminal
@@ -42,13 +90,15 @@ Feature: Git worktree management
     When I open the command palette
     And I select "New terminal" in the palette
     And I select "kolu-wt-cancel" in the palette
+    And I press Enter
     Then the header CWD should show ".worktrees/"
-    Given I note the pill tree entry count
+    And the workspace switcher should show a worktree indicator
+    Given I note the workspace switcher entry count
     When I open the command palette
     And I select "Close terminal" in the palette
     Then the close confirmation should be visible
     When I dismiss the close confirmation
-    Then the pill tree entry count should be unchanged
+    Then the workspace switcher entry count should be unchanged
     And there should be no page errors
 
   Scenario: Close only keeps the worktree on disk
@@ -58,13 +108,15 @@ Feature: Git worktree management
     When I open the command palette
     And I select "New terminal" in the palette
     And I select "kolu-wt-close-only" in the palette
+    And I press Enter
     Then the header CWD should show ".worktrees/"
-    Given I note the pill tree entry count
+    And the workspace switcher should show a worktree indicator
+    Given I note the workspace switcher entry count
     When I open the command palette
     And I select "Close terminal" in the palette
     Then the close confirmation should be visible
     When I click close only in the close confirmation
-    Then the pill tree should have 1 fewer terminal entry
+    Then the workspace switcher should have 1 fewer terminal entry
     And there should be no page errors
 
   Scenario: Remove option is hidden when another terminal shares the worktree
@@ -75,13 +127,13 @@ Feature: Git worktree management
     When I create a terminal
     And I run "cd /tmp/kolu-wt-shared/.worktrees/shared-wt"
     Then the header should show a branch name
-    Given I note the pill tree entry count
+    Given I note the workspace switcher entry count
     When I open the command palette
     And I select "Close terminal" in the palette
     Then the close confirmation should be visible
     And the close confirmation should not offer worktree removal because "sharedWithOtherTerminals"
     When I confirm close all in the close confirmation
-    Then the pill tree should have 1 fewer terminal entry
+    Then the workspace switcher should have 1 fewer terminal entry
     And there should be no page errors
 
   # Sub-terminal create-via-palette in a worktree-spawned terminal stalls
@@ -97,6 +149,7 @@ Feature: Git worktree management
     When I open the command palette
     And I select "New terminal" in the palette
     And I select "kolu-wt-split-close" in the palette
+    And I press Enter
     Then the header CWD should show ".worktrees/"
     When I create a sub-terminal via command palette
     And I create another sub-terminal via command palette
@@ -114,12 +167,13 @@ Feature: Git worktree management
     When I open the command palette
     And I select "New terminal" in the palette
     And I select "kolu-wt-splits" in the palette
+    And I press Enter
     Then the header CWD should show ".worktrees/"
     When I create a sub-terminal via command palette
-    Given I note the pill tree entry count
+    Given I note the workspace switcher entry count
     When I open the command palette
     And I select "Close terminal" in the palette
     Then the close confirmation should be visible
     When I confirm worktree removal
-    Then the pill tree should have 1 fewer terminal entry
+    Then the workspace switcher should have 1 fewer terminal entry
     And there should be no page errors

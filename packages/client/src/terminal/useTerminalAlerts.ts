@@ -2,9 +2,12 @@
  *  Watches metadata subscriptions for agent state changes (any AI coding agent). */
 
 import { makeEventListener } from "@solid-primitives/event-listener";
-import type { TerminalId, TerminalMetadata } from "kolu-common";
+import type { TerminalId, TerminalMetadata } from "kolu-common/surface";
 import { type Accessor, createEffect, on } from "solid-js";
-import { usePreferences } from "../settings/usePreferences";
+import { preferences } from "../wire";
+import { isAttentionState } from "./agentState";
+import { useStaleCheck } from "./staleness";
+import type { TerminalSubject } from "./terminalSubject";
 import {
   fireActivityAlert,
   requestNotificationPermission,
@@ -12,24 +15,45 @@ import {
 
 export function useTerminalAlerts(deps: {
   activeId: Accessor<TerminalId | null>;
+  activate: (id: TerminalId) => void;
   getMetadata: (id: TerminalId) => TerminalMetadata | undefined;
+  getSubject: (id: TerminalId) => TerminalSubject;
   hasBadgeAttention: (id: TerminalId) => boolean;
   clearBadgeAttention: () => void;
   markUnread: (id: TerminalId) => void;
   markBadgeAttention: (id: TerminalId) => void;
   terminalIds: Accessor<TerminalId[]>;
-  terminalLabel: (id: TerminalId) => string;
 }) {
-  const { preferences } = usePreferences();
   const activityAlerts = () => preferences().activityAlerts;
+  const isStale = useStaleCheck();
 
   // Request browser notification permission eagerly when alerts are enabled
   if (activityAlerts()) requestNotificationPermission();
 
-  // Badge the PWA dock icon with terminals that need attention.
+  // Stale terminals are excluded — but the attention mark itself
+  // stays, so a fresh agent transition (which bumps `lastActivityAt`
+  // and unparks) wakes the badge back up. `isStale` is purely
+  // temporal: a `waiting` agent past the activity window suppresses
+  // the badge along with every other stale terminal — by design, so a
+  // user who's been away long enough doesn't get a phantom badge from
+  // yesterday's queue. The dock still surfaces those terminals via
+  // their parked-row AgentIndicator; the OS badge is for "act now".
+  const isAttentionLive = (id: TerminalId) => {
+    if (!deps.hasBadgeAttention(id)) return false;
+    const meta = deps.getMetadata(id);
+    if (!meta) return false;
+    return !isStale(meta.lastActivityAt);
+  };
+
+  // Badge the PWA dock icon with terminals that need attention. The
+  // effect re-runs on every staleness tick (~60s), so guard against
+  // re-issuing the same count to the OS shell.
+  let lastBadgeCount = -1;
   createEffect(() => {
     if (!("setAppBadge" in navigator)) return;
-    const count = deps.terminalIds().filter(deps.hasBadgeAttention).length;
+    const count = deps.terminalIds().filter(isAttentionLive).length;
+    if (count === lastBadgeCount) return;
+    lastBadgeCount = count;
     if (count > 0) {
       void navigator.setAppBadge(count);
     } else {
@@ -62,7 +86,11 @@ export function useTerminalAlerts(deps: {
     prev: string | undefined,
     next: string | undefined,
   ) {
-    if (!activityAlerts() || next !== "waiting" || prev === "waiting") return;
+    if (!activityAlerts()) return;
+    // Fire on entry into the "needs-attention" class (waiting or
+    // awaiting_user). Treating the two as one class means we don't
+    // double-alert when the agent flips between them in one session.
+    if (!isAttentionState(next) || isAttentionState(prev)) return;
     alertForTerminal(id);
   }
 
@@ -74,7 +102,14 @@ export function useTerminalAlerts(deps: {
       deps.markBadgeAttention(id);
     }
     if (isBackground || document.hidden)
-      fireActivityAlert(deps.terminalLabel(id));
+      fireActivityAlert(
+        deps.getSubject(id),
+        // The only consumer of `onSwitch` is `Notification.onclick`,
+        // which only fires when `document.hidden` is true — passing a
+        // callback while the tab is visible captures a closure that
+        // never runs. Tie the payload to the channel's precondition.
+        document.hidden ? () => deps.activate(id) : undefined,
+      );
   }
 
   function simulateAlert(options?: { target?: "active" | "inactive" }) {

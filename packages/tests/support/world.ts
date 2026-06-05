@@ -15,19 +15,49 @@ import type { Browser, BrowserContext, Locator, Page } from "playwright";
 // them without `(window as any)` / `(this as any)` casts.
 import "kolu-common/test-hooks";
 
-setDefaultTimeout(30_000);
-
-const READY_TIMEOUT = 20_000;
-/** Shared timeout for element polling (waitFor / waitForFunction). Generous for darwin CI under load. */
+/** Per-step / per-hook budget for interaction polls — `waitFor` /
+ *  `waitForFunction` against a settled UI. Most step definitions reach
+ *  for this. */
 export const POLL_TIMEOUT = 20_000;
+
+/** Per-step budget for *hydration* polls — waiting for the app to mount
+ *  enough state that interaction is meaningful (server WS up, savedSession
+ *  reflected, file-tree populated). The hydration axis is volatile
+ *  separately from interaction: a loaded darwin runner can take 30 s+ for
+ *  the Pierre file tree to flip from empty to populated (branch mode +
+ *  server-side `git status` round-trip), but the *first* interaction
+ *  after that lands in ~200 ms. Splitting the constants keeps one slow
+ *  axis from forcing the rest of the suite to wait. Generous margin
+ *  here is on purpose — empirically the slow path hits 30 s on the
+ *  darwin CI runner, and the safety-net Cucumber retry only absorbs
+ *  one re-run per scenario. */
+export const HYDRATION_TIMEOUT = 60_000;
+
+const READY_TIMEOUT = HYDRATION_TIMEOUT;
+
+/** Cucumber outer-kill timeout. Derived so the relationship
+ *  `POLL_TIMEOUT < HYDRATION_TIMEOUT < setDefaultTimeout` is structural —
+ *  bumping either inner constant cannot silently make the outer envelope
+ *  too tight to surface the inner timeout's real error message. */
+const STEP_GUARD = 10_000;
+setDefaultTimeout(Math.max(POLL_TIMEOUT, HYDRATION_TIMEOUT) + STEP_GUARD);
 export const MOD_KEY = process.platform === "darwin" ? "Meta" : "Control";
 
 /** Locator for the app's settled state: either a visible terminal screen or the empty state tip. */
 const SETTLED_SELECTOR =
   '[data-visible] .xterm-screen, [data-testid="empty-state"]';
-/** Pill-tree branch entries (one per terminal) — the canonical "list of
- *  terminals" affordance. */
-export const PILL_TREE_ENTRY_SELECTOR = '[data-testid="pill-tree-branch"]';
+/** Touch-device media query — mirrors `isTouch` in packages/client/src/useMobile.ts.
+ *  The test package can't import from client src, so the literal is named here to
+ *  keep the one place it's duplicated legible and self-documenting. Exported so
+ *  step definitions can gate touch-specific waits (e.g. the suppressed
+ *  refocus-terminal-on-dialog-close) on the same query. */
+export const COARSE_POINTER_QUERY = "(pointer: coarse)";
+/** Canonical "list of terminals" affordance — one row per terminal in
+ *  the dock. Replaced the chrome-bar workspace-switcher pill
+ *  strip with #903; the surface is different, the semantics are the
+ *  same (one entry per live terminal with `data-terminal-id`,
+ *  `data-active`, `data-unread`, etc.). */
+export const WORKSPACE_SWITCHER_ENTRY_SELECTOR = '[data-testid="dock-row"]';
 /** Per-tile elements on the canvas — one per top-level terminal. Mobile
  *  uses the mobile-tile-view body to enumerate terminals instead. */
 export const CANVAS_TILE_SELECTOR = '[data-testid="canvas-tile"]';
@@ -41,13 +71,17 @@ export class KoluWorld extends World {
   // Stashed state for comparison across steps
   savedSessionTerminalCount?: number;
   savedSessionTerminals?: import("kolu-common").SavedTerminal[];
+  /** Captured on the first saved-session POST per scenario; replayed
+   *  verbatim on self-heal re-POSTs so assertions always exercise the
+   *  originally-persisted session, not a fresh one. */
+  savedSessionSavedAt?: number;
   savedCanvas?: { x: number; y: number; width: number; height: number };
   previousCanvas?: { x: number; y: number; width: number; height: number };
   savedFontSize?: number;
   lastResponseText?: string;
   lastResponseOk?: boolean;
   terminalCountBeforeRefresh?: number;
-  savedPillTreeCount?: number;
+  savedWorkspaceSwitcherCount?: number;
   savedActiveTerminalId?: string;
   savedScrollTop?: number;
   savedVisibleText?: string;
@@ -69,6 +103,12 @@ export class KoluWorld extends World {
     number,
     { id: string; left: number; top: number }
   >;
+  /** Snapshot of every visible canvas tile's canvas-space position
+   *  (`style.left`/`top`, keyed by terminal id) captured by `When I
+   *  record all canvas tile positions`. Read back by the
+   *  no-auto-arrange-on-create regression to prove a new terminal never
+   *  moves an existing one. */
+  recordedTilePositions?: Record<string, { left: number; top: number }>;
   _scrollFifo?: string;
   createdTerminalIds: string[] = [];
   shuffleHistory: string[] = [];
@@ -130,16 +170,27 @@ export class KoluWorld extends World {
     if (!newId) throw new Error("Created terminal but no new id appeared");
 
     await this.canvas.waitFor({ state: "visible", timeout });
-    // Wait for xterm's textarea to receive focus (auto-focus in Terminal.tsx onMount)
+    // Desktop auto-focuses xterm's textarea on mount — the signal that a
+    // subsequent keyboard.type() will land — so wait for it. On touch, selection
+    // no longer auto-focuses (focusOnSelection() is a no-op there; the soft keyboard
+    // must only rise on an explicit tap), so the terminal mounts unfocused by
+    // design — gate on the helper textarea existing in the visible tile instead.
     await this.page.waitForFunction(
-      () => !!document.activeElement?.closest("[data-visible]"),
+      (coarsePointer) => {
+        const visible = document.querySelector("[data-visible]");
+        if (!visible) return false;
+        return matchMedia(coarsePointer).matches
+          ? !!visible.querySelector(".xterm-helper-textarea")
+          : !!document.activeElement?.closest("[data-visible]");
+      },
+      COARSE_POINTER_QUERY,
       { timeout },
     );
     return newId;
   }
 
   /** All terminal ids currently present in the DOM (canvas tiles, mobile
-   *  pager entries, and pill-tree branches all carry `data-terminal-id`). */
+   *  pager entries, and workspace-switcher entries all carry `data-terminal-id`). */
   async terminalIds(): Promise<string[]> {
     return this.page.evaluate(() => {
       const seen = new Set<string>();
@@ -151,10 +202,36 @@ export class KoluWorld extends World {
     });
   }
 
-  /** Wait for the app to reach a stable state (restored terminals or empty state). */
-  async waitForSettled(timeout = READY_TIMEOUT) {
+  /** Wait for the app to reach a stable state (restored terminals or
+   *  empty state).
+   *
+   *  Pass `onTick` to drive a side effect (re-POST, `utimesSync` re-touch,
+   *  WAL nudge) on every poll iteration — the same self-heal pattern that
+   *  `pollFor` in `support/poll.ts` exposes. Used by step definitions that
+   *  race a server-side hydration effect against test fixtures (see
+   *  `session_restore_steps.ts`). */
+  async waitForSettled(
+    timeout = READY_TIMEOUT,
+    onTick?: () => void | Promise<void>,
+  ) {
     const settled = this.page.locator(SETTLED_SELECTOR);
-    await settled.first().waitFor({ state: "visible", timeout });
+    if (!onTick) {
+      await settled.first().waitFor({ state: "visible", timeout });
+      return;
+    }
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (
+        await settled
+          .first()
+          .isVisible()
+          .catch(() => false)
+      )
+        return;
+      await onTick();
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    await settled.first().waitFor({ state: "visible", timeout: 500 });
   }
 
   /** Wait for the app to settle, creating a terminal if empty state is shown. */
@@ -167,7 +244,26 @@ export class KoluWorld extends World {
     }
   }
 
+  /** Ensure a terminal matching `scope` holds keyboard focus before typing.
+   *  On touch, terminals no longer auto-focus on selection (the soft keyboard
+   *  must rise only on a tap), so this focuses the target's helper textarea —
+   *  the harness stand-in for that tap. Desktop terminals already hold focus,
+   *  so it no-ops there. */
+  async focusForTyping(scope: string) {
+    const focused = await this.page.evaluate(
+      (sel) => !!document.activeElement?.closest(sel),
+      scope,
+    );
+    if (!focused) {
+      await this.page
+        .locator(`${scope} .xterm-helper-textarea`)
+        .first()
+        .focus();
+    }
+  }
+
   async terminalRun(command: string) {
+    await this.focusForTyping("[data-visible]:not([data-sub-terminal])");
     await this.page.keyboard.type(command);
     await this.page.keyboard.press("Enter");
   }

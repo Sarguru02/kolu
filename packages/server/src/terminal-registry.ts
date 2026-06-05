@@ -2,28 +2,33 @@
  * Terminal registry — the `Map<TerminalId, TerminalProcess>` and the
  * pure read/write accessors around it.
  *
- * Kept as a leaf module on purpose: metadata providers under `./meta/*`
- * need to read the registry (for `TerminalProcess` shape and for
- * `getTerminal`), and the higher-level lifecycle in `./terminals.ts` needs
- * to write to it. When both lived on `terminals.ts`, the providers' edge
- * back to `terminals.ts` (plus `terminals.ts`'s edge to `./meta/index.ts`
- * for `startProviders`) closed a cycle that Biome's `noImportCycles`
- * correctly flagged (#710). Splitting the map+reads here breaks it.
- *
- * No imports from `./meta/*` or `./terminals.ts` — that invariant is what
- * keeps this file a leaf.
+ * Backend-agnostic: every `TerminalBackend` (local in R-1, remote in
+ * R-2) writes to the same registry so consumers downstream (router,
+ * surface) iterate one place regardless of where the terminal lives.
+ * Per-backend internal state (PTY handle, provider cleanups for
+ * `LocalTerminalBackend`) stays inside the backend itself, not on
+ * `TerminalProcess`.
  */
 
-import type { TerminalId, TerminalInfo } from "kolu-common";
-import type { PtyHandle } from "./pty.ts";
+import { ORPCError } from "@orpc/server";
+import type {
+  TerminalId,
+  TerminalInfo,
+  TerminalMetadata,
+} from "kolu-common/surface";
+import type { TerminalHandle } from "kolu-common/terminalBackend";
 
-/** Server-side terminal state. Owns a PtyHandle and embeds the wire-type TerminalInfo. */
+/** Server-side terminal state. `info` is the wire shape sent in the
+ *  `terminalList` cell snapshot; `meta` is mutated in place by the
+ *  owning backend's providers and published via the
+ *  `terminalMetadata` collection from `terminalBackend/metadata.ts`;
+ *  `handle` is the abstract control surface (write / resize / screen
+ *  state — NO `dispose()`, the backend's `killTerminal` is the sole
+ *  termination path). */
 export interface TerminalProcess {
-  /** The wire-type snapshot — single source of truth for id, pid, meta. */
   info: TerminalInfo;
-  handle: PtyHandle;
-  /** Cleanup function for all metadata providers. */
-  stopProviders: () => void;
+  meta: TerminalMetadata;
+  handle: TerminalHandle;
 }
 
 const terminals = new Map<TerminalId, TerminalProcess>();
@@ -38,11 +43,11 @@ export function unregisterTerminal(id: TerminalId): boolean {
   return terminals.delete(id);
 }
 
-/** Snapshot + clear. Used by `killAllTerminals` where the caller needs to
- *  dispose each handle AFTER the map is empty (so onExit callbacks can't
- *  find the entry and trigger session saves). Returning the entries keeps
- *  the clear-then-dispose ordering in the caller rather than forcing it
- *  into the registry API. */
+/** Snapshot + clear. Used by `killAllTerminals` where the caller needs
+ *  to dispose each handle AFTER the map is empty (so onExit callbacks
+ *  can't find the entry and trigger session saves). Returning the
+ *  entries keeps the clear-then-dispose ordering in the caller rather
+ *  than forcing it into the registry API. */
 export function drainTerminals(): TerminalProcess[] {
   const entries = [...terminals.values()];
   terminals.clear();
@@ -60,8 +65,8 @@ export function terminalEntries(): IterableIterator<
 /** Current terminals in their canonical `Map` insertion order.
  *
  *  Insertion order is the ordering model — new terminals append to the
- *  tail. Clients render this order directly; within-group pill ordering
- *  is a separate spatial sort driven by saved canvas layouts. */
+ *  tail. Clients render this order directly; within-group pill
+ *  ordering is a separate spatial sort driven by saved canvas layouts. */
 export function listTerminals(): TerminalInfo[] {
   return [...terminals.values()].map((entry) => entry.info);
 }
@@ -70,17 +75,29 @@ export function listTerminals(): TerminalInfo[] {
 export const terminalCount = (): number => terminals.size;
 
 /** Number of terminals currently hosting a Claude Code session. Derived
- *  from `entry.info.meta.agent` — the generic agent orchestrator
- *  (`meta/agent.ts`, driven by `claudeCodeProvider` from `kolu-claude-code`)
- *  sets it on session match and clears it on teardown. Exported for diagnostics. */
+ *  from `entry.meta.agent` — the agent detectors inside
+ *  `LocalTerminalBackend` (driven by `claudeCodeProvider` from
+ *  `kolu-claude-code`) set it on session match and clear it on
+ *  teardown. Exported for diagnostics. */
 export function countActiveClaudeSessions(): number {
   let n = 0;
   for (const entry of terminals.values()) {
-    if (entry.info.meta.agent?.kind === "claude-code") n++;
+    if (entry.meta.agent?.kind === "claude-code") n++;
   }
   return n;
 }
 
 export function getTerminal(id: TerminalId): TerminalProcess | undefined {
   return terminals.get(id);
+}
+
+/** The terminal-not-found fault as a typed oRPC error. One definition of
+ *  the code + message shared by every per-terminal handler (router,
+ *  surface) so the wire shape can't drift between call sites. Typed
+ *  (not a bare Error) because oRPC scrubs bare errors to an opaque
+ *  "Internal server error". */
+export function terminalNotFound(
+  id: string,
+): ORPCError<"NOT_FOUND", undefined> {
+  return new ORPCError("NOT_FOUND", { message: `Terminal ${id} not found` });
 }

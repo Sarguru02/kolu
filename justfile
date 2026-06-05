@@ -15,6 +15,7 @@ cucumber_parallel := env('CUCUMBER_PARALLEL', '4')
 mod ai 'agents/ai.just'
 mod ci 'ci/mod.just'
 mod website 'website/mod.just'
+mod atlas 'docs/atlas/mod.just'
 
 # List available recipes
 default:
@@ -28,10 +29,33 @@ install:
     {{ nix_shell }} pnpm install
 
 # Run server + client in parallel.
-# Enters nix develop once, then re-invokes just inside it — subsequent
-# recipes see IN_NIX_SHELL so nix_shell becomes a no-op.
-dev:
+# Bare `just dev` keeps the canonical 7681/5173 (see README). Override either
+# port to run a second instance alongside a primary one; empty falls back to
+# the default. `just dev-auto` picks two free ports for you.
+#   just dev 7700 5180   (positional: SERVER_PORT then CLIENT_PORT)
+# The env vars must be exported before the parallel fork — Vite reads them once
+# at startup to compute its proxy target — so resolution happens here, in the
+# sequential recipe body, before `_dev` forks server + client.
+dev SERVER_PORT="" CLIENT_PORT="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export KOLU_DEV_SERVER_PORT="{{ SERVER_PORT }}"
+    export KOLU_DEV_CLIENT_PORT="{{ CLIENT_PORT }}"
+    echo "→ server http://localhost:${KOLU_DEV_SERVER_PORT:-7681}"
+    echo "→ client http://localhost:${KOLU_DEV_CLIENT_PORT:-5173}"
     {{ nix_shell }} just _dev
+
+# Run server + client on two free random ports, printing the resolved URLs.
+# For agents / a second worktree that must not collide with a primary instance.
+dev-auto:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # python3 via nix (not a global install) so this works outside the devshell.
+    # Both sockets stay open until printed, guaranteeing two *unique* free ports.
+    read -r SERVER_PORT CLIENT_PORT < <(nix shell nixpkgs#python3 --command python3 -c 'import socket; a=socket.socket(); a.bind(("",0)); b=socket.socket(); b.bind(("",0)); print(a.getsockname()[1], b.getsockname()[1]); a.close(); b.close()')
+    # Positional args — `just dev NAME=VALUE` would bind the literal "NAME=VALUE"
+    # to the param, not the value.
+    exec just dev "$SERVER_PORT" "$CLIENT_PORT"
 
 [private]
 _dev: install _dev-parallel
@@ -42,15 +66,16 @@ _dev-parallel: server client
 
 # Run TypeScript type checking + Biome lint across all packages — fast static-correctness gate
 check: install
-    {{ nix_shell }} sh -c 'pnpm typecheck && pnpm exec biome lint .'
+    {{ nix_shell }} sh -c 'pnpm typecheck && biome lint .'
 
 # Biome lint only — mirrors ci::biome. Format stays on Prettier for now (see biome.jsonc).
 lint: install
-    {{ nix_shell }} pnpm exec biome lint .
+    {{ nix_shell }} biome lint .
 
-# Run server with auto-reload
+# Run server with auto-reload. Honors KOLU_DEV_SERVER_PORT if set (e.g. by
+# `just dev`), otherwise the server CLI falls back to its default port.
 server:
-    cd packages/server && {{ nix_shell }} pnpm dev
+    cd packages/server && {{ nix_shell }} pnpm dev ${KOLU_DEV_SERVER_PORT:+--port $KOLU_DEV_SERVER_PORT}
 
 # Run client with Vite dev server (HMR)
 client:
@@ -64,10 +89,26 @@ test-unit: install
 test: install
     #!/usr/bin/env bash
     set -euo pipefail
-    KOLU_SERVER="${KOLU_SERVER:-$(nix build .#koluBin --print-out-paths)/bin/kolu}"
+    # Raise the fd soft limit before spawning workers/servers. macOS defaults
+    # to 256, which a kolu server under parallel load can exhaust on accept()
+    # (silent EMFILE — no crash, just refused connections). Hard limit is
+    # unlimited; this is free insurance on every platform.
+    ulimit -n 65536 2>/dev/null || true
+    # Worker count scales with the host unless CUCUMBER_PARALLEL is set
+    # explicitly: ~1 worker per 3 cores, clamped to [4,8]. The 24-core darwin
+    # CI host (rasam) gets 8 — ~45% faster than the old fixed 4 — while laptops
+    # and smaller CI stay at 4. Past 8 the slowest-scenario tail dominates and
+    # extra workers only add contention (PAR=12 measured *slower* than PAR=8 on
+    # a 24-core host). See docs/ci-e2e-macos-ralph-report.md.
+    cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+    par=$(( cores / 3 ))
+    if (( par < 4 )); then par=4; fi
+    if (( par > 8 )); then par=8; fi
+    par="${CUCUMBER_PARALLEL:-$par}"
+    KOLU_SERVER="${KOLU_SERVER:-$(nix build .#koluBin --no-link --print-out-paths)/bin/kolu}"
     cd packages/tests
     {{ nix_shell_e2e }} pnpm install
-    KOLU_SERVER="$KOLU_SERVER" CUCUMBER_PARALLEL={{ cucumber_parallel }} {{ nix_shell_e2e }} pnpm test
+    KOLU_SERVER="$KOLU_SERVER" CUCUMBER_PARALLEL="$par" {{ nix_shell_e2e }} pnpm test
 
 # Fast self-contained e2e tests (no nix build, no separate dev server).
 # Builds client via pnpm, spawns server from source on random ports.
@@ -106,15 +147,15 @@ clean:
 
 # Format all files in-place
 fmt: install
-    {{ nix_shell }} sh -c 'pnpm exec biome format --write . && nixpkgs-fmt *.nix nix/**/*.nix website/*.nix'
+    {{ nix_shell }} sh -c 'biome format --write . && nixpkgs-fmt *.nix nix/**/*.nix website/*.nix'
 
 # Check formatting without modifying files (used by CI)
 fmt-check: install
-    {{ nix_shell }} sh -c 'pnpm exec biome format . && nixpkgs-fmt --check *.nix nix/**/*.nix website/*.nix'
+    {{ nix_shell }} sh -c 'biome format . && nixpkgs-fmt --check *.nix nix/**/*.nix website/*.nix'
 
-# Nix build (server + client)
+# Nix build (server + client) — prints store path, no ./result symlink
 build:
-    nix build
+    nix build --no-link --print-out-paths
 
 # Run the combined server+client binary
 run:

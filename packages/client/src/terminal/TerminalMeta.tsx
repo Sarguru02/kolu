@@ -1,26 +1,41 @@
 /** Terminal metadata for the canvas tile title bar — two rows:
  *
  *    Row 1: name [suffix] [worktree] [foreground] [agent progress]
- *    Row 2: branch [PR icon checks #N title]
+ *    Row 2: annotation [PR icon checks #N title]
+ *
+ *  Row 2 is the *annotation slot* (supplant rule): intent line-1 if
+ *  the user set one, else the git branch name, else empty. Clicking
+ *  the slot always opens the intent editor — there's no separate
+ *  glyph chip, so the slot is the canvas tile's sole intent
+ *  affordance.
  *
  *  The mobile pull-handle has its own one-row layout — see
- *  `TerminalMetaCompact`. Reusing one component across both was an
- *  abstraction that complected mount-site context with rendering
- *  decisions; the two layouts are different enough to warrant
- *  separate components, with shared bits (skeleton, agent progress)
- *  exported below for reuse. */
+ *  `TerminalMetaCompact`. */
 
-import { prUnavailableSource, prValue } from "kolu-common/pr";
+import { prUnavailableSource, prValue } from "kolu-github/schemas";
 import { type Component, Show } from "solid-js";
+import { StatePip } from "../canvas/dock/RowPips";
+import { agentBucket } from "../canvas/dockModel";
+import { IntentMarkdownInline } from "../intent/IntentMarkdown";
+import { annotationLine } from "../intent/text";
+import { agentWorkflow } from "../ui/agentDisplay";
 import { PrStateIcon, WorktreeIcon } from "../ui/Icons";
 import Tip from "../ui/Tip";
 import ChecksIndicator from "./ChecksIndicator";
-import { copyTextWithToast } from "./clipboard";
 import { PrUnavailableButton } from "./PrUnavailablePopover";
+import { prTooltip } from "./prTooltip";
 import type { TerminalDisplayInfo } from "./terminalDisplay";
 
 const TerminalMeta: Component<{
   info: TerminalDisplayInfo | undefined;
+  /** True when this terminal has unseen agent activity. Drives the
+   *  leading state pip's attention escalation exactly as the dock row
+   *  does, so the title and the dock can't disagree on what's loud.
+   *  Sourced from view-state at the call site (`store.isUnread(id)`). */
+  unread: boolean;
+  /** Open the intent editor for this terminal. Wired in `App.tsx` to
+   *  `intentEditor.openTerminal(id)`. */
+  onOpenIntent: () => void;
 }> = (props) => {
   const i = () => props.info;
   return (
@@ -67,6 +82,11 @@ const TerminalMeta: Component<{
                 </span>
               )}
             </Show>
+            <Show when={agentWorkflow(info().meta.agent)}>
+              {(wf) => (
+                <AgentWorkflowBadge name={wf().name} agents={wf().agents} />
+              )}
+            </Show>
             <Show when={info().meta.agent?.taskProgress}>
               {(tp) => (
                 <AgentTaskProgress
@@ -77,74 +97,88 @@ const TerminalMeta: Component<{
             </Show>
           </div>
 
-          {/* Branch + PR — combined row. PR (if present) follows inline:
-           *  state icon, checks indicator, linked #N, truncated title. */}
-          <Show
-            when={info().meta.git}
-            fallback={
-              <div data-testid="terminal-meta-branch" class="text-xs text-fg-2">
-                {"\u00A0"}
-              </div>
-            }
-          >
-            {(git) => (
-              <div class="flex items-center gap-1.5 min-w-0 text-xs">
-                <Tip label="Copy branch name">
-                  <button
-                    type="button"
-                    data-testid="terminal-meta-branch"
-                    aria-label={`Copy branch ${git().branch} to clipboard`}
-                    class="appearance-none bg-transparent border-0 p-0 text-left [font:inherit] truncate shrink-0 max-w-[16ch] cursor-pointer hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 rounded-sm"
-                    style={{ color: info().branchColor }}
-                    classList={{ "text-fg-2": !info().branchColor }}
-                    onPointerDown={(e) => e.stopPropagation()}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void copyTextWithToast(git().branch, {
-                        success: "Copied branch name to clipboard",
-                        failure: "Failed to copy branch name",
-                      });
-                    }}
-                    onDblClick={(e) => e.stopPropagation()}
+          {/* Annotation row (supplant rule) + PR.
+           *
+           *  The slot shows intent line-1 if the user set one, else the
+           *  git branch name, else a non-breaking-space placeholder.
+           *  Clicking always opens the intent editor — there is no
+           *  separate glyph chip, so this slot is the canvas tile's
+           *  sole intent affordance regardless of git state. */}
+          <div class="flex items-center gap-1.5 min-w-0 text-xs">
+            {/* Agent-state pip leading the branch/intent annotation —
+             *  the same shape-distinct StatePip the dock row leads its
+             *  annotation line with (spinning ring = working, dot =
+             *  awaiting), reused verbatim so a working/awaiting agent
+             *  reads identically in the title and the dock, and sits
+             *  beside the same branch/intent context it does there.
+             *  Gated on a live agent: when none is attached the title
+             *  shows no pip (exactly as its agent-kind indicator vanishes
+             *  when the session ends), leaving the dock's idle/parked
+             *  triage states — which fold in recency/staleness — dock-only. */}
+            <Show when={info().meta.agent}>
+              {(agent) => (
+                <StatePip bucket={agentBucket(agent())} unread={props.unread} />
+              )}
+            </Show>
+            <Tip label={info().meta.intent ? "Edit intent" : "Set intent"}>
+              <button
+                type="button"
+                data-testid="terminal-meta-branch"
+                aria-label={
+                  info().meta.intent
+                    ? "Edit terminal intent"
+                    : "Set terminal intent"
+                }
+                class="appearance-none bg-transparent border-0 p-0 text-left [font:inherit] truncate shrink-0 max-w-[16ch] cursor-pointer hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50 rounded-sm"
+                style={{ color: info().annotationColor }}
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  props.onOpenIntent();
+                }}
+                onDblClick={(e) => e.stopPropagation()}
+              >
+                <IntentMarkdownInline
+                  markdown={annotationLine(
+                    info().meta.intent,
+                    info().meta.git?.branch ?? "—",
+                  )}
+                />
+              </button>
+            </Tip>
+            <Show when={prValue(info().meta.pr)}>
+              {(pr) => (
+                <span
+                  class="flex items-center gap-1 text-fg-2 truncate min-w-0"
+                  data-testid="terminal-meta-pr"
+                  title={prTooltip(pr())}
+                >
+                  <PrStateIcon state={pr().state} class="w-3 h-3" />
+                  <Show when={pr().checks}>
+                    {(checks) => <ChecksIndicator status={checks()} />}
+                  </Show>
+                  <a
+                    href={pr().url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="hover:text-accent shrink-0"
+                    onClick={(e) => e.stopPropagation()}
                   >
-                    {git().branch}
-                  </button>
-                </Tip>
-                <Show when={prValue(info().meta.pr)}>
-                  {(pr) => (
-                    <span
-                      class="flex items-center gap-1 text-fg-2 truncate min-w-0"
-                      data-testid="terminal-meta-pr"
-                      title={`#${pr().number} ${pr().title}`}
-                    >
-                      <PrStateIcon state={pr().state} class="w-3 h-3" />
-                      <Show when={pr().checks}>
-                        {(checks) => <ChecksIndicator status={checks()} />}
-                      </Show>
-                      <a
-                        href={pr().url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        class="hover:text-accent shrink-0"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        #{pr().number}
-                      </a>
-                      <span class="truncate">{pr().title}</span>
-                    </span>
-                  )}
-                </Show>
-                <Show when={prUnavailableSource(info().meta.pr)}>
-                  {(source) => (
-                    <PrUnavailableButton
-                      source={source()}
-                      testId="terminal-meta-pr-unavailable"
-                    />
-                  )}
-                </Show>
-              </div>
-            )}
-          </Show>
+                    #{pr().number}
+                  </a>
+                  <span class="truncate">{pr().title}</span>
+                </span>
+              )}
+            </Show>
+            <Show when={prUnavailableSource(info().meta.pr)}>
+              {(source) => (
+                <PrUnavailableButton
+                  source={source()}
+                  testId="terminal-meta-pr-unavailable"
+                />
+              )}
+            </Show>
+          </div>
         </>
       )}
     </Show>
@@ -152,7 +186,7 @@ const TerminalMeta: Component<{
 };
 
 /** Mobile pull-handle one-row variant — repo + branch + #PR inline.
- *  Mirrors what the pill tree shows for a focused terminal; the full
+ *  Mirrors what the workspace switcher shows for a focused terminal; the full
  *  branch/PR/foreground details live in the chrome sheet that the
  *  pull-handle opens. */
 export const TerminalMetaCompact: Component<{
@@ -167,17 +201,19 @@ export const TerminalMetaCompact: Component<{
           <Show when={info().meta.git?.isWorktree}>
             <WorktreeBadge />
           </Show>
-          <Show when={info().meta.git}>
-            {(git) => (
-              <span
-                data-testid="terminal-meta-branch"
-                class="text-xs truncate min-w-0"
-                style={{ color: info().branchColor }}
-                classList={{ "text-fg-2": !info().branchColor }}
-              >
-                {git().branch}
-              </span>
-            )}
+          <Show when={info().meta.intent ?? info().meta.git?.branch}>
+            <span
+              data-testid="terminal-meta-branch"
+              class="text-xs truncate min-w-0"
+              style={{ color: info().annotationColor }}
+            >
+              <IntentMarkdownInline
+                markdown={annotationLine(
+                  info().meta.intent,
+                  info().meta.git?.branch ?? "",
+                )}
+              />
+            </span>
           </Show>
           {/* Anchor stops propagation so a tap on the PR doesn't toggle
            *  the enclosing Drawer.Trigger. */}
@@ -189,7 +225,7 @@ export const TerminalMetaCompact: Component<{
                 target="_blank"
                 rel="noopener noreferrer"
                 class="text-xs font-mono text-fg-3 hover:text-accent shrink-0"
-                title={`#${pr().number} ${pr().title}`}
+                title={prTooltip(pr())}
                 onClick={(e) => e.stopPropagation()}
                 onPointerDown={(e) => e.stopPropagation()}
               >
@@ -238,6 +274,22 @@ const WorktreeBadge: Component = () => (
   >
     <WorktreeIcon />
   </span>
+);
+
+/** Dynamic-workflow fan-out indicator: the background workflow's name and
+ *  the count of sub-agents it has spawned so far. Shown while the agent is
+ *  busy-waiting on the workflow (state `running_background`). */
+const AgentWorkflowBadge: Component<{ name: string; agents: number }> = (
+  props,
+) => (
+  <div
+    data-testid="agent-workflow-badge"
+    class="ml-auto flex items-center gap-1 shrink-0 text-[0.65rem] text-fg-2"
+    title={`Background workflow "${props.name}" · ${props.agents} sub-agents`}
+  >
+    <span class="truncate max-w-24">{props.name}</span>
+    <span class="tabular-nums text-fg-3">{props.agents}▸</span>
+  </div>
 );
 
 const AgentTaskProgress: Component<{ completed: number; total: number }> = (

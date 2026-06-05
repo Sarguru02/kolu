@@ -12,8 +12,8 @@
  * abstraction uniform across axes.
  */
 
+import { createDirFilenameWatcher } from "kolu-io";
 import { resolveGitDir, WATCHER_DEBOUNCE_MS } from "./git-dir.ts";
-import { createDirFilenameWatcher } from "./shared-dir-filename-watcher.ts";
 
 const indexWatcher = createDirFilenameWatcher({
   resolveDir: resolveGitDir,

@@ -84,6 +84,7 @@ describe("prResultEqual", () => {
     url: "https://github.com/test/test/pull/1",
     state: "open",
     checks: "pass",
+    checkRuns: [],
   };
   const ok: PrResult = { kind: "ok", value: pr };
 
@@ -170,6 +171,15 @@ describe("classifyGhError", () => {
       classifyGhError({
         code: 1,
         stderr: 'no pull requests found for branch "my-branch"',
+      }),
+    ).toEqual({ kind: "absent" });
+  });
+
+  it("classifies gh's 'no git remotes found' as absent", () => {
+    expect(
+      classifyGhError({
+        code: 1,
+        stderr: "no git remotes found\n",
       }),
     ).toEqual({ kind: "absent" });
   });

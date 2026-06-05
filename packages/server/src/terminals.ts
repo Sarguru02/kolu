@@ -1,41 +1,45 @@
 /**
- * Terminal lifecycle: spawn PTYs, wire them to metadata providers, and
- * manage create/kill/update operations. The underlying `Map` and its
- * simple accessors (`getTerminal`, `listTerminals`, `terminalCount`,
- * `countActiveClaudeSessions`, the `TerminalProcess` shape) live in
- * `./terminal-registry.ts` so `./meta/*` can depend on the registry
- * without closing a cycle back through this file.
+ * Terminal lifecycle façade — `createTerminal` / `killTerminal` /
+ * `killAllTerminals` resolve to a `TerminalBackend` via
+ * `getTerminalBackendFor(location)` and delegate. The backend owns
+ * PTY spawn, per-terminal provider startup, registry insert/remove,
+ * autosave-trigger signalling.
  *
- * External callers that used to import state-reads + lifecycle from
- * `./terminals.ts` as a single module keep their import path — this
- * file re-exports the registry surface they need.
+ * Client-facing per-terminal metadata setters (`setTerminalParent`,
+ * `setCanvasLayout`, `setSubPanelState`, `setRightPanelState`,
+ * `setTerminalTheme`, `setTerminalIntent`) live here because they're
+ * location-agnostic — they mutate the in-registry entry through the
+ * narrowed `updateClientMetadata` helper, which publishes through the
+ * same metadata channel regardless of which backend owns the terminal.
+ *
+ * Re-exports the registry surface for callers that used to import
+ * state-reads + lifecycle from this file as a single module.
  */
 
 import type {
   InitialTerminalMetadata,
+  RightPanelPerTerminalState,
   SavedTerminal,
   TerminalId,
   TerminalInfo,
-} from "kolu-common";
-import { cleanupClipboardDir } from "./clipboard.ts";
-import { log } from "./log.ts";
-import {
-  createMetadata,
-  startProviders,
-  updateClientMetadata,
-  updateServerMetadata,
-} from "./meta/index.ts";
-import { spawnPty } from "./pty.ts";
-import { publishForTerminal, publishSystem } from "./publisher.ts";
-import {
-  drainTerminals,
-  getTerminal,
-  listTerminals,
-  registerTerminal,
-  type TerminalProcess,
-  terminalEntries,
-  unregisterTerminal,
-} from "./terminal-registry.ts";
+} from "kolu-common/surface";
+// Load-order is cycle-sensitive: importing `terminalBackend/metadata.ts`
+// before `terminalBackend/index.ts` is what makes the surface cycle
+// converge with `localTerminalBackend` already initialized by the time
+// line 33 below calls `getTerminalBackendFor`. Reversing these two
+// (biome's alphabetical preference) puts the cycle entry-point at the
+// deeper `activity.ts → surface.ts` branch and trips a TDZ on
+// `localTerminalBackend`.
+// biome-ignore-start assist/source/organizeImports: cycle-sensitive load order
+import { updateClientMetadata } from "./terminalBackend/metadata.ts";
+import { getTerminalBackendFor } from "./terminalBackend/index.ts";
+import { terminalsDirtyChannel } from "./publisher.ts";
+import { getTerminal, terminalEntries } from "./terminal-registry.ts";
+// biome-ignore-end assist/source/organizeImports: cycle-sensitive load order
+
+// R-1: a single local backend. R-2 will route by `location.kind` per
+// call site via `getTerminalBackendForCreate` — this const goes away then.
+const localBackend = getTerminalBackendFor({ kind: "local" });
 
 // Re-export registry accessors + type so external callers (router.ts,
 // diagnostics.ts, index.ts) keep a single import path.
@@ -66,124 +70,38 @@ export function snapshotSession(): {
         agent: _agent,
         foreground: _foreground,
         ...persisted
-      } = entry.info.meta;
+      } = entry.meta;
       return { id, ...persisted };
     },
   );
   return { terminals: snappedTerminals, activeTerminalId };
 }
 
-/** Notify that terminal state changed (triggers debounced session auto-save). */
-function emitChanged(): void {
-  publishSystem("terminals:dirty", {});
-}
-
-/** Notify that terminal membership changed (create/kill).
- *  Drives the live terminal.list stream to clients. */
-function emitListChanged(): void {
-  publishSystem("terminal-list", listTerminals());
-}
-
-/** Create a new terminal, spawn a PTY process. `initial` seeds
- *  client-owned metadata onto `meta` before the first `emitListChanged()`,
- *  so the list snapshot already carries it — used by session restore
- *  to avoid racing post-hoc `setCanvasLayout` / `setTheme` / `setSubPanel`
- *  RPCs against the client's canvas-cascade effect (#642). */
+/** Create a new terminal. The backend owns PTY spawn, provider
+ *  startup, and registry insert; this wrapper just resolves the
+ *  backend, mints an id, and forwards. `initial` seeds client-owned
+ *  metadata before providers run — see #642 (avoids racing post-hoc
+ *  `setCanvasLayout` / `setTheme` / `setSubPanel` RPCs against the
+ *  client's canvas-cascade effect). */
 export function createTerminal(
   cwd?: string,
   parentId?: string,
   initial?: InitialTerminalMetadata,
 ): TerminalInfo {
   const id = crypto.randomUUID();
-  const tlog = log.child({ terminal: id });
-
-  const handle = spawnPty(
-    tlog,
-    id,
-    {
-      onData: (data) => {
-        publishForTerminal("data", id, data);
-      },
-      // On natural exit: notify clients, then remove from server state
-      onExit: (exitCode) => {
-        tlog.info({ exitCode }, "exited");
-        const entry = getTerminal(id);
-        if (entry) {
-          entry.stopProviders();
-          cleanupClipboardDir(id);
-        }
-        publishForTerminal("exit", id, exitCode);
-        // Only save session on natural exit (entry still in map).
-        // killAllTerminals clears the map first, so entry is gone — skip.
-        const wasNaturalExit = unregisterTerminal(id);
-        if (wasNaturalExit) {
-          emitChanged();
-          emitListChanged();
-        }
-      },
-      // PTY callback (OSC 0/2): notify process provider that title changed
-      onTitleChange: (title) => {
-        publishForTerminal("title", id, title);
-      },
-      // PTY callback (OSC 633;E): raw preexec command line. Agent parsing,
-      // the per-terminal stash, and the recent-agents MRU all live in
-      // `meta/agent-command.ts`, fed via this channel.
-      onCommandRun: (raw) => {
-        publishForTerminal("commandRun", id, raw);
-      },
-      // PTY callback (OSC 7): update metadata CWD, notify providers via cwd channel
-      onCwd: (newCwd) => {
-        const entry = getTerminal(id);
-        if (entry) {
-          updateServerMetadata(entry, id, (m) => {
-            m.cwd = newCwd;
-          });
-          publishForTerminal("cwd", id, newCwd);
-        }
-      },
-    },
-    cwd,
-  );
-
-  const meta = createMetadata(handle.cwd);
-  if (parentId) meta.parentId = parentId;
-  // Seed client-owned initial metadata BEFORE emitListChanged so the
-  // first list snapshot carries these fields (see #642).
-  if (initial?.themeName) meta.themeName = initial.themeName;
-  if (initial?.canvasLayout) meta.canvasLayout = initial.canvasLayout;
-  if (initial?.subPanel) meta.subPanel = initial.subPanel;
-  const entry: TerminalProcess = {
-    info: {
-      id,
-      pid: handle.pid,
-      meta,
-    },
-    handle,
-    stopProviders: () => {},
-  };
-  // Start providers after entry is in the map (providers may emit immediately)
-  registerTerminal(id, entry);
-  entry.stopProviders = startProviders(entry, id);
-
-  tlog.info({ pid: handle.pid, total: listTerminals().length }, "created");
-  emitChanged();
-  emitListChanged();
-  return entry.info;
+  // R-2's `getTerminalBackendForCreate` will read `parentId` to inherit
+  // the parent's location — at that point `localBackend` goes away.
+  return localBackend.spawnPty(id, { cwd, parentId, initialMetadata: initial });
 }
 
-/** Kill a terminal's PTY process and remove it from the map. Returns final info, or undefined if not found. */
-export function killTerminal(id: TerminalId): TerminalInfo | undefined {
-  const entry = getTerminal(id);
-  if (!entry) return undefined;
-
-  log.child({ terminal: id }).info({ pid: entry.handle.pid }, "killing");
-  entry.stopProviders();
-  entry.handle.dispose();
-  cleanupClipboardDir(id);
-  unregisterTerminal(id);
-  emitChanged();
-  emitListChanged();
-  return entry.info;
+/** Kill a terminal. Returns final info, or undefined if not found. Async
+ *  since #951 R4c: the local backend awaits the daemon's kill confirmation
+ *  over the socket before unregistering (so a failed kill can't orphan the
+ *  PTY). */
+export async function killTerminal(
+  id: TerminalId,
+): Promise<TerminalInfo | undefined> {
+  return localBackend.killTerminal(id);
 }
 
 /** Set or clear a terminal's parent relationship. */
@@ -215,15 +133,68 @@ export function setCanvasLayout(
 }
 
 /** Store a terminal's sub-panel state (client-reported).
- *  Same approach: mutate metadata directly, session auto-save only. */
+ *  Publishes via metadata so other clients (and the same client after a
+ *  refresh, via the collection's snapshot read) pick up the change from
+ *  the same channel as every other client-owned metadata field.
+ *
+ *  Equality-gated: the client RPCs this on every drag tick of the
+ *  resizable handle, so without a guard each mouse-move would fan a
+ *  full per-key metadata publish to every connected client. Same shape
+ *  as the `lastAgentCommand` gate inside `LocalTerminalBackend`'s
+ *  agent-command tracker. */
 export function setSubPanelState(
   id: TerminalId,
   state: { collapsed: boolean; panelSize: number },
 ): void {
   const entry = getTerminal(id);
   if (!entry) return;
-  entry.info.meta.subPanel = state;
-  emitChanged();
+  const cur = entry.meta.subPanel;
+  if (
+    cur &&
+    cur.collapsed === state.collapsed &&
+    cur.panelSize === state.panelSize
+  )
+    return;
+  updateClientMetadata(entry, id, (m) => {
+    m.subPanel = state;
+  });
+}
+
+/** Store a terminal's right-panel per-terminal state (client-reported).
+ *  Publishes via metadata so other clients (and the same client after a
+ *  refresh) pick up the change from the same channel as every other
+ *  client-owned metadata field.
+ *
+ *  Equality-gated like `setSubPanelState` — the client RPCs this on
+ *  every file-tree click and tab-toggle, so without a guard each
+ *  interaction would fan a full per-key metadata publish. Deep-compares
+ *  `selectedFileByMode` since the user clicks files often. */
+export function setRightPanelState(
+  id: TerminalId,
+  state: RightPanelPerTerminalState,
+): void {
+  const entry = getTerminal(id);
+  if (!entry) return;
+  const cur = entry.meta.rightPanel;
+  if (cur && rightPanelStateEqual(cur, state)) return;
+  updateClientMetadata(entry, id, (m) => {
+    m.rightPanel = state;
+  });
+}
+
+function rightPanelStateEqual(
+  a: RightPanelPerTerminalState,
+  b: RightPanelPerTerminalState,
+): boolean {
+  if (a.activeTab !== b.activeTab || a.codeMode !== b.codeMode) return false;
+  const am = a.selectedFileByMode;
+  const bm = b.selectedFileByMode;
+  if (am === bm) return true;
+  if (!am || !bm) return false;
+  if (am.local !== bm.local) return false;
+  if (am.branch !== bm.branch) return false;
+  if (am.browse !== bm.browse) return false;
+  return true;
 }
 
 // Active terminal ID — client-reported, used only for session snapshots.
@@ -231,12 +202,12 @@ let activeTerminalId: TerminalId | null = null;
 
 /** Store which terminal is active (reported by the client).
  *  Only emits session:changed when a terminal is actually selected —
- *  null (no selection, e.g. client reconnect) must not trigger auto-save
- *  because snapshotSession() may return an empty terminal list at that
- *  point, which would clear the saved session. */
+ *  null (no selection, e.g. client reconnect) must not trigger
+ *  auto-save because snapshotSession() may return an empty terminal
+ *  list at that point, which would clear the saved session. */
 export function setActiveTerminalId(id: TerminalId | null): void {
   activeTerminalId = id;
-  if (id !== null) emitChanged();
+  if (id !== null) terminalsDirtyChannel.publish({});
 }
 
 /** Set the theme name for a terminal (stored in metadata, published to clients). */
@@ -249,16 +220,19 @@ export function setTerminalTheme(id: TerminalId, themeName: string): void {
   }
 }
 
-/** Kill and remove all terminals. Used by tests to reset server state between scenarios. */
-export function killAllTerminals(): void {
-  // Snapshot entries and clear map BEFORE disposing — prevents onExit
-  // callbacks from finding terminals and triggering session saves.
-  const entries = drainTerminals();
-  log.info({ count: entries.length }, "killing all terminals");
-  for (const entry of entries) {
-    entry.stopProviders();
-    entry.handle.dispose();
-    cleanupClipboardDir(entry.info.id);
-  }
-  emitListChanged();
+/** Set or clear a terminal's freeform intent annotation. Empty string clears. */
+export function setTerminalIntent(id: TerminalId, intent: string): void {
+  const entry = getTerminal(id);
+  if (!entry) return;
+  const next = intent.length > 0 ? intent : undefined;
+  updateClientMetadata(entry, id, (m) => {
+    m.intent = next;
+  });
+}
+
+/** Kill and remove all terminals. Used by tests to reset server state between
+ *  scenarios. Async since #951 R4c (awaits the daemon's killAll over the
+ *  socket before draining the registry). */
+export async function killAllTerminals(): Promise<void> {
+  await localBackend.killAllTerminals();
 }

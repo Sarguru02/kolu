@@ -27,24 +27,36 @@ import {
   runWithOwner,
   Show,
 } from "solid-js";
+import { toast } from "solid-sonner";
 import { match } from "ts-pattern";
-import { SafeClipboardProvider } from "./clipboard";
+import { SafeClipboardProvider, writeTextToClipboard } from "../ui/clipboard";
 import "@xterm/xterm/css/xterm.css";
-import type { TerminalId } from "kolu-common";
+import { streamCall } from "@kolu/surface/solid";
 import { DEFAULT_SCROLLBACK } from "kolu-common/config";
+import type { TerminalId } from "kolu-common/surface";
+import { rejectionFor, sizeRejectionFor } from "kolu-common/upload";
 import { FONT_FAMILY } from "terminal-themes";
-import { matchesAnyShortcut } from "../input/actions";
+import { ACTIONS, matchesAnyShortcut } from "../input/actions";
+import { matchesKeybind } from "../input/keyboard";
 import { createZoom } from "../input/zoom";
 import { refitOnTabVisible } from "../refitOnTabVisible";
-import { client, stream } from "../rpc/rpc";
+import { openInCodeTab } from "../right-panel/openInCodeTab";
+import type { LineRef } from "../ui/lineRef";
 import { isExpectedCleanupError } from "../rpc/streamCleanup";
 import { createScrollLock } from "../scrollLock";
-import { usePreferences } from "../settings/usePreferences";
 import { isTouch } from "../useMobile";
+import { client, preferences } from "../wire";
+import {
+  createFileRefLinkProvider,
+  fileRefAtCell,
+} from "./fileRefLinkProvider";
 import ScrollToBottom from "./ScrollToBottom";
+import { applyStickyModifiers } from "./stickyModifiers";
 import SearchBar from "./SearchBar";
+import { enableSoftKeyboardInput } from "./softKeyboardInput";
 import { registerTerminalRefs, unregisterTerminalRefs } from "./terminalRefs";
 import { registerDiagnostics } from "./useTerminalDiagnostics";
+import { useTerminalStore } from "./useTerminalStore";
 import {
   trackCreate,
   trackDispose,
@@ -134,6 +146,10 @@ function bufferToBase64(buf: ArrayBuffer): string {
   );
 }
 
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 const Terminal: Component<{
   terminalId: TerminalId;
   visible: boolean;
@@ -153,9 +169,10 @@ const Terminal: Component<{
   let containerRef!: HTMLDivElement;
   let terminal: XTerm | null = null;
   let fitAddon: FitAddon | null = null;
+  let linkProviderDisposable: { dispose(): void } | null = null;
   const [searchAddon, setSearchAddon] = createSignal<SearchAddon | null>(null);
-  const { preferences } = usePreferences();
   const scrollLock = createScrollLock(() => preferences().scrollLock);
+  const terminalStore = useTerminalStore();
   let fitRaf = 0;
 
   /** Debounce fit() to one call per animation frame — ResizeObserver fires rapidly. */
@@ -267,6 +284,25 @@ const Terminal: Component<{
     }
   }
 
+  // Selection-driven focus. Desktop raises the keyboard when a tile becomes
+  // active/visible; on touch that's intrusive — the soft keyboard should only
+  // rise from an explicit tap (the wrapper-click and pointerup handlers in
+  // onMount), never as a side-effect of switching/revealing a tile. So this is
+  // a no-op on touch. Real taps still call terminal.focus() directly.
+  function focusOnSelection() {
+    if (!isTouch()) terminal?.focus();
+  }
+
+  // Open a `path:line` reference in the Code tab. Shared by the hover link
+  // provider (desktop mouse click) and the mobile tap handler — both resolve
+  // the same ref against this terminal's repo and route through one front door.
+  function activateFileRef(ref: LineRef) {
+    const meta = terminalStore.getMetadata(props.terminalId);
+    const repoRoot = meta?.git?.repoRoot ?? null;
+    if (!repoRoot) return;
+    openInCodeTab({ ref, repoRoot, cwd: meta?.cwd, targetMode: "browse" });
+  }
+
   // Re-fit and auto-focus when terminal becomes visible (display:none → visible).
   // Only auto-focus if this terminal should have focus (focused prop is true or unset).
   // defer: true skips the initial run (onMount handles first fit + focus).
@@ -278,7 +314,7 @@ const Terminal: Component<{
         scrollLock.reset();
         terminal.scrollToBottom();
         debouncedFit();
-        if (props.focused !== false) terminal.focus();
+        if (props.focused !== false) focusOnSelection();
       },
       { defer: true },
     ),
@@ -290,7 +326,7 @@ const Terminal: Component<{
       () => props.focused,
       (focused) => {
         if (focused && props.visible && terminal) {
-          terminal.focus();
+          focusOnSelection();
         }
       },
       { defer: true },
@@ -317,7 +353,7 @@ const Terminal: Component<{
       () => props.searchOpen,
       (open) => {
         if (!open && props.visible && props.focused !== false && terminal)
-          terminal.focus();
+          focusOnSelection();
       },
       { defer: true },
     ),
@@ -380,6 +416,8 @@ const Terminal: Component<{
     disposeDiagnostics?.();
     disposeDiagnostics = null;
     unloadWebgl();
+    linkProviderDisposable?.dispose();
+    linkProviderDisposable = null;
     terminal?.dispose();
     terminal = null;
     // Null out the other addon slots on this component's Context. xterm
@@ -451,6 +489,13 @@ const Terminal: Component<{
           fitAddon = new FitAddon();
           term.loadAddon(fitAddon);
           term.loadAddon(new WebLinksAddon());
+          // Linkify `path:line[:col][-end]` references in terminal
+          // output. The link provider reads repoRoot from the
+          // terminal store at click time (not at mount) so a cwd
+          // change keeps subsequent clicks anchored to the new repo.
+          linkProviderDisposable = term.registerLinkProvider(
+            createFileRefLinkProvider(term, { onActivate: activateFileRef }),
+          );
           const search = new SearchAddon();
           term.loadAddon(search);
           setSearchAddon(search);
@@ -464,43 +509,113 @@ const Terminal: Component<{
           term.loadAddon(serializeAddon);
 
           term.open(containerRef);
-          // Click-to-focus on the host div: xterm's own click handler covers
-          // the inner canvas, but clicks on the wrapper padding need to focus
-          // too. Attach via addEventListener (not JSX onClick) so the host
-          // div stays free of interactive props that would force a11y roles
-          // — the actual interactive surface is the xterm canvas inside.
-          containerRef.addEventListener("click", () => term.focus());
-          // Mobile: route soft-keyboard input through `.xterm-screen` itself,
-          // the way hterm does (libapps/hterm/js/hterm_scrollport.js:617-655).
-          //
-          // xterm's own hidden helper textarea already has spellcheck/autocorrect
-          // disabled by the library (CoreBrowserTerminal.ts:448-450), but iOS
-          // Safari still runs spell-check against the accumulated `textarea.value`
-          // that `_syncTextArea()` parks at the cursor cell — hence the phantom
-          // underlines. Making the screen element contenteditable gives mobile a
-          // real focus target and lets us opt the whole input surface out of
-          // correction features. `caret-color: transparent` keeps the native
-          // contenteditable caret from fighting xterm's rendered cursor.
-          //
-          // Desktop is left alone — xterm's unmodified mousedown → textarea.focus
-          // path works fine with a hardware keyboard and we don't want to risk
-          // fighting its selection handling.
-          if (isTouch()) {
-            const screen = term.element?.querySelector(
-              ".xterm-screen",
-            ) as HTMLElement | null;
-            if (screen) {
-              screen.setAttribute("contenteditable", "true");
-              screen.setAttribute("spellcheck", "false");
-              screen.setAttribute("autocorrect", "off");
-              screen.setAttribute("autocapitalize", "none");
-              screen.setAttribute("autocomplete", "off");
-              screen.setAttribute("aria-readonly", "true");
-              screen.style.caretColor = "transparent";
-              screen.style.outline = "none";
-            }
+          // Click-to-focus on the host div's own padding only. xterm's own
+          // click handler already focuses canvas clicks on desktop, and on
+          // touch the .xterm-screen pointerup handler below owns that path
+          // (with the iOS gesture-window care a bare click can't replicate).
+          // Scoping to `e.target === containerRef` fires solely for clicks that
+          // landed on the wrapper padding — the one region nothing else covers
+          // — so a tap on the terminal body doesn't double-focus. Attach via
+          // addEventListener (not JSX onClick) so the host div stays free of
+          // interactive props that would force a11y roles.
+          containerRef.addEventListener("click", (e) => {
+            if (e.target === containerRef) term.focus();
+          });
+          // Touch: give the soft keyboard a contenteditable `.xterm-screen`
+          // input surface (xterm's hidden helper textarea triggers iOS
+          // spell-check underlines). Extracted to `softKeyboardInput.ts` so the
+          // xterm shadow-DOM knowledge and the `isTouch()` guard live in one
+          // testable place; returns the prepared screen (null on desktop) onto
+          // which the tap-routing gestures below wire link-activation vs. focus.
+          const screen = enableSoftKeyboardInput(term);
+          if (screen) {
+            // iOS Safari rejects the soft keyboard when focus shuffles
+            // mid-gesture from the contenteditable above to xterm's
+            // opacity-0 helper textarea — which is exactly what happens
+            // when the wrapper-click handler (line 500) fires
+            // term.focus() right after the browser auto-focuses
+            // .xterm-screen on pointerdown. preventDefault on pointerdown
+            // blocks the contenteditable auto-focus.
+            //
+            // Defer the focus call to pointerup, gated on a tap-sized
+            // movement threshold: taps summon the keyboard, touch-scrolls
+            // don't. pointerup still fires inside the user-gesture window
+            // iOS requires for programmatic focus, and the call sees the
+            // same "single focus event, no shuffle" iOS heuristic the
+            // pointerdown variant did. Threshold is generous enough to
+            // tolerate finger jitter on a real tap but tighter than the
+            // ~1-cell-height step the scroll handler at line 716 reads as
+            // "scroll started".
+            const TAP_THRESHOLD_PX = 10;
+            const isTap = (dx: number, dy: number) =>
+              Math.hypot(dx, dy) <= TAP_THRESHOLD_PX;
+            let activeTap: {
+              pointerId: number;
+              startX: number;
+              startY: number;
+            } | null = null;
+            // Map a tap point to the `path:line` reference under it, if any.
+            // Reads the screen's `getBoundingClientRect()` to convert the
+            // viewport pixel into a (col, buffer-line) cell — both axes plus
+            // the rect offsets, since a tap is 2D (the touch-scroll handler
+            // below needs only `clientHeight`, one dimension, so the two
+            // don't share a geometry helper). Then hit-tests the link parser.
+            const fileRefAtPoint = (
+              clientX: number,
+              clientY: number,
+            ): LineRef | null => {
+              if (!terminal) return null;
+              const rect = screen.getBoundingClientRect();
+              const cellW = rect.width / terminal.cols;
+              const cellH = rect.height / terminal.rows;
+              if (
+                !Number.isFinite(cellW) ||
+                cellW <= 0 ||
+                !Number.isFinite(cellH) ||
+                cellH <= 0
+              )
+                return null;
+              const col = Math.floor((clientX - rect.left) / cellW);
+              const row = Math.floor((clientY - rect.top) / cellH);
+              const bufferLine = terminal.buffer.active.viewportY + row;
+              return fileRefAtCell(terminal, col, bufferLine);
+            };
+            makeEventListener(screen, "pointerdown", (e: PointerEvent) => {
+              e.preventDefault();
+              activeTap = {
+                pointerId: e.pointerId,
+                startX: e.clientX,
+                startY: e.clientY,
+              };
+            });
+            makeEventListener(screen, "pointerup", (e: PointerEvent) => {
+              if (activeTap === null || e.pointerId !== activeTap.pointerId)
+                return;
+              const { startX, startY } = activeTap;
+              activeTap = null;
+              if (!isTap(e.clientX - startX, e.clientY - startY)) return;
+              // What the tap does decides whether the keyboard rises: a tap on
+              // a `path:line` reference follows the link into the Code tab
+              // (xterm's own link activation is mouse/hover-only and never
+              // fires for touch), a tap on plain content focuses to type.
+              // Only the latter summons the soft keyboard.
+              const ref = fileRefAtPoint(e.clientX, e.clientY);
+              if (ref) {
+                activateFileRef(ref);
+                return;
+              }
+              term.focus();
+            });
+            makeEventListener(screen, "pointercancel", (e: PointerEvent) => {
+              if (activeTap?.pointerId === e.pointerId) activeTap = null;
+            });
           }
-          // Expose for e2e tests: read buffer content at viewport position.
+          // Kolu-owned bridge consumed by e2e step definitions —
+          // `support/buffer.ts`, `step_definitions/file_ref_link_steps.ts`,
+          // and friends read `container.__xterm` to drive xterm's
+          // public API (buffer reads, cell-to-pixel math). Removing
+          // this assignment silently breaks every cucumber test that
+          // touches terminal contents.
           (containerRef as HTMLDivElement & { __xterm?: XTerm }).__xterm = term;
           // Production path for handlers that need live xterm/addon refs
           // (e.g. export-as-PDF reads serializeAddon).
@@ -540,6 +655,26 @@ const Terminal: Component<{
             // paste listener uploads images; xterm's own paste handler covers text.
             if (e.ctrlKey && e.key === "v") return false;
 
+            // Ctrl+Shift+C — Linux/Windows terminal copy chord. Without
+            // preventDefault, Chromium hijacks the chord to open DevTools'
+            // Inspect Element picker. xterm's selection isn't reflected in
+            // the textarea either, so we copy via getSelection() ourselves.
+            // Must come before the matchesAnyShortcut check below, since
+            // copySelection is registered there for ShortcutsHelp visibility
+            // but dispatched here.
+            if (matchesKeybind(e, ACTIONS.copySelection.keybind)) {
+              e.preventDefault();
+              const selection = term.getSelection();
+              if (selection)
+                writeTextToClipboard(selection)
+                  .then(() => toast.success("Copied selection to clipboard"))
+                  .catch((err: Error) => {
+                    console.error("Failed to copy selection:", err);
+                    toast.error(`Failed to copy selection: ${err.message}`);
+                  });
+              return false;
+            }
+
             // Let any registered app shortcut bubble through to the capture-phase dispatcher
             if (matchesAnyShortcut(e)) return false;
 
@@ -558,7 +693,7 @@ const Terminal: Component<{
           // at which point the visibility effect below calls debouncedFit().
           if (props.visible) {
             fitAddon.fit();
-            if (props.focused !== false) term.focus();
+            if (props.focused !== false) focusOnSelection();
           }
 
           // Track user-initiated focus for "remember last focused" in sub-panel
@@ -574,13 +709,17 @@ const Terminal: Component<{
           // (a fresh screenState snapshot) — otherwise it double-paints.
           consumeStream(
             () =>
-              stream.attach(props.terminalId, {
-                signal,
-                onRetry: () => {
-                  terminal?.reset();
-                  scrollLock.reset();
+              streamCall(
+                client.terminal.attach,
+                { id: props.terminalId },
+                {
+                  signal,
+                  onRetry: () => {
+                    terminal?.reset();
+                    scrollLock.reset();
+                  },
                 },
-              }),
+              ),
             (data) => {
               if (terminal) scrollLock.writeData(terminal, data);
             },
@@ -600,7 +739,12 @@ const Terminal: Component<{
           const csiResponse = /\x1b\[[?>=]?[\d;]*[cnRy]/; // DA1/DA2/DSR/CPR/DECRPM
           term.onData((data: string) => {
             if (csiResponse.test(data) || data.startsWith("\x1b]")) return;
-            void client.terminal.sendInput({ id: props.terminalId, data });
+            // Fold any sticky Ctrl/Alt armed on the mobile key bar into this
+            // keystroke (no-op on desktop, where nothing is ever armed).
+            void client.terminal.sendInput({
+              id: props.terminalId,
+              data: applyStickyModifiers(data),
+            });
           });
 
           createResizeObserver(
@@ -684,14 +828,19 @@ const Terminal: Component<{
           // paste event (not navigator.clipboard.read) so no explicit
           // clipboard-read permission is needed.
           async function uploadPastedImage(file: File) {
-            const base64 = bufferToBase64(await file.arrayBuffer());
+            const reason = sizeRejectionFor("clipboard image", file.size);
+            if (reason !== null) {
+              toast.error(reason);
+              return;
+            }
             try {
+              const base64 = bufferToBase64(await file.arrayBuffer());
               await client.terminal.pasteImage({
                 id: props.terminalId,
                 data: base64,
               });
             } catch (err) {
-              console.error("Failed to upload clipboard image:", err);
+              toast.error(`Failed to upload clipboard image: ${errMsg(err)}`);
             }
           }
 
@@ -716,6 +865,58 @@ const Terminal: Component<{
             },
             { capture: true },
           );
+
+          // Drag-and-drop file upload. Files dropped on the terminal are
+          // uploaded to the server, which saves them under the terminal's
+          // clipboard directory and bracketed-pastes the path into the PTY
+          // — the same shape as Ctrl+V image paste, just sourced from
+          // DataTransfer instead of ClipboardData.
+          async function uploadDroppedFile(file: File) {
+            const reason = rejectionFor(file.name, file.size);
+            if (reason !== null) {
+              toast.error(reason);
+              return;
+            }
+            try {
+              const base64 = bufferToBase64(await file.arrayBuffer());
+              await client.terminal.uploadFile({
+                id: props.terminalId,
+                name: file.name,
+                data: base64,
+              });
+            } catch (err) {
+              toast.error(`Failed to upload "${file.name}": ${errMsg(err)}`);
+            }
+          }
+
+          makeEventListener(containerRef, "dragover", (e: DragEvent) => {
+            // Only react when the drag carries files — text/HTML drags
+            // belong to the browser / xterm.
+            if (!e.dataTransfer?.types.includes("Files")) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "copy";
+            containerRef.dataset.dropTarget = "";
+          });
+          makeEventListener(containerRef, "dragleave", (e: DragEvent) => {
+            // dragleave fires when the cursor crosses any child element
+            // boundary too; gate on relatedTarget leaving the container so
+            // the highlight doesn't flicker mid-drag.
+            const next = e.relatedTarget as Node | null;
+            if (next && containerRef.contains(next)) return;
+            delete containerRef.dataset.dropTarget;
+          });
+          makeEventListener(containerRef, "drop", (e: DragEvent) => {
+            const files = e.dataTransfer?.files;
+            if (!files || files.length === 0) return;
+            // Prevent browser navigation (default action when dropping a file
+            // onto a page). Must come after the guard: only cancel drops we
+            // actually handle so text/HTML drags fall through unimpeded.
+            e.preventDefault();
+            delete containerRef.dataset.dropTarget;
+            for (const file of files) {
+              void uploadDroppedFile(file);
+            }
+          });
 
           // Cleanup is registered synchronously near the top of the component body
           // (see comment there). It references `terminal`, `webgl`, and the local
@@ -744,13 +945,19 @@ const Terminal: Component<{
         active={scrollLock.hasNewOutput()}
         onClick={() => {
           if (terminal) scrollLock.scrollToBottom(terminal);
-          terminal?.focus();
+          // focusOnSelection is a no-op on touch: tapping the scroll-to-bottom
+          // FAB to catch up on output must not summon the soft keyboard (only
+          // an explicit tap on the terminal does). Desktop still refocuses so
+          // the user can keep typing.
+          focusOnSelection();
         }}
       />
       <div
         ref={containerRef}
-        // touch-manipulation: eliminate 300ms tap delay and prevent double-tap-to-zoom on mobile
-        class="w-full h-full overflow-hidden touch-manipulation"
+        // touch-manipulation: eliminate 300ms tap delay and prevent double-tap-to-zoom on mobile.
+        // data-[drop-target]: inset ring while a file drag is hovering — set/cleared by the
+        // dragover/drop/dragleave listeners in onMount.
+        class="w-full h-full overflow-hidden touch-manipulation data-[drop-target]:outline data-[drop-target]:outline-2 data-[drop-target]:-outline-offset-2 data-[drop-target]:outline-sky-400/70"
         data-terminal-id={props.terminalId}
         data-visible={props.visible ? "" : undefined}
         data-focused={props.focused !== false ? "" : undefined}

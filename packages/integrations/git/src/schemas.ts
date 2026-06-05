@@ -16,8 +16,23 @@ export const GitInfoSchema = z.object({
 
 // --- Git worktree operations ---
 
+/** Worktree branch name. Catches the common ref-name violations so the
+ *  toast says what's actually wrong instead of git's opaque "fatal: not
+ *  a valid branch name". Obscure cases (`@{`, `.lock` suffix, leading
+ *  slash) still fall through to git's own check. Exported so the client
+ *  can run the same predicate live in the worktree-naming palette leaf
+ *  — single source of truth for the rule. */
+export const WorktreeNameSchema = z
+  .string()
+  .min(1)
+  .refine((s) => !/[\s~^:?*[\\]/.test(s) && !s.includes(".."), {
+    message:
+      "branch name cannot contain whitespace, '..', or any of: ~ ^ : ? * [ \\",
+  });
+
 export const WorktreeCreateInputSchema = z.object({
   repoPath: z.string(),
+  name: WorktreeNameSchema,
 });
 
 export const WorktreeCreateOutputSchema = z.object({
@@ -103,7 +118,11 @@ export const GitDiffInputSchema = z.object({
  *  `oldFileName` / `newFileName` are null when the file doesn't exist on
  *  that side of the diff (added file → oldFileName null; deleted file →
  *  newFileName null). The renderer uses the pair to spot pure renames
- *  (no hunks but both names set and different). */
+ *  (no hunks but both names set and different).
+ *
+ *  Classification flags (`binary`, …) gate the client to a placeholder
+ *  instead of the renderer. Detection lives in `parseRawDiffFlags`
+ *  (`review.ts`) — not in the client. */
 export const GitDiffOutputSchema = z.object({
   oldFileName: z.string().nullable(),
   newFileName: z.string().nullable(),
@@ -111,6 +130,11 @@ export const GitDiffOutputSchema = z.object({
    *  header block (i.e. passthrough of `git diff` output), not a bare hunk
    *  body. Currently always zero or one element — a single per-file patch. */
   hunks: z.array(z.string()),
+  /** True when git classified the file as binary (NUL bytes in the first
+   *  8KB). Binary files yield no `@@` hunks — git emits a single
+   *  `Binary files a/x and b/x differ` line — so the client renders a
+   *  "Binary file — not displayable" placeholder instead of an empty pane. */
+  binary: z.boolean(),
 });
 export type GitDiffOutput = z.infer<typeof GitDiffOutputSchema>;
 
@@ -128,17 +152,37 @@ export const FsListAllOutputSchema = z.object({
 export type FsListAllOutput = z.infer<typeof FsListAllOutputSchema>;
 
 export const FsReadFileInputSchema = z.object({
+  /** Terminal that owns the URL handle for `kind: "binary"` outputs.
+   *  Text reads ignore this — the field is on the input because the URL
+   *  shape (`/api/terminals/<id>/file/...`) is constructed server-side
+   *  from this id, so the client doesn't have to know the route layout. */
+  terminalId: z.string().uuid(),
   /** Absolute path to the repo root. */
   repoPath: z.string(),
   /** Path relative to repo root. */
   filePath: z.string(),
 });
 
-export const FsReadFileOutputSchema = z.object({
-  content: z.string(),
-  /** True if the file exceeded the size limit and was truncated. */
-  truncated: z.boolean(),
-});
+/** Discriminated by `kind`. Text files yield their content; binary-
+ *  previewable files yield a cache-busted URL the client points an
+ *  `<iframe>` (documents) or `<img>` (raster images) at. The variant-picker
+ *  (`isBinaryPreviewable`) lives in the node-free `kolu-common/preview`
+ *  classifier; the URL builder lives server-side in `iframePreviewRoute.ts`. */
+export const FsReadFileOutputSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("text"),
+    content: z.string(),
+    /** True if the file exceeded the size limit and was truncated. */
+    truncated: z.boolean(),
+  }),
+  z.object({
+    kind: z.literal("binary"),
+    /** Server-constructed URL for the iframe `src`. Includes a `?v=<mtime>`
+     *  query so the stream re-yield on file change produces a new URL and
+     *  the iframe reloads via the same subscription path. */
+    url: z.string(),
+  }),
+]);
 export type FsReadFileOutput = z.infer<typeof FsReadFileOutputSchema>;
 
 // --- Derived types ---

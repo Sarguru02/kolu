@@ -19,9 +19,9 @@ import {
   getLatestAssistantContextTokens,
   getSessionTaskProgress,
   getSessionTitle,
-  hasRunningTools,
   type OpenCodeSession,
   openDb,
+  runningToolsBucket,
 } from "./core.ts";
 import type { OpenCodeInfo } from "./schemas.ts";
 import { subscribeOpenCodeDb } from "./wal-watcher.ts";
@@ -59,22 +59,21 @@ export function createOpenCodeWatcher(
   function refresh(db: DatabaseSync): OpenCodeInfo | null {
     const derived = deriveSessionState(session.id, log, db);
     if (!derived) {
-      log?.debug(
-        { session: session.id },
-        "no messages yet for opencode session",
-      );
+      // deriveSessionState already logged the precise cause — a debug
+      // "no messages yet" for an empty session, or an error for a malformed
+      // latest row. Don't flatten both back into one ambiguous line here.
       return null;
     }
 
     // When the assistant is actively generating (state === "thinking"),
-    // check whether the current message has any tool parts in the
-    // "running" state to distinguish tool execution from LLM generation.
-    // Scoped to derived.messageId (the latest message) — not the entire
-    // session — so we only scan the handful of current-turn parts.
+    // classify the current message's running tool parts to distinguish
+    // tool execution from LLM generation — and within tool execution,
+    // separate "blocked on user question" from real compute. Scoped to
+    // derived.messageId (the latest message) — not the entire session —
+    // so we only scan the handful of current-turn parts.
     const state =
-      derived.state === "thinking" &&
-      hasRunningTools(derived.messageId, log, db)
-        ? ("tool_use" as const)
+      derived.state === "thinking"
+        ? (runningToolsBucket(derived.messageId, log, db) ?? derived.state)
         : derived.state;
 
     const taskProgress = getSessionTaskProgress(session.id, log, db);

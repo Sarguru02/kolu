@@ -71,12 +71,43 @@ export const pierreTreesStyle: JSX.CSSProperties = {
   "--trees-density-override": "0.85",
 };
 
-/** Apply to any `@pierre/diffs` FileDiff / File host.
+/** Injected into Pierre's shadow root via `<FileTree shadowCss>`. Pierre marks
+ *  every ancestor of a changed file with `data-item-contains-git-change` but
+ *  only paints a half-opacity dot in the git lane (`[data-item-section='git']`)
+ *  — it exposes no theme variable to tint the folder itself. This rule colors
+ *  the folder's name (`[data-item-section='content']`) and brightens its dot
+ *  with the same modified color the dot already uses, so a changed subtree
+ *  reads at a glance, the way changed files do. Pierre exposes only a boolean
+ *  roll-up (no aggregate status), so every contained-change folder reads in the
+ *  one modified color regardless of whether the change underneath was an add or
+ *  a delete — matching Pierre's own dot. */
+export const pierreTreesShadowCss = `
+  [data-item-contains-git-change='true'] > [data-item-section='content'] {
+    color: var(--trees-git-modified-color);
+  }
+  [data-item-contains-git-change='true'] > [data-item-section='git'] {
+    opacity: 1;
+  }
+`;
+
+/** Rendered code-row height (px) for Pierre `CodeView` hosts. It drives both
+ *  the CSS row height (`--diffs-line-height` below) and the numeric metric
+ *  Pierre's virtualizer needs (`itemMetrics.lineHeight`, via the wrapper's
+ *  `lineHeight` prop). These two MUST agree — if the metric defaults to
+ *  Pierre's 20px while rows render at this value, the virtualizer's window
+ *  comes up short and the last rows are unreachable at the bottom of the
+ *  scroll (#1026). Module-private: both halves ship together through
+ *  `koluCodeViewProps()` so a call site can't supply one without the other. */
+const PIERRE_DIFFS_LINE_HEIGHT = 16;
+
+/** CSS custom properties for a `@pierre/diffs` `CodeView` host. Module-private
+ *  — callers reach it (paired with the matching line-height metric) through
+ *  `koluCodeViewProps()`, never on its own.
  *
  *  Pierre's diffs CSS reads bare variables (`--diffs-font-size`) for fonts and
  *  `-override` suffix for colors — see `@pierre/diffs/src/style.css`. Don't
  *  rename the font vars: they won't cascade if you add `-override`. */
-export const pierreDiffsStyle: JSX.CSSProperties = {
+const pierreDiffsStyle: JSX.CSSProperties = {
   "--diffs-bg-override": "var(--color-surface-0)",
   "--diffs-fg-override": "var(--color-fg)",
   "--diffs-border-color-override": "var(--color-edge)",
@@ -87,5 +118,16 @@ export const pierreDiffsStyle: JSX.CSSProperties = {
   "--diffs-header-font-family":
     "var(--font-sans), ui-sans-serif, system-ui, sans-serif",
   "--diffs-font-size": "11px",
-  "--diffs-line-height": "16px",
+  "--diffs-line-height": `${PIERRE_DIFFS_LINE_HEIGHT}px`,
 };
+
+/** Presentation props every Kolu `<CodeView>` host must carry: the diffs CSS
+ *  vars AND the matching `lineHeight` virtualizer metric, as one inseparable
+ *  unit. Spread at the call site — `<CodeView {...koluCodeViewProps()} … />` —
+ *  so the two halves of the row-height invariant can't drift or be supplied
+ *  apart (the #1026 failure mode: style without a matching metric clips the
+ *  last rows). */
+export const koluCodeViewProps = () => ({
+  style: pierreDiffsStyle,
+  lineHeight: PIERRE_DIFFS_LINE_HEIGHT,
+});

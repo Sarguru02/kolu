@@ -16,44 +16,104 @@ Invoke the `/test` skill. It selects relevant `.feature` files from the git diff
 
 ## CI command
 
-Invoke the `/ci` skill. It runs `just ci` via the Monitor tool and cross-checks posted GitHub commit statuses against `just ci::_contexts` so missing steps can't silently pass.
+Use the `/ci` skill for the runner mechanics (subcommands, flags, modes, retry shape). Two Kolu-specific operational notes layered on top of it:
+
+**Ephemeral linux build host per run.** Static darwin (`sincereintent`) lives in `~/.config/justci/hosts.json`; the linux lane uses a throwaway Incus container per CI invocation so prior runs' nix-store cruft can't poison the verdict. (Box lifecycle — create/connect/destroy, the no-egress retry — is the [`pu`](../.apm/skills/pu/SKILL.md) skill.) [`ci/pu-ci-host.sh`](../ci/pu-ci-host.sh) provisions that host: it **forks the warm golden box** (`kolu-ci-golden`) so the lane starts with a hot Nix store — `ci::nix` ~20s instead of the ~180s a cold box spends re-realising the closure from the substituter (juspay/kolu#1173, and that cold pull also degrades badly when several PRs run at once). It falls back to a cold `pu create`, then to `hosts.json`, so a missing/cold/slow golden never blocks the run. It prints the host name, or nothing — in which case drop `--host` and let justci resolve the linux lane from `hosts.json`.
+
+```sh
+pr=$(gh pr view --json number --jq .number)
+host=$(ci/pu-ci-host.sh "kolu-pr-$pr")                                                   # warm fork → cold create → (empty)
+if [ -n "$host" ]; then
+  nix run github:juspay/justci -- run --progress json --host x86_64-linux="$host"           # --host wins over hosts.json on collision; darwin keeps using sincereintent
+  pu destroy "$host"
+else                                                                                    # provisioning failed entirely (e.g. no-egress) — let hosts.json resolve the linux lane
+  nix run github:juspay/justci -- run --progress json
+fi
+```
+
+**Keep the golden box warm.** `kolu-ci-golden` is a long-lived `pu` box whose Nix store is kept hot by periodically running the linux lane on it against `master` (e.g. after a merge): `nix run github:juspay/justci -- run --no-post --platform x86_64-linux --host x86_64-linux=kolu-ci-golden`. A fork inherits whatever is warm; the dependency closure (the bulk of `ci::nix`) stays valid across commits, so even a golden a few commits behind still gives most of the win. Create it once with `pu create kolu-ci-golden`. See [`docs/pu-box-ci-ralph-report.md`](../docs/pu-box-ci-ralph-report.md) for the measurements and the two `pu fork` bugs the script works around.
+
+**Live failure surfacing — consume the `--progress json` stream.** The CI step runs in the background (the `/do` skill backgrounds it), and `--progress json` makes the runner emit one NDJSON line to stdout per node transition the instant process-compose reports it: `{node, recipe, platform, status, exit_code?, log?}` with `status ∈ running|success|failed|skipped|errored`. **Don't wait for the run to finish, and don't poll `gh pr checks` in a loop.** Tail the backgrounded output and react the moment a node turns `failed`/`errored` — while sibling lanes are still running:
+
+```sh
+# Against the backgrounded CI output (the /do skill's task output file):
+grep -o '{.*}' "$ci_output" | jq -c 'select(.status=="failed" or .status=="errored")'
+# → {"node":"biome@x86_64-linux","recipe":"biome","platform":"x86_64-linux","status":"failed","exit_code":1,"log":".ci/<sha>/x86_64-linux/biome.log"}
+```
+
+The instant such a line appears, read its `log` path (`.ci/<sha>/<platform>/<recipe>.log`) to diagnose — the failing recipe's full output is already on disk before the other lanes finish. Extract JSON objects (`grep -o '{.*}'`) rather than matching line starts: process-compose shares the inherited stdout and emits its own `[<recipe>@<platform>]` log lines plus an xterm title escape that can prefix the very first JSON line. Begin the fix → fmt → commit → retry-CI loop as soon as you have a confirmed failure; you needn't let the rest of the pipeline drain first. (`gh pr checks` / `justci protect --dry-run` remain the source of truth for the *final* green-gate below — the stream is for reacting fast, the checks are for confirming done.) The `CI=true` prefix is gone: justci is strict by default now, and the var is a harmless no-op.
+
+**`pu` misbehaves → comment on the PR with full diagnostics.** Whenever `pu` fails to do its job — `create` errors out, a box lands with no egress (`nix run` hangs on "Resolving timed out"), retries keep landing on dead hosts, or `connect`/`destroy` misbehaves — don't just silently fall back. Post a PR comment so the `pu`/Incus admin can fix the underlying host permanently instead of every run papering over it. Gather everything the admin needs to pin the bad physical host, then drop `--host` and continue per the fallback above (a diagnostic comment must never block the run).
+
+```sh
+# $host is the box name; $stage is the pu subcommand that misbehaved (create|connect|destroy|egress)
+{
+  echo "## ⚠️ \`pu\` misbehaved — Incus admin attention needed"
+  echo
+  echo "- **PR:** #$pr &nbsp; **branch:** \`$(git rev-parse --abbrev-ref HEAD)\` &nbsp; **commit:** \`$(git rev-parse --short HEAD)\`"
+  echo "- **Stage:** \`pu $stage\` &nbsp; **box:** \`$host\` &nbsp; **when:** $(date -u +%FT%TZ)"
+  echo
+  echo "**Box placement (\`pu list\` — NAME + physical LOCATION that needs fixing):**"
+  echo '```'; pu list 2>&1 | grep -E "NAME|$host"; echo '```'
+  echo "**\`pu $stage\` stderr:**"
+  echo '```'; cat /tmp/pu-$host.err 2>/dev/null; echo '```'
+  # Box-side network state — only if the box came up enough to SSH into
+  echo "**Box network state (resolv.conf / routes / egress / gateway TCP):**"
+  echo '```'
+  pu connect "$host" -- '
+    echo "== /etc/resolv.conf =="; cat /etc/resolv.conf
+    echo "== ip route ==";        ip route
+    echo "== egress probe ==";    timeout 15 curl -sS -o /dev/null -w "https HTTP %{http_code}\n" https://api.github.com || echo "egress FAILED"
+    echo "== gateway TCP ==";     gw=$(ip route | awk "/default/{print \$3; exit}"); timeout 5 bash -c "echo > /dev/tcp/$gw/443" && echo "gw $gw:443 ok" || echo "gw $gw:443 FAILED"
+  ' 2>&1
+  echo '```'
+} | gh pr comment "$pr" --body-file -
+```
+
+To capture each stage's stderr for the excerpt above, tee it when you invoke `pu` — e.g. `pu create "$host" 2> >(tee /tmp/pu-$host.err >&2)`.
+
+**Flake → comment on [#320](https://github.com/juspay/kolu/issues/320)** with scenario/platform/error excerpt/PR.
+
+**Evidence required → all GitHub status checks green per `justci protect`.** `/do` is done only when every required status check is green on the PR's current `HEAD`. Source the required list from `justci protect --dry-run` — it prints the `<recipe>@<platform>` contexts the canonical DAG produces, which are exactly the contexts branch protection gates on. Verify with `gh pr checks`; a green from a positional retry counts (final state matters).
 
 ## Documentation
 
-Keep `README.md` in sync with user-facing changes.
+Keep these docs in sync:
+
+- **`README.md`** (top-level) — user-facing changes, architecture prose, transport-resilience description.
+- **`packages/surface/README.md`** — the `@kolu/surface` framework reference. The "How Kolu uses this framework" section is a concrete inventory of every cell, collection, and stream descriptor plus the raw-oRPC procedures that stay outside the framework. Update it whenever a new descriptor lands or whenever a contract entry's classification changes (added mutation, retired stream, …).
+- **`website/src/pages/index.astro`** — the kolu.dev marketing page. Its hero terminal + canvas-strip mockups (dock cards, split tile with `claude` + `just test`, codex apply_patch tile, opencode planning tile, Code-tab tree + preview) approximate the running Kolu app. When a user-facing surface changes shape — a new dock-row affordance, a renamed agent integration, a different split layout, a new chip state, a new Code-tab tab, a new theme name worth name-dropping — refresh the mockup so the marketing visual doesn't drift from the product. Drive the running app via `chrome-devtools` MCP if you want a reference screenshot to model from (`just dev-auto` boots Kolu on two free ports with HMR and prints the client URL).
 
 ## PR evidence
 
-When the change has visible UI impact, post a `## Evidence` PR comment with screenshots. Use judgment — server-only diffs sometimes ripple into rendering.
+Post a `## Evidence` PR comment when **any** of these holds — the trigger is "is there behavior worth proving?", not "does a pixel change?":
 
-**Delegate to a subagent** (`Agent(subagent_type="general-purpose", model="sonnet")`) so the main context stays clear of MCP and screenshot noise. Brief it with: the dev-server URL, what scenarios to capture, a `/tmp/kolu-evidence-<slug>.png` filename, and the PR number. Have it return only the markdown body it posted.
+1. **Visible UI impact** — capture screenshots, or **video** when the change is about motion (an animation, a transition, a multi-step interaction a still can't convey). Use judgment — server-only diffs sometimes ripple into rendering.
+2. **Behavioral / round-trip changes** — the diff touches a persistence, restore, session, autosave, debounce/coalesce, or reconnect path, and the proof is *"state survives an interaction or a restart,"* not a pixel change. Capture the before→after **behavior** — often with **zero visual diff** (e.g. resize → stop kolu → start → restore session → the panel returns at the resized width). A video of the round-trip is the proof the fix didn't break recoverability.
+3. **Bug fixes generally** — the default for a fix is *"demonstrate the fixed behavior."* The bug was often a storm, a lost write, or a hang, so a before/after or survives-restart clip is the evidence **even when nothing looks different**. Don't skip evidence just because a fix has no visual diff; skip only when the behavior genuinely can't be observed (e.g. a pure internal refactor with no externally visible effect).
 
-### Dev server
-
-Spawn a dedicated dev server on a **free random port** (the user may have one on 5173 already). Hold the port number in a shell variable for the subagent and kill the process at the end:
-
-```sh
-PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); p=s.getsockname()[1]; s.close(); print(p)')
-# Override the client port — read packages/client/vite.config.ts and the
-# `client`/`dev` recipes to find the right flag/env (e.g. `pnpm dev -- --port $PORT`).
-just dev &  # adjusted for the port override
-DEV_PID=$!
-trap 'kill $DEV_PID 2>/dev/null' EXIT
-```
-
-For bug fixes that need a "before" shot, run a second server from a `git worktree` on `master` (different free port). Never stash the PR branch.
-
-### Capture, host, post
-
-The subagent drives `chrome-devtools` MCP — `new_page` at `http://localhost:$PORT/`, reproduces the relevant state, `take_screenshot` to `/tmp/kolu-evidence-<slug>.png`.
-
-`gh pr comment` can't attach binaries, so upload to a long-lived `evidence-assets` GitHub release and embed the download URL inline:
+**Capture by recording an e2e scenario — the [`evidence`](../.apm/skills/evidence/SKILL.md) skill owns the procedure** (it builds on the [`pu`](../.apm/skills/pu/SKILL.md) skill; everything runs on an ephemeral `pu` box, off-machine, the way CI runs e2e). Kolu's e2e suite (`@cucumber/cucumber` + Playwright) already drives every UI surface through a maintained step library, so you capture a clip by *recording a scenario* — selected **by name**, with no edit to the feature file — never a hand-rolled Playwright script. Pick the scenario that exercises the change (or author a tiny one reusing existing steps); on the box the skill runs it with `KOLU_EVIDENCE=1`, which makes `packages/tests/support/hooks.ts` record the `.webm` (recordVideo + slowMo, animations left on), then transcodes (ffmpeg → GIF/mp4), uploads to the `evidence-assets` release, and links the shared Pages player.
 
 ```sh
-gh release view evidence-assets >/dev/null 2>&1 || \
-  gh release create evidence-assets --prerelease \
-    --title "Evidence assets (auto-uploaded by /do)" --notes "Do not delete."
-gh release upload evidence-assets /tmp/kolu-evidence-<slug>.png --clobber
+KOLU_EVIDENCE=1 just test-quick features/<file>.feature --name "<scenario name>"
+# → packages/tests/reports/videos/<scenario>.webm
 ```
 
-URL pattern: `https://github.com/juspay/kolu/releases/download/evidence-assets/<filename>`. Use the single-quoted heredoc pattern (`<<'EOF'`) when posting so backticks and `$` survive unescaped.
+Rationale + the ecosystem survey: [`docs/atlas/src/content/atlas/video-evidence.mdx`](../docs/atlas/src/content/atlas/video-evidence.mdx).
+
+### Agent-state scenarios
+
+When the change touches the Dock, terminal, or any UI surface that reflects agent activity, the capture has to show real states — a blank Dock proves nothing. Kolu's opencode integration is first-class: have the scenario you're recording open a terminal and run opencode in it (an `I run "…"` step); the preexec hook surfaces state in the Dock within ~300ms (states: `thinking`, `tool_use`, `awaiting_user`, `waiting`; bucketed in the Dock as `working ▸`, `awaiting ⏵`, `idle ☾`).
+
+```sh
+# Inside a Kolu terminal on the box — no global install needed
+nix run github:juspay/AI#opencode
+```
+
+Drive distinct states by prompt:
+
+- **thinking / tool_use** (`working ▸`, pulsing border) — send a reasoning- or tool-heavy prompt (`explain the architecture of this repo`, `list every file in src/`); capture during the spinner.
+- **awaiting_user** (`awaiting ⏵`, breathing border) — request an action that needs confirmation (e.g. an edit opencode wants to apply).
+- **waiting / idle** (`idle ☾`) — let the reply finish; the row drops to the idle bucket.
+
+For PRs whose changes affect one state, a single representative capture is fine; capture each when the change spans multiple. The default evidence for any Dock-touching change is **a screenshot of the Dock showing an agent state with a visible opencode reply** — that single frame proves the pipeline (terminal → provider → Dock) is alive end-to-end.

@@ -9,7 +9,7 @@
  *  as props because they are state setters whose ownership belongs at the
  *  orchestration layer. Extracted from App.tsx per kolu#626. */
 
-import type { TerminalId } from "kolu-common";
+import type { TerminalId } from "kolu-common/surface";
 import { type Component, Show } from "solid-js";
 import { useRightPanel } from "../right-panel/useRightPanel";
 import { CONTEXTUAL_TIPS } from "../settings/tips";
@@ -28,7 +28,7 @@ const TILE_BUTTON_CLASS =
 
 const TileTitleActions: Component<{
   id: TerminalId;
-  /** Open the command palette at a specific group (e.g. "Theme"). */
+  /** Open the command palette at a specific group (e.g. "Set theme"). */
   onOpenPaletteGroup: (group: string) => void;
   /** Toggle the sub-panel for the given parent — App owns this because it
    *  has to bridge to `crud.handleCreateSubTerminal` when no splits exist. */
@@ -47,7 +47,7 @@ const TileTitleActions: Component<{
   const meta = () => store.getMetadata(props.id);
   const themeName = () =>
     store.activeId() === props.id ? activeThemeName() : meta()?.themeName;
-  const subCount = () => store.getSubTerminalIds(props.id).length;
+  const subCount = () => store.getDisplayInfo(props.id)?.subCount ?? 0;
   const splitExpanded = () =>
     subCount() > 0 && !subPanel.getSubPanel(props.id).collapsed;
 
@@ -61,8 +61,8 @@ const TileTitleActions: Component<{
             onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => {
               e.stopPropagation();
-              store.setActiveId(props.id);
-              rightPanel.expandPanel();
+              store.setActiveSilently(props.id);
+              rightPanel.reveal();
             }}
             title="Open inspector"
           >
@@ -81,8 +81,8 @@ const TileTitleActions: Component<{
               onPointerDown={(e) => e.stopPropagation()}
               onClick={(e) => {
                 e.stopPropagation();
-                store.setActiveId(props.id);
-                props.onOpenPaletteGroup("Theme");
+                store.setActiveSilently(props.id);
+                props.onOpenPaletteGroup("Set theme");
                 setTimeout(
                   () => showTipOnce(CONTEXTUAL_TIPS.themeFromPalette),
                   500,
@@ -104,7 +104,7 @@ const TileTitleActions: Component<{
           onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             e.stopPropagation();
-            store.setActiveId(props.id);
+            store.setActiveSilently(props.id);
             props.onToggleSubPanel(props.id);
           }}
           aria-label="Toggle split"
@@ -129,7 +129,7 @@ const TileTitleActions: Component<{
           onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             e.stopPropagation();
-            store.setActiveId(props.id);
+            store.setActiveSilently(props.id);
             props.onOpenSearch();
           }}
           aria-label="Find in terminal"

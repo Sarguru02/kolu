@@ -2,15 +2,37 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { simpleGit } from "simple-git";
+
+/** Tests in this file that gate on `fs.watch` event delivery are
+ *  unreliable on darwin — FSEvents coalesces and can take >12s to
+ *  deliver a single change under contention. The dispatcher logic
+ *  itself (snapshot + try/catch per listener, in
+ *  `kolu-io/refcounted-dir-watcher.ts:96-106`) is verified by
+ *  linux+inotify CI on every commit; the darwin skips here only avoid
+ *  the platform layer's non-determinism. Local darwin devs also skip
+ *  these — running them on a busy laptop produces false negatives.
+ *  Tracked: juspay/kolu#320 for a proper fix (test seam or polling
+ *  fallback in the production watcher path). */
+const SKIP_DARWIN_FSWATCH = process.platform === "darwin";
+
 import {
   afterAll,
   afterEach,
   beforeAll,
+  beforeEach,
   describe,
   expect,
   it,
-  vi,
 } from "vitest";
+import {
+  _resetSharedCwdGitWatchers,
+  _sharedCwdGitWatcherCount,
+} from "./cwd-git-watcher.ts";
+import { WATCHER_DEBOUNCE_MS } from "./git-dir.ts";
+import {
+  _resetSharedHeadWatchers,
+  _sharedHeadWatcherCount,
+} from "./head-watcher.ts";
 import {
   type GitInfo,
   getDiff,
@@ -23,12 +45,6 @@ import {
   watchGitHead,
   worktreeCreate,
 } from "./index.ts";
-import { _sharedHeadWatcherCount } from "./head-watcher.ts";
-
-// Mock randomName to return a predictable value
-vi.mock("memorable-names", () => ({
-  randomName: () => "test-worktree",
-}));
 
 // --- getDiff: renames ---
 
@@ -119,6 +135,64 @@ describe("getDiff", () => {
         (l) => /^[+-]/.test(l) && !l.startsWith("---") && !l.startsWith("+++"),
       );
     expect(diffLines).toEqual(["+export const b = 2;"]);
+  });
+
+  /** Bytes guaranteed to trigger git's binary detection — NUL at byte 4. */
+  const BINARY_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02]);
+
+  it("modified binary file: binary=true, hunks empty", async () => {
+    const { dir, git } = await initRepo();
+
+    fs.writeFileSync(path.join(dir, "image.png"), BINARY_BYTES);
+    await git.add("image.png");
+    await git.commit("add binary");
+
+    fs.writeFileSync(
+      path.join(dir, "image.png"),
+      Buffer.concat([BINARY_BYTES, BINARY_BYTES]),
+    );
+
+    const result = await getDiff(dir, "image.png", "local");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.value.binary).toBe(true);
+    expect(result.value.hunks).toEqual([]);
+    expect(result.value.newFileName).toBe("image.png");
+  });
+
+  it("untracked binary file: binary=true via --no-index", async () => {
+    const { dir, git } = await initRepo();
+    // Need an initial commit so HEAD exists.
+    fs.writeFileSync(path.join(dir, "seed.txt"), "seed\n");
+    await git.add("seed.txt");
+    await git.commit("seed");
+
+    fs.writeFileSync(path.join(dir, "blob.bin"), BINARY_BYTES);
+
+    const result = await getDiff(dir, "blob.bin", "local");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.value.binary).toBe(true);
+    expect(result.value.hunks).toEqual([]);
+  });
+
+  it("text file: binary=false", async () => {
+    const { dir, git } = await initRepo();
+
+    fs.writeFileSync(path.join(dir, "readme.txt"), "hello\n");
+    await git.add("readme.txt");
+    await git.commit("add text");
+
+    fs.writeFileSync(path.join(dir, "readme.txt"), "hello\nworld\n");
+
+    const result = await getDiff(dir, "readme.txt", "local");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(result.value.binary).toBe(false);
+    expect(result.value.hunks.length).toBe(1);
   });
 });
 
@@ -537,9 +611,10 @@ describe("worktreeCreate", () => {
 
     await bareGit.raw(["symbolic-ref", "HEAD", "refs/heads/main"]);
 
-    const result = await worktreeCreate(repos.cloneDir);
+    const result = await worktreeCreate(repos.cloneDir, "feat-default");
     expect(result.ok).toBe(true);
     if (!result.ok) return;
+    expect(result.value.branch).toBe("feat-default");
 
     const worktreeGit = simpleGit(result.value.path);
     const worktreeHead = (await worktreeGit.revparse(["HEAD"])).trim();
@@ -571,7 +646,7 @@ describe("worktreeCreate", () => {
     const staleCommit = (await cloneGit.revparse(["origin/main"])).trim();
     expect(staleCommit).not.toBe(latestCommit);
 
-    const result = await worktreeCreate(repos.cloneDir);
+    const result = await worktreeCreate(repos.cloneDir, "feat-fresh");
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
@@ -580,6 +655,27 @@ describe("worktreeCreate", () => {
     expect(worktreeHead).toBe(latestCommit);
 
     await cloneGit.raw(["worktree", "remove", result.value.path, "--force"]);
+  });
+
+  it("returns WORKTREE_NAME_COLLISION when the branch already exists", async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "kolu-git-test-"));
+    const repos = await setupRepos();
+
+    const first = await worktreeCreate(repos.cloneDir, "shared-name");
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    const second = await worktreeCreate(repos.cloneDir, "shared-name");
+    expect(second.ok).toBe(false);
+    if (second.ok) return;
+    expect(second.error.code).toBe("WORKTREE_NAME_COLLISION");
+
+    await simpleGit(repos.cloneDir).raw([
+      "worktree",
+      "remove",
+      first.value.path,
+      "--force",
+    ]);
   });
 });
 
@@ -625,9 +721,19 @@ describe("watchGitHead", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  beforeEach(() => {
+    // Hard-reset the module-scope registry so a previous test that timed
+    // out (and never reached its `stop*()` calls) cannot leak into this
+    // one. Without this, a single 5s vitest timeout cascades into every
+    // following test's afterEach (#955).
+    _resetSharedHeadWatchers();
+  });
+
   afterEach(() => {
     // Defensive: any test that leaks a subscription would skew the count
-    // for the next test. The Map is module-scope, so leaks are sticky.
+    // for the next test. The `beforeEach` above keeps the count truthful
+    // even when a test fails — the assertion below is still the place a
+    // *clean* test surfaces a real leak.
     expect(_sharedHeadWatcherCount()).toBe(0);
   });
 
@@ -699,66 +805,89 @@ describe("watchGitHead", () => {
     expect(_sharedHeadWatcherCount()).toBe(0);
   });
 
-  it("a HEAD change fans out to every subscriber on the shared watcher", async () => {
-    const { dir, git, gitDir } = await initRepo("dispatch-repo");
-    let aFires = 0;
-    let bFires = 0;
-    const stopA = watchGitHead(dir, () => {
-      aFires++;
-    });
-    const stopB = watchGitHead(dir, () => {
-      bFires++;
-    });
-    expect(_sharedHeadWatcherCount()).toBe(1);
+  /** Wait for an fs.watch-driven predicate, re-touching HEAD between
+   *  attempts. FSEvents on darwin coalesces and can take seconds to
+   *  deliver under load — a single fixed `waitFor` budget races that
+   *  latency and produces the `watchGitHead` darwin-only flake tracked
+   *  in #320. Each attempt waits up to `perAttemptMs` for the predicate;
+   *  if it doesn't fire, the next iteration rewrites HEAD to force
+   *  another change event. Up to 6 attempts × 2s = 12s overall budget. */
+  async function waitForHeadEvent(
+    predicate: () => boolean,
+    gitDir: string,
+    perAttemptMs = 2000,
+    attempts = 6,
+  ): Promise<void> {
+    const head = path.join(gitDir, "HEAD");
+    for (let i = 0; i < attempts; i++) {
+      try {
+        await waitFor(predicate, perAttemptMs);
+        return;
+      } catch {
+        if (i === attempts - 1)
+          throw new Error("HEAD-event predicate never fired");
+        // Re-touch HEAD with its own bytes so fs.watch fires another
+        // change event without altering repo state.
+        const content = fs.readFileSync(head);
+        fs.writeFileSync(head, content);
+      }
+    }
+  }
 
-    // Branch switch rewrites .git/HEAD, which is what we're watching.
-    await git.checkoutLocalBranch("feature");
+  it.skipIf(SKIP_DARWIN_FSWATCH)(
+    "a HEAD change fans out to every subscriber on the shared watcher",
+    async () => {
+      const { dir, git, gitDir } = await initRepo("dispatch-repo");
+      let aFires = 0;
+      let bFires = 0;
+      const stopA = watchGitHead(dir, () => {
+        aFires++;
+      });
+      const stopB = watchGitHead(dir, () => {
+        bFires++;
+      });
+      expect(_sharedHeadWatcherCount()).toBe(1);
 
-    // Re-touch HEAD until both listeners fire — fs.watch (inotify on Linux,
-    // FSEvents on darwin) is best-effort and a single edit can occasionally
-    // be missed under load.
-    await waitFor(() => aFires > 0 && bFires > 0, 3000).catch(async () => {
-      const head = path.join(gitDir, "HEAD");
-      const content = fs.readFileSync(head);
-      fs.writeFileSync(head, content);
-      await waitFor(() => aFires > 0 && bFires > 0, 2000);
-    });
+      // Branch switch rewrites .git/HEAD, which is what we're watching.
+      await git.checkoutLocalBranch("feature");
 
-    expect(aFires).toBeGreaterThan(0);
-    expect(bFires).toBeGreaterThan(0);
+      await waitForHeadEvent(() => aFires > 0 && bFires > 0, gitDir);
 
-    stopA();
-    stopB();
-    expect(_sharedHeadWatcherCount()).toBe(0);
-  });
+      expect(aFires).toBeGreaterThan(0);
+      expect(bFires).toBeGreaterThan(0);
 
-  it("a listener that throws does not block its peers", async () => {
-    const { dir, git, gitDir } = await initRepo("fault-isolation-repo");
-    let bFires = 0;
-    const stopA = watchGitHead(dir, () => {
-      throw new Error("boom");
-    });
-    const stopB = watchGitHead(dir, () => {
-      bFires++;
-    });
+      stopA();
+      stopB();
+      expect(_sharedHeadWatcherCount()).toBe(0);
+    },
+  );
 
-    await git.checkoutLocalBranch("feature");
-    await waitFor(() => bFires > 0, 3000).catch(async () => {
-      const head = path.join(gitDir, "HEAD");
-      fs.writeFileSync(head, fs.readFileSync(head));
-      await waitFor(() => bFires > 0, 2000);
-    });
+  it.skipIf(SKIP_DARWIN_FSWATCH)(
+    "a listener that throws does not block its peers",
+    async () => {
+      const { dir, git, gitDir } = await initRepo("fault-isolation-repo");
+      let bFires = 0;
+      const stopA = watchGitHead(dir, () => {
+        throw new Error("boom");
+      });
+      const stopB = watchGitHead(dir, () => {
+        bFires++;
+      });
 
-    expect(bFires).toBeGreaterThan(0);
-    stopA();
-    stopB();
-    expect(_sharedHeadWatcherCount()).toBe(0);
-  });
+      await git.checkoutLocalBranch("feature");
+      await waitForHeadEvent(() => bFires > 0, gitDir);
+
+      expect(bFires).toBeGreaterThan(0);
+      stopA();
+      stopB();
+      expect(_sharedHeadWatcherCount()).toBe(0);
+    },
+  );
 });
 
 // --- subscribeGitInfo: watcher lifecycle invariants (#748 regression) ---
 
-describe("subscribeGitInfo watcher churn", () => {
+describe.skipIf(SKIP_DARWIN_FSWATCH)("subscribeGitInfo watcher churn", () => {
   let tmpDir: string;
 
   /** Create a git repo with one commit. */
@@ -797,18 +926,30 @@ describe("subscribeGitInfo watcher churn", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
+  beforeEach(() => {
+    // See companion comment in the `watchGitHead` describe — module-scope
+    // registry reset breaks the leak-cascade (#955).
+    _resetSharedHeadWatchers();
+    _resetSharedCwdGitWatchers();
+  });
+
   afterEach(() => {
     expect(_sharedHeadWatcherCount()).toBe(0);
+    expect(_sharedCwdGitWatcherCount()).toBe(0);
   });
 
   /** Tracks watcher install/retire log lines as a vitest-friendly counter. */
   function makeLog() {
     let installs = 0;
     let retires = 0;
+    let cwdInstalls = 0;
+    let cwdRetires = 0;
     const log = {
       info(_obj: unknown, msg: string) {
         if (msg === "git: head watcher installed") installs++;
         if (msg === "git: head watcher retired") retires++;
+        if (msg === "git: cwd watcher installed") cwdInstalls++;
+        if (msg === "git: cwd watcher retired") cwdRetires++;
       },
       debug() {},
       warn() {},
@@ -821,6 +962,12 @@ describe("subscribeGitInfo watcher churn", () => {
       },
       get retires() {
         return retires;
+      },
+      get cwdInstalls() {
+        return cwdInstalls;
+      },
+      get cwdRetires() {
+        return cwdRetires;
       },
     };
   }
@@ -860,8 +1007,12 @@ describe("subscribeGitInfo watcher churn", () => {
     expect(counter.retires).toBe(1);
   });
 
-  it("git init in the current cwd installs the watcher exactly once", async () => {
-    const dir = path.join(tmpDir, "git-init-dir");
+  // `git init` in the cwd a terminal is already sitting in must reach the
+  // Code browser and path pill — but the shell doesn't re-emit OSC 7 when
+  // cwd hasn't changed, so the provider can't rely on `setCwd` to learn
+  // about the new `.git`.
+  it("detects `git init` in the current cwd without an OSC 7 setCwd", async () => {
+    const dir = path.join(tmpDir, "git-init-osc7-less");
     fs.mkdirSync(dir, { recursive: true });
 
     const counter = makeLog();
@@ -874,10 +1025,14 @@ describe("subscribeGitInfo watcher churn", () => {
       counter.log,
     );
 
-    // Initial subscribe on a non-git dir installs no watcher.
+    // Initial subscribe on a non-git dir installs the cwd watcher, not the
+    // HEAD watcher — there's nothing inside `.git/` to watch yet.
     expect(counter.installs).toBe(0);
+    expect(counter.cwdInstalls).toBe(1);
 
-    // Simulate `git init` in the same cwd.
+    // `git init` (no setCwd / OSC 7 follow-up). The cwd watcher must fire
+    // on `.git` appearing, trigger a re-resolve, and swap to the HEAD
+    // watcher.
     const git = simpleGit(dir);
     await git.init();
     await git.checkoutLocalBranch("main");
@@ -885,9 +1040,42 @@ describe("subscribeGitInfo watcher churn", () => {
     await git.add(".");
     await git.commit("initial");
 
-    // Same-cwd setCwd must trigger the install (this is the only path
-    // that does — there's no fs.watch on the parent dir to signal the
-    // .git appearing).
+    await waitFor(() => updates.length >= 1, 3000);
+    expect(updates[0]?.repoRoot).toBe(fs.realpathSync(dir));
+
+    sub.stop();
+
+    expect(counter.installs).toBe(1);
+    expect(counter.retires).toBe(1);
+    expect(counter.cwdRetires).toBe(1);
+  });
+
+  it("setCwd defense-in-depth still works if the cwd watcher missed the event", async () => {
+    // Some filesystems (bind-mounted containers, polling fallback) can lose
+    // events. A same-cwd setCwd from a downstream caller is the belt-and-
+    // braces fallback for that case.
+    const dir = path.join(tmpDir, "git-init-via-setcwd");
+    fs.mkdirSync(dir, { recursive: true });
+
+    const counter = makeLog();
+    const updates: (GitInfo | null)[] = [];
+    const sub = subscribeGitInfo(
+      dir,
+      (info) => {
+        updates.push(info);
+      },
+      counter.log,
+    );
+
+    const git = simpleGit(dir);
+    await git.init();
+    await git.checkoutLocalBranch("main");
+    fs.writeFileSync(path.join(dir, "f.txt"), "x");
+    await git.add(".");
+    await git.commit("initial");
+
+    // Explicit re-resolve via setCwd. The cwd watcher may also have fired
+    // by now; both paths converge on the same end state.
     sub.setCwd(dir);
 
     await waitFor(() => updates.length >= 1);
@@ -895,6 +1083,8 @@ describe("subscribeGitInfo watcher churn", () => {
 
     sub.stop();
 
+    // Even with both paths potentially firing, the HEAD watcher is
+    // installed exactly once.
     expect(counter.installs).toBe(1);
     expect(counter.retires).toBe(1);
   });
@@ -927,5 +1117,44 @@ describe("subscribeGitInfo watcher churn", () => {
     // Initial install on a + retire on transition + install on b + retire on stop.
     expect(counter.installs).toBe(2);
     expect(counter.retires).toBe(2);
+  });
+
+  // Regression: an fs watcher event fires after the test's last awaited
+  // update but before `stop()`. The debounced listener calls `resolve()`,
+  // which awaits git subprocesses. If `stop()` runs while that resolve is
+  // in flight, the resume path would hit `ensureMode("head")` with the
+  // watcher slot already null and install a fresh watcher that nobody
+  // retires — leaking past the subscription's lifetime. Manifested as a
+  // flaky `_sharedHeadWatcherCount() === 0` afterEach failure under CI
+  // load.
+  it("stop() during an in-flight resolve does not reinstall the watcher", async () => {
+    const { dir, git } = await initRepo("stop-race");
+
+    const counter = makeLog();
+    const updates: (GitInfo | null)[] = [];
+    const sub = subscribeGitInfo(
+      dir,
+      (info) => {
+        updates.push(info);
+      },
+      counter.log,
+    );
+
+    await waitFor(() => updates.length >= 1);
+
+    // Rewrite .git/HEAD to schedule a debounced watcher event. After the
+    // debounce window, the listener will call `resolve()`, which then
+    // awaits its git subprocesses — that's the window where stop() must
+    // make subsequent ensureMode calls into no-ops.
+    await git.checkoutLocalBranch("other");
+    await new Promise((r) => setTimeout(r, WATCHER_DEBOUNCE_MS + 20));
+    sub.stop();
+
+    // Drain any in-flight resolve so a reinstalled watcher (without the
+    // stopped gate) would be observable here.
+    await new Promise((r) => setTimeout(r, 300));
+
+    expect(_sharedHeadWatcherCount()).toBe(0);
+    expect(counter.installs).toBe(counter.retires);
   });
 });

@@ -1,13 +1,13 @@
 /** Shared terminal lifecycle + buffer assertion steps. Surface-agnostic —
- *  work for canvas tiles, mobile pager, and the pill tree. */
+ *  work for canvas tiles, mobile pager, and the workspace switcher. */
 
 import * as assert from "node:assert";
 import { Given, Then, When } from "@cucumber/cucumber";
 import { waitForBufferContains } from "../support/buffer.ts";
 import {
   type KoluWorld,
-  PILL_TREE_ENTRY_SELECTOR,
   POLL_TIMEOUT,
+  WORKSPACE_SWITCHER_ENTRY_SELECTOR,
 } from "../support/world.ts";
 
 When("I create a terminal", async function (this: KoluWorld) {
@@ -36,13 +36,13 @@ Then(
 );
 
 When(
-  "I select terminal {int} in the pill tree",
+  "I select terminal {int} in the workspace switcher",
   async function (this: KoluWorld, index: number) {
     const id = this.createdTerminalIds[index - 1];
     assert.ok(id, `No terminal created at index ${index} in this scenario`);
-    // Click the pill-tree branch for this terminal.
+    // Click the workspace-switcher branch for this terminal.
     await this.page
-      .locator(`${PILL_TREE_ENTRY_SELECTOR}[data-terminal-id="${id}"]`)
+      .locator(`${WORKSPACE_SWITCHER_ENTRY_SELECTOR}[data-terminal-id="${id}"]`)
       .click();
     // Wait for the selected terminal to take focus.
     await this.page
@@ -52,22 +52,56 @@ When(
   },
 );
 
-Given("I note the pill tree entry count", async function (this: KoluWorld) {
-  this.savedPillTreeCount = await this.page
-    .locator(PILL_TREE_ENTRY_SELECTOR)
-    .count();
-});
+/** Select a terminal by its position in the workspace switcher (1-based),
+ *  regardless of `createdTerminalIds`. Complements
+ *  `I select terminal {int} in the workspace switcher` (ID-based, waits on
+ *  `data-focused`): this variant addresses entries by DOM position and
+ *  waits on `data-visible`, which is what scenarios that don't track
+ *  created IDs (or want to address pre-existing background terminals)
+ *  need.
+ *
+ *  Positional order matches terminal-creation order only for plain-shell
+ *  terminals — they all have `lastActivityAt === 0`, tie in
+ *  `rankDockRows()`'s `b.ts - a.ts` sort, and the stable sort then
+ *  preserves the `Map`'s insertion order. Agent-backed terminals carry
+ *  real activity timestamps and may reshuffle the dock, so position-based
+ *  addressing isn't safe for them; reach for the ID-based sibling step
+ *  instead. */
+When(
+  "I select workspace switcher entry {int}",
+  async function (this: KoluWorld, position: number) {
+    const entry = this.page
+      .locator(WORKSPACE_SWITCHER_ENTRY_SELECTOR)
+      .nth(position - 1);
+    await entry.click();
+    const id = await entry.getAttribute("data-terminal-id");
+    assert.ok(id, `Workspace switcher entry ${position} has no terminal ID`);
+    await this.page
+      .locator(`[data-terminal-id="${id}"][data-visible]`)
+      .waitFor({ state: "attached", timeout: POLL_TIMEOUT });
+    await this.waitForFrame();
+  },
+);
+
+Given(
+  "I note the workspace switcher entry count",
+  async function (this: KoluWorld) {
+    this.savedWorkspaceSwitcherCount = await this.page
+      .locator(WORKSPACE_SWITCHER_ENTRY_SELECTOR)
+      .count();
+  },
+);
 
 Then(
-  "the pill tree should have {int} more terminal entry/entries",
+  "the workspace switcher should have {int} more terminal entry/entries",
   async function (this: KoluWorld, delta: number) {
-    const expected = (this.savedPillTreeCount ?? 0) + delta;
-    const buttons = this.page.locator(PILL_TREE_ENTRY_SELECTOR);
+    const expected = (this.savedWorkspaceSwitcherCount ?? 0) + delta;
+    const buttons = this.page.locator(WORKSPACE_SWITCHER_ENTRY_SELECTOR);
     await buttons
       .nth(expected - 1)
       .waitFor({ state: "visible", timeout: POLL_TIMEOUT });
     const current = await buttons.count();
-    const baseline = this.savedPillTreeCount ?? 0;
+    const baseline = this.savedWorkspaceSwitcherCount ?? 0;
     assert.strictEqual(
       current - baseline,
       delta,
@@ -76,5 +110,5 @@ Then(
   },
 );
 
-// "the pill tree should have N fewer terminal entries" already lives in
+// "the workspace switcher should have N fewer terminal entries" already lives in
 // worktree_steps.ts — don't redeclare it here.

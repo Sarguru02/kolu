@@ -30,8 +30,12 @@ pkgs.mkShell {
     pnpm
     tsx
     nixpkgs-fmt
+    # Biome from nixpkgs — single toolchain source, avoids per-platform Rust
+    # binary fetches via pnpm postinstall. Version drift between this and
+    # biome.jsonc's $schema URL is tolerable for IDE auto-complete (#885).
+    biome
     # `uv` provides `uvx`, used by agents/ai.just to run APM from
-    # git+https without a global install (see ci::apm-sync).
+    # git+https without a global install.
     uv
     # prettier is provided by pnpm (same version) — no need for a nix copy.
     # Use `pnpm exec prettier` or ensure `just install` has been run.

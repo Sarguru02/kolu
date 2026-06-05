@@ -7,25 +7,22 @@ import type {
   CanvasLayout,
   InitialTerminalMetadata,
   TerminalId,
-} from "kolu-common";
+} from "kolu-common/surface";
 import { toast } from "solid-sonner";
 import { availableThemes, pickTheme, resolveThemeBgs } from "terminal-themes";
-import { client } from "../rpc/rpc";
+import { useRightPanel } from "../right-panel/useRightPanel";
 import { CONTEXTUAL_TIPS } from "../settings/tips";
-import { usePreferences } from "../settings/usePreferences";
 import { useTips } from "../settings/useTips";
-import { copyTextWithToast } from "./clipboard";
+import { writeTextToClipboard } from "../ui/clipboard";
+import { client, preferences } from "../wire";
 import { useSubPanel } from "./useSubPanel";
 import type { TerminalStore } from "./useTerminalStore";
 
-export function useTerminalCrud(deps: {
-  store: TerminalStore;
-  subscribeExit: (id: TerminalId) => void;
-}) {
+export function useTerminalCrud(deps: { store: TerminalStore }) {
   const { store } = deps;
   const subPanel = useSubPanel();
+  const rightPanel = useRightPanel();
   const { showTipOnce } = useTips();
-  const { preferences } = usePreferences();
 
   /** The terminal the user is currently interacting with —
    *  the active sub-tab when a split has focus, otherwise the workspace root. */
@@ -88,10 +85,14 @@ export function useTerminalCrud(deps: {
     const ids = store.terminalIds();
     const idx = ids.indexOf(id);
     subPanel.removePanel(id);
+    rightPanel.removePanel(id);
     store.setMruOrder((prev) => prev.filter((x) => x !== id));
     if (store.activeId() === id) {
       const remaining = ids.filter((x) => x !== id);
-      store.setActiveId(remaining[Math.min(idx, remaining.length - 1)] ?? null);
+      const next = remaining[Math.min(idx, remaining.length - 1)] ?? null;
+      // `activate` pans the canvas to the auto-switched tile — without
+      // it the viewport would stay centered on the just-killed tile.
+      store.activate(next);
     }
   }
 
@@ -127,13 +128,18 @@ export function useTerminalCrud(deps: {
         themeName: theme,
         canvasLayout: initial?.canvasLayout,
         subPanel: initial?.subPanel,
+        rightPanel: initial?.rightPanel,
+        lastActivityAt: initial?.lastActivityAt,
+        intent: initial?.intent,
       })
       .catch((err: Error) => {
         toast.error(`Failed to create terminal: ${err.message}`);
         throw err;
       });
-    store.setActiveId(info.id);
-    deps.subscribeExit(info.id);
+    // `setActiveSilently`: the canvas's cascade-placement effect bumps
+    // the centering signal once the new tile's pending layout is set —
+    // calling `activate` here would race the layout and read undefined.
+    store.setActiveSilently(info.id);
     showTipOnce(CONTEXTUAL_TIPS.themeSwitch);
     return info.id;
   }
@@ -147,7 +153,6 @@ export function useTerminalCrud(deps: {
       });
     subPanel.setActiveSubTab(parentId, info.id);
     subPanel.expandPanel(parentId);
-    deps.subscribeExit(info.id);
   }
 
   async function handleKill(id: TerminalId) {
@@ -169,12 +174,17 @@ export function useTerminalCrud(deps: {
   async function handleCopyTerminalText() {
     const id = focusedTerminalId();
     if (id === null) return;
+    let text: string;
     try {
-      const text = await client.terminal.screenText({ id });
-      await copyTextWithToast(text, {
-        success: "Copied terminal text to clipboard",
-        failure: "Failed to copy terminal text",
-      });
+      text = await client.terminal.screenText({ id });
+    } catch (err) {
+      console.error("Failed to read terminal text:", err);
+      toast.error(`Failed to read terminal text: ${(err as Error).message}`);
+      return;
+    }
+    try {
+      await writeTextToClipboard(text);
+      toast.success("Copied terminal text to clipboard");
     } catch (err) {
       console.error("Failed to copy terminal text:", err);
       toast.error(`Failed to copy terminal text: ${(err as Error).message}`);
